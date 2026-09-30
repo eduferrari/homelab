@@ -11,12 +11,14 @@ Manual de instalação e uso do script `homelab-setup.sh`, que transforma o Thin
 | Ubuntu Server | 24.04 LTS (recomendado) | — | — |
 | Docker Engine + Compose | repositório oficial Docker | — | `docker compose` |
 | MySQL | `mysql:8.4` | 3306 | cliente MySQL / aplicações |
-| Adminer | `adminer:latest` | 8080 | `http://<IP>:8080` |
+| Adminer | `adminer:latest` | 8080 | `http://<host>:8080` |
 | Redis | `redis:7-alpine` | 6379 | cliente Redis / aplicações |
-| RedisInsight | `redis/redisinsight:latest` | 5540 | `http://<IP>:5540` |
+| RedisInsight | `redis/redisinsight:latest` | 5540 | `http://<host>:5540` |
 | RabbitMQ (AMQP) | `rabbitmq:4-management` | 5672 | aplicações |
-| RabbitMQ Management | (mesma imagem) | 15672 | `http://<IP>:15672` |
-| SSH | OpenSSH | 22 | `ssh <usuario>@<IP>` |
+| RabbitMQ Management | (mesma imagem) | 15672 | `http://<host>:15672` |
+| SSH | OpenSSH | 22 | `ssh <usuario>@<host>` |
+
+`<host>` é o nome mDNS do servidor: `<hostname>.local` (ex.: `homelab-eduardo.local`). Ele continua válido mesmo quando o IP muda — veja a seção 8.1.
 
 Todos os containers ficam na rede Docker **`devnet`** e usam **volumes nomeados persistentes** — os dados sobrevivem a `docker compose down`, reboots e atualizações de imagem.
 
@@ -27,7 +29,7 @@ Todos os containers ficam na rede Docker **`devnet`** e usam **volumes nomeados 
 1. **Ubuntu Server 24.04 LTS** instalado no L14 (22.04 também funciona; Ubuntu Desktop funciona, mas o script muda o boot para modo texto).
    - Na instalação, marque **"Install OpenSSH server"**.
 2. Um usuário comum com `sudo` (o que você criou na instalação).
-3. **Conexão por cabo de rede** (recomendado) e **IP fixo** — de preferência via *reserva DHCP* no roteador, usando o MAC da placa (`ip link`).
+3. **Conexão por cabo de rede** (recomendado; Wi-Fi funciona, mas é menos estável). IP fixo é opcional: o script ativa mDNS, então o servidor é acessado por `<hostname>.local`. Se tiver acesso ao roteador, uma *reserva DHCP* pelo MAC (`ip link`) ainda ajuda.
 4. Notebook ligado na tomada.
 
 ### BIOS do ThinkPad (recomendado)
@@ -112,12 +114,12 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
 
 | # | Etapa | Detalhes |
 |---|---|---|
-| 1 | Sistema base | `apt upgrade`, pacotes úteis (git, jq, htop, btop, tmux…), timezone, atualizações automáticas de segurança, `sysctl` (swappiness 10, `vm.overcommit_memory=1` para o Redis, limites de inotify) |
+| 1 | Sistema base | `apt upgrade`, pacotes úteis (git, jq, htop, btop, tmux, tcpdump, netcat…), mDNS (`avahi-daemon`), timezone, atualizações automáticas de segurança, `sysctl` (swappiness 10, `vm.overcommit_memory=1` para o Redis, limites de inotify) |
 | 2 | Modo servidor | Boot em `multi-user.target` (sem interface gráfica) |
 | 3 | Tampa / energia | `logind` ignora a tampa; suspensão e hibernação mascaradas; tela desliga em 60s; **TLP** limita a bateria a 75–80% (ela não fica em 100% o tempo todo) e desliga economia de energia de Wi-Fi/USB |
 | 4 | SSH | Serviço clássico (`ssh.service`, sem socket), root bloqueado, `MaxAuthTries 3`, só `HOMELAB_USER` pode entrar, senha desativada se houver chave; **fail2ban** bane após 5 falhas por 1h (IPs da LAN ficam de fora) |
 | 5 | Docker | Docker CE + Buildx + Compose plugin do repositório oficial; rotação de logs (10 MB × 3); `live-restore` |
-| 6 | Firewall | UFW: entrada negada, saída liberada, SSH com rate-limit; integração UFW+Docker (ver seção 8) |
+| 6 | Firewall | UFW: entrada negada, saída liberada, SSH com rate-limit, mDNS só da LAN; integração UFW+Docker (ver seção 8.2) |
 | 7 | Diretórios | Estrutura da seção 6 |
 | 8 | Rede | `docker network create devnet` |
 | 9 | Stack | Gera `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf` e scripts utilitários |
@@ -162,9 +164,9 @@ Veja as credenciais geradas:
 cat /opt/homelab/infra/.env
 ```
 
-Substitua `<IP>` pelo IP do L14 (`hostname -I`).
+Substitua `<host>` por `<hostname>.local` (ex.: `homelab-eduardo.local`) ou pelo IP atual (`hostname -I`).
 
-### 7.1 Adminer (MySQL) — `http://<IP>:8080`
+### 7.1 Adminer (MySQL) — `http://<host>:8080`
 
 | Campo | Valor |
 |---|---|
@@ -174,7 +176,7 @@ Substitua `<IP>` pelo IP do L14 (`hostname -I`).
 | Senha | `MYSQL_ROOT_PASSWORD` ou `MYSQL_PASSWORD` |
 | Base de dados | `appdb` (ou em branco) |
 
-### 7.2 RedisInsight — `http://<IP>:5540`
+### 7.2 RedisInsight — `http://<host>:5540`
 
 O banco **homelab-redis** já deve aparecer pré-configurado. Se não aparecer, clique em **Add Redis database**:
 
@@ -185,7 +187,7 @@ O banco **homelab-redis** já deve aparecer pré-configurado. Se não aparecer, 
 | Username | *(em branco)* |
 | Password | `REDIS_PASSWORD` |
 
-### 7.3 RabbitMQ Management — `http://<IP>:15672`
+### 7.3 RabbitMQ Management — `http://<host>:15672`
 
 | Campo | Valor |
 |---|---|
@@ -194,12 +196,12 @@ O banco **homelab-redis** já deve aparecer pré-configurado. Se não aparecer, 
 
 ### 7.4 Conexão a partir das aplicações
 
-**De fora do Docker** (sua máquina, Rider, testes locais) — use o IP do L14:
+**De fora do Docker** (sua máquina, Rider, testes locais) — use o nome `.local` do L14:
 
 ```text
-MySQL     Server=<IP>;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
-Redis     <IP>:6379,password=<REDIS_PASSWORD>
-RabbitMQ  amqp://admin:<RABBITMQ_DEFAULT_PASS>@<IP>:5672/
+MySQL     Server=<host>;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
+Redis     <host>:6379,password=<REDIS_PASSWORD>
+RabbitMQ  amqp://admin:<RABBITMQ_DEFAULT_PASS>@<host>:5672/
 ```
 
 **De dentro da rede `devnet`** (containers das suas APIs) — use o nome do serviço:
@@ -231,7 +233,21 @@ networks:
 
 ---
 
-## 8. Firewall — como funciona
+## 8. Rede
+
+### 8.1 Acesso por nome (mDNS)
+
+O script instala o `avahi-daemon`: o L14 anuncia `<hostname>.local` na LAN e libera `5353/udp` no UFW apenas para redes privadas. macOS resolve `.local` nativamente; Linux precisa de `libnss-mdns`; Windows 10+ também resolve.
+
+```bash
+ping -c 2 homelab-eduardo.local       # do Mac
+```
+
+Use sempre o nome nas connection strings: sem acesso ao roteador, o IP pode mudar a cada reboot (DHCP).
+
+> Containers **dentro** do Docker (rede `devnet`) não resolvem `.local` — entre containers use os nomes dos serviços (`mysql`, `redis`, `rabbitmq`).
+
+### 8.2 Firewall — como funciona
 
 O Docker publica portas diretamente no `iptables` e **ignora as regras do UFW**. Para evitar que os bancos fiquem expostos, o script adiciona o bloco padrão *ufw-docker* em `/etc/ufw/after.rules`:
 
@@ -391,7 +407,11 @@ sudo tlp fullcharge BAT0
 | Sintoma | Causa provável / solução |
 |---|---|
 | `permission denied ... docker.sock` | Faltou reiniciar após a instalação (ou faça logout/login) |
-| UI não abre de outra máquina | Confirme o IP (`hostname -I`) e se a máquina está na mesma LAN; verifique `docker compose ps` |
+| UI não abre de outra máquina | Teste `ping <hostname>.local`; confira o IP atual (`hostname -I`) e `docker compose ps` |
+| `Connection refused` em **todas** as portas, mas o SSH pelo Terminal funciona | Permissão de **Rede Local** do macOS: *Ajustes do Sistema → Privacidade e Segurança → Rede Local* — libere o app (Rider, Claude, iTerm…) e reabra-o |
+| `<hostname>.local` não resolve | `systemctl status avahi-daemon` e `sudo ufw status \| grep 5353` |
+| Servidor mudou de IP | Esperado com DHCP — use `<hostname>.local` |
+| Diagnóstico de rede | `sudo tcpdump -ni any host <IP-do-cliente> -c 20` no L14 e `nc -vz <host> 3306` no cliente |
 | Container `unhealthy` | `docker compose logs <serviço>` |
 | RabbitMQ perdeu filas após recriar | O `hostname: rabbitmq` foi alterado — o nó grava os dados pelo nome |
 | RedisInsight sem o banco pré-cadastrado | Adicione manualmente (seção 7.2) |
