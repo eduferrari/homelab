@@ -58,7 +58,12 @@ apt_install() {
 
 # ------------------------------- Pré-checagens -------------------------------
 [[ $EUID -eq 0 ]] || die "Execute com sudo: sudo ./homelab-setup.sh"
-[[ -n "$HOMELAB_USER" ]] || die "Não foi possível detectar o usuário. Use: sudo HOMELAB_USER=<usuario> ./homelab-setup.sh"
+# Executado de dentro de "sudo su"/"sudo -i", o SUDO_USER vira root: tenta o dono da sessão
+if [[ -z "$HOMELAB_USER" || "$HOMELAB_USER" == "root" ]]; then
+  HOMELAB_USER="$(logname 2>/dev/null || true)"
+fi
+[[ -n "$HOMELAB_USER" && "$HOMELAB_USER" != "root" ]] || \
+  die "Não foi possível detectar seu usuário (não use root). Rode a partir do seu usuário: sudo ./homelab-setup.sh  — ou: sudo HOMELAB_USER=<usuario> ./homelab-setup.sh"
 id "$HOMELAB_USER" &>/dev/null || die "Usuário '$HOMELAB_USER' não existe."
 
 # shellcheck disable=SC1091
@@ -164,7 +169,16 @@ elif [[ "$DISABLE_SSH_PASSWORD" == "auto" && -s "$USER_HOME/.ssh/authorized_keys
   PASSWORD_AUTH="no"
 fi
 
-cat > /etc/ssh/sshd_config.d/99-homelab.conf <<EOF
+# O Ubuntu lê sshd_config.d em ordem alfabética e a PRIMEIRA ocorrência vence.
+# Por isso o prefixo 00- (antes do 50-cloud-init.conf, que força PasswordAuthentication yes).
+SSHD_DROPIN="/etc/ssh/sshd_config.d/00-homelab.conf"
+rm -f /etc/ssh/sshd_config.d/99-homelab.conf   # nome usado em versões anteriores do script
+
+# No Ubuntu 24.04 o SSH é ativado por socket: /run/sshd só existe depois que
+# o serviço sobe, e sem ele o "sshd -t" falha com "Missing privilege separation directory".
+install -d -m 0755 /run/sshd
+
+cat > "$SSHD_DROPIN" <<EOF
 Port ${SSH_PORT}
 PermitRootLogin no
 PasswordAuthentication ${PASSWORD_AUTH}
@@ -177,14 +191,39 @@ ClientAliveInterval 300
 ClientAliveCountMax 2
 AllowUsers ${HOMELAB_USER}
 EOF
-sshd -t || die "Configuração do SSH inválida — verifique /etc/ssh/sshd_config.d/99-homelab.conf"
-systemctl enable ssh >/dev/null 2>&1
-systemctl restart ssh
-ok "SSH na porta ${SSH_PORT} | root bloqueado | login por senha: ${PASSWORD_AUTH}"
-[[ "$PASSWORD_AUTH" == "yes" ]] && warn "Login por senha ainda ativo. Copie sua chave (ssh-copy-id) e rode novamente com DISABLE_SSH_PASSWORD=true"
+if ! SSHD_CHECK="$(/usr/sbin/sshd -t 2>&1)"; then
+  rm -f "$SSHD_DROPIN"   # não deixa o SSH com configuração quebrada
+  die "Configuração do SSH inválida (arquivo revertido):
+$SSHD_CHECK"
+fi
+
+# 24.04+: troca a ativação por socket pelo serviço clássico (sempre escutando,
+# respeita Port do sshd_config e evita "Connection refused" após reinícios)
+if systemctl list-unit-files ssh.socket 2>/dev/null | grep -q '^ssh.socket'; then
+  systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/ssh.service.d/00-socket.conf
+  systemctl daemon-reload
+fi
+systemctl enable ssh.service >/dev/null 2>&1
+if ! systemctl restart ssh.service; then
+  # fallback: algumas instalações ainda dependem do socket — reativa para não perder o acesso
+  warn "ssh.service não subiu sozinho; reativando ssh.socket"
+  systemctl enable --now ssh.socket >/dev/null 2>&1 || true
+  systemctl restart ssh.socket || true
+fi
+sleep 1
+ss -tln | grep -q ":${SSH_PORT} " || die "sshd não está escutando na porta ${SSH_PORT} — veja: journalctl -u ssh -n 30"
+ok "SSH na porta ${SSH_PORT} | usuário permitido: ${HOMELAB_USER} | root bloqueado | login por senha: ${PASSWORD_AUTH}"
+if [[ "$PASSWORD_AUTH" == "yes" ]]; then
+  warn "Login por senha ainda ativo. Copie sua chave (ssh-copy-id) e rode novamente com DISABLE_SSH_PASSWORD=true"
+fi
 
 apt_install fail2ban
 cat > /etc/fail2ban/jail.d/homelab.local <<EOF
+[DEFAULT]
+# nunca bane a própria LAN (evita se trancar para fora do homelab)
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+
 [sshd]
 enabled  = true
 port     = ${SSH_PORT}

@@ -115,7 +115,7 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
 | 1 | Sistema base | `apt upgrade`, pacotes úteis (git, jq, htop, btop, tmux…), timezone, atualizações automáticas de segurança, `sysctl` (swappiness 10, `vm.overcommit_memory=1` para o Redis, limites de inotify) |
 | 2 | Modo servidor | Boot em `multi-user.target` (sem interface gráfica) |
 | 3 | Tampa / energia | `logind` ignora a tampa; suspensão e hibernação mascaradas; tela desliga em 60s; **TLP** limita a bateria a 75–80% (ela não fica em 100% o tempo todo) e desliga economia de energia de Wi-Fi/USB |
-| 4 | SSH | Root bloqueado, `MaxAuthTries 3`, só `HOMELAB_USER` pode entrar, senha desativada se houver chave; **fail2ban** bane após 5 falhas por 1h |
+| 4 | SSH | Serviço clássico (`ssh.service`, sem socket), root bloqueado, `MaxAuthTries 3`, só `HOMELAB_USER` pode entrar, senha desativada se houver chave; **fail2ban** bane após 5 falhas por 1h (IPs da LAN ficam de fora) |
 | 5 | Docker | Docker CE + Buildx + Compose plugin do repositório oficial; rotação de logs (10 MB × 3); `live-restore` |
 | 6 | Firewall | UFW: entrada negada, saída liberada, SSH com rate-limit; integração UFW+Docker (ver seção 8) |
 | 7 | Diretórios | Estrutura da seção 6 |
@@ -396,7 +396,8 @@ sudo tlp fullcharge BAT0
 | RabbitMQ perdeu filas após recriar | O `hostname: rabbitmq` foi alterado — o nó grava os dados pelo nome |
 | RedisInsight sem o banco pré-cadastrado | Adicione manualmente (seção 7.2) |
 | Notebook suspendeu com a tampa fechada | Rode `systemctl status systemd-logind` e reinicie; confirme a seção 11 |
-| Bloqueado fora do SSH | Acesse pelo teclado local e revise `/etc/ssh/sshd_config.d/99-homelab.conf` |
+| `Connection refused` no SSH | `sudo ss -tlnp \| grep :22` (sshd escutando?) e `sudo fail2ban-client unban --all` |
+| Bloqueado fora do SSH | Acesse pelo teclado local e revise `/etc/ssh/sshd_config.d/00-homelab.conf` |
 | Porta 8080 conflita com uma API | Altere `ADMINER_PORT` no `.env` e rode `docker compose up -d` |
 
 Log completo da instalação: `/var/log/homelab-setup.log`
