@@ -192,15 +192,17 @@ if ! SSHD_CHECK="$(/usr/sbin/sshd -t 2>&1)"; then
 $SSHD_CHECK"
 fi
 
-# 24.04+: o ssh.socket define a porta — o generator relê o sshd_config no daemon-reload
-if systemctl list-unit-files ssh.socket &>/dev/null && systemctl is-enabled ssh.socket &>/dev/null; then
+# 24.04+: troca a ativação por socket pelo serviço clássico (sempre escutando,
+# respeita Port do sshd_config e evita "Connection refused" após reinícios)
+if systemctl list-unit-files ssh.socket 2>/dev/null | grep -q '^ssh.socket'; then
+  systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/ssh.service.d/00-socket.conf
   systemctl daemon-reload
-  systemctl restart ssh.socket
-  systemctl restart ssh.service 2>/dev/null || true
-else
-  systemctl enable ssh >/dev/null 2>&1
-  systemctl restart ssh
 fi
+systemctl enable ssh.service >/dev/null 2>&1
+systemctl restart ssh.service
+sleep 1
+ss -tln | grep -q ":${SSH_PORT} " || die "sshd não está escutando na porta ${SSH_PORT} — veja: journalctl -u ssh -n 30"
 ok "SSH na porta ${SSH_PORT} | root bloqueado | login por senha: ${PASSWORD_AUTH}"
 if [[ "$PASSWORD_AUTH" == "yes" ]]; then
   warn "Login por senha ainda ativo. Copie sua chave (ssh-copy-id) e rode novamente com DISABLE_SSH_PASSWORD=true"
@@ -208,6 +210,10 @@ fi
 
 apt_install fail2ban
 cat > /etc/fail2ban/jail.d/homelab.local <<EOF
+[DEFAULT]
+# nunca bane a própria LAN (evita se trancar para fora do homelab)
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+
 [sshd]
 enabled  = true
 port     = ${SSH_PORT}
