@@ -16,6 +16,7 @@ Manual de instalação e uso do script `homelab-setup.sh`, que transforma o Thin
 | RedisInsight | `redis/redisinsight:latest` | 5540 | `http://<host>:5540` |
 | RabbitMQ (AMQP) | `rabbitmq:4-management` | 5672 | aplicações |
 | RabbitMQ Management | (mesma imagem) | 15672 | `http://<host>:15672` |
+| Caddy (proxy + HTTPS) | `caddy:2-alpine` | 80, 443, 8081–8089 | `https://<host>` — sites de cada projeto (seção 8.3) |
 | SSH | OpenSSH | 22 | `ssh <usuario>@<host>` |
 
 `<host>` é o nome mDNS do servidor: `<hostname>.local` (ex.: `homelab-eduardo.local`). Ele continua válido mesmo quando o IP muda — veja a seção 8.1.
@@ -122,7 +123,7 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
 | 6 | Firewall | UFW: entrada negada, saída liberada, SSH com rate-limit, mDNS só da LAN; integração UFW+Docker (ver seção 8.2) |
 | 7 | Diretórios | Estrutura da seção 6 |
 | 8 | Rede | `docker network create devnet` |
-| 9 | Stack | Gera `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf` e scripts utilitários |
+| 9 | Stack | Gera `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf`, Caddyfile base + snippets e scripts utilitários |
 | 10 | Subida | `docker compose up -d --wait` (aguarda os healthchecks) |
 | 11 | GitHub Actions | Usuário `gh-runner`, download da última versão do runner e script de registro |
 
@@ -135,14 +136,22 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
 ├── infra/
 │   ├── docker-compose.yml      # stack de serviços
 │   ├── .env                    # credenciais (chmod 640 — NÃO versionar)
-│   └── mysql/
-│       ├── conf.d/homelab.cnf  # utf8mb4, buffer pool, etc.
-│       └── init/               # .sql/.sh executados na 1ª criação do banco
+│   ├── mysql/
+│   │   ├── conf.d/homelab.cnf  # utf8mb4, buffer pool, etc.
+│   │   └── init/               # .sql/.sh executados na 1ª criação do banco
+│   └── caddy/
+│       ├── Caddyfile           # base da plataforma (gerado — não editar)
+│       └── sites/
+│           ├── 00-snippets.caddy      # snippets: sse, security_headers
+│           ├── _exemplo.caddy.txt     # modelo de site de projeto
+│           └── <projeto>.caddy        # um arquivo por projeto
 ├── apps/                       # destino de deploy dos seus projetos (CI/CD)
 ├── backups/mysql/              # dumps gerados pelo backup-mysql.sh
 └── scripts/
     ├── status.sh               # visão rápida do homelab
     ├── backup-mysql.sh         # backup de todos os bancos (retém 7 dias)
+    ├── caddy-reload.sh         # valida e recarrega o Caddy
+    ├── caddy-ca.sh             # exporta a CA interna + impressão digital
     └── register-runner.sh      # registra o runner do GitHub Actions
 
 ~/projects/
@@ -269,6 +278,92 @@ sudo journalctl -k | grep "UFW DOCKER BLOCK"  # ver bloqueios
 
 ---
 
+### 8.3 Proxy reverso e HTTPS (Caddy)
+
+O Caddy roda como container da stack, na rede `devnet`, e é a **porta de entrada HTTPS** dos projetos. Ele usa uma **CA interna** (`local_certs`) para emitir certificados válidos para `<hostname>.local` **e** para o IP da LAN.
+
+**Divisão de responsabilidades**
+
+| Onde | O quê |
+|---|---|
+| Este repositório (plataforma) | Container, Caddyfile base, snippets, volume da CA, scripts de reload/exportação |
+| Cada projeto (`deploy/homelab/*.caddy`) | Os sites: portas, upstreams, SSE, headers |
+
+**Portas publicadas:** `80` (redireciona para HTTPS), `443` e a faixa `CADDY_APP_PORTS` (padrão `8081-8089`, no `.env`) para sistemas em porta própria. Não é preciso regra no UFW: como são portas de container, valem as regras da seção 8.2 (somente LAN).
+
+#### Publicar um projeto
+
+1. O container do projeto entra na rede `devnet` **sem publicar portas** (o Caddy chega a ele pelo nome):
+   ```yaml
+   services:
+     api:
+       build: .
+       container_name: api
+       networks: [devnet]
+   networks:
+     devnet:
+       external: true
+   ```
+2. Crie o site em `/opt/homelab/infra/caddy/sites/<projeto>.caddy` (modelo em `_exemplo.caddy.txt`). Use `{$HOMELAB_HOST}` e `{$HOMELAB_IP}` — o setup atualiza o IP no `.env` a cada execução:
+   ```caddyfile
+   # Site principal (443; a 80 redireciona)
+   {$HOMELAB_HOST}, {$HOMELAB_IP} {
+   	import security_headers
+   	reverse_proxy site:8080
+   }
+
+   # API com SSE, sem buffer
+   {$HOMELAB_HOST}:8083, {$HOMELAB_IP}:8083 {
+   	reverse_proxy api:8080 {
+   		import sse
+   	}
+   }
+   ```
+   Arquivos de site têm **só blocos de site** — opções globais (`local_certs` etc.) já estão no Caddyfile base.
+3. Recarregue (valida antes; se houver erro, nada é aplicado):
+   ```bash
+   /opt/homelab/scripts/caddy-reload.sh
+   ```
+
+> Se o IP mudar (DHCP), rode o setup novamente para atualizar `HOMELAB_IP` e recrie o Caddy (`docker compose up -d caddy`). O nome `.local` não é afetado.
+
+#### Instalar a CA nos dispositivos
+
+```bash
+/opt/homelab/scripts/caddy-ca.sh      # gera infra/caddy/homelab-root-ca.crt e mostra o SHA-256
+scp eduardo@<host>:/opt/homelab/infra/caddy/homelab-root-ca.crt .   # no Mac
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain homelab-root-ca.crt         # macOS
+```
+
+Confira a impressão digital antes de confiar. Instruções para Windows, Firefox e Android ficam no `deploy/homelab/README.md` de cada projeto. A CA vive no volume `homelab_caddy_data`: **não o apague**, ou todos os dispositivos precisarão da CA nova.
+
+#### Migrar um Caddy existente
+
+Se já existir um Caddy rodando (instalado via `apt` ou em outro compose), o setup **não sobe** o container da stack para não disputar a porta 443 — e avisa. Para migrar **mantendo a mesma CA** (os dispositivos continuam confiando):
+
+```bash
+cd /opt/homelab/infra
+docker compose create caddy                         # cria o volume homelab_caddy_data
+
+# A) Caddy instalado no host (apt)
+sudo systemctl disable --now caddy
+docker run --rm -v homelab_caddy_data:/data -v /var/lib/caddy/.local/share/caddy:/src:ro \
+  alpine sh -c 'mkdir -p /data/caddy && cp -a /src/. /data/caddy/'
+
+# B) Caddy em outro compose — copie do volume de dados dele (/data)
+# docker stop <caddy-antigo>
+# docker run --rm -v homelab_caddy_data:/data -v <volume-antigo>:/src:ro \
+#   alpine sh -c 'cp -a /src/. /data/'
+
+# Sites: mova os blocos do Caddyfile antigo para sites/<projeto>.caddy,
+# removendo opções globais e trocando upstreams localhost:PORTA pelo nome do container na devnet
+docker compose up -d caddy && /opt/homelab/scripts/caddy-reload.sh
+/opt/homelab/scripts/caddy-ca.sh                    # a impressão digital deve ser a mesma de antes
+```
+
+---
+
 ## 9. Operação do dia a dia
 
 ```bash
@@ -366,6 +461,10 @@ jobs:
           rsync -a --delete ./ /opt/homelab/apps/${{ github.event.repository.name }}/
           cd /opt/homelab/apps/${{ github.event.repository.name }}
           docker compose up -d --build
+      - name: Publicar site no Caddy
+        run: |
+          cp deploy/homelab/*.caddy /opt/homelab/infra/caddy/sites/
+          /opt/homelab/scripts/caddy-reload.sh
 ```
 
 ### Segurança do runner
@@ -416,6 +515,10 @@ sudo tlp fullcharge BAT0
 | Servidor mudou de IP | Esperado com DHCP — use `<hostname>.local` |
 | Diagnóstico de rede | `sudo tcpdump -ni any host <IP-do-cliente> -c 20` no L14 e `nc -vz <host> 3306` no cliente |
 | Container `unhealthy` | `docker compose logs <serviço>` |
+| `502 Bad Gateway` no Caddy | O upstream não está na `devnet` ou o nome/porta estão errados: `docker network inspect devnet` e confira `reverse_proxy <container>:<porta-interna>` |
+| Container `caddy` não subiu no setup | Outro Caddy/servidor ocupa a 443 — veja *Migrar um Caddy existente* (seção 8.3) |
+| Navegador acusa certificado inválido | A CA não está instalada no dispositivo, ou o volume `caddy_data` foi recriado (CA nova) — rode `caddy-ca.sh` e reinstale |
+| Certificado não vale para o IP novo | Rode o setup (atualiza `HOMELAB_IP`) e `docker compose up -d caddy` |
 | RabbitMQ perdeu filas após recriar | O `hostname: rabbitmq` foi alterado — o nó grava os dados pelo nome |
 | RedisInsight sem o banco pré-cadastrado | Adicione manualmente (seção 7.2) |
 | Notebook suspendeu com a tampa fechada | Rode `systemctl status systemd-logind` e reinicie; confirme a seção 11 |

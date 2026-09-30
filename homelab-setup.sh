@@ -3,7 +3,8 @@
 #  homelab-setup.sh — Provisionamento do homelab (ThinkPad L14 + Ubuntu Server)
 #
 #  Stack: Docker Engine + Compose | MySQL 8.4 + Adminer | Redis 7 + RedisInsight
-#         RabbitMQ 4 + Management | rede "devnet" | SSH | UFW | fail2ban | mDNS (.local)
+#         RabbitMQ 4 + Management | Caddy (proxy + CA interna) | rede "devnet"
+#         SSH | UFW | fail2ban | mDNS (.local)
 #         tampa fechada sem suspender | preparação GitHub Actions (self-hosted)
 #
 #  Uso:   sudo ./homelab-setup.sh
@@ -334,7 +335,7 @@ ok "UFW ativo: entrada negada por padrão, SSH liberado (com rate-limit), mDNS n
 # ======================= 7. Estrutura de diretórios ==========================
 step "7/11 Criando estrutura de diretórios"
 INFRA_DIR="$HOMELAB_DIR/infra"
-mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} \
+mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} "$INFRA_DIR"/caddy/sites \
          "$HOMELAB_DIR"/{apps,backups/mysql,scripts} \
          "$USER_HOME"/projects/{apps,libs,sandbox}
 
@@ -388,8 +389,79 @@ EOF
 else
   ok "$ENV_FILE já existe — credenciais preservadas"
 fi
+# Chaves do Caddy: adicionadas em instalações antigas; host/IP atualizados a cada execução
+set_env() {
+  if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
+}
+grep -q '^# Caddy' "$ENV_FILE" || printf '\n# Caddy (proxy reverso + CA interna)\n' >> "$ENV_FILE"
+grep -q '^CADDY_APP_PORTS=' "$ENV_FILE" || echo 'CADDY_APP_PORTS=8081-8089' >> "$ENV_FILE"
+set_env HOMELAB_HOST "$(hostname).local"
+set_env HOMELAB_IP "$(hostname -I | awk '{print $1}')"
 chown "$HOMELAB_USER":docker "$ENV_FILE"
 chmod 640 "$ENV_FILE"
+
+# ---- Caddy: arquivo base (plataforma) + snippets; sites de cada projeto em caddy/sites/*.caddy ----
+cat > "$INFRA_DIR/caddy/Caddyfile" <<'EOF'
+# Gerado por homelab-setup.sh — NÃO edite (é sobrescrito).
+# Sites dos projetos: /opt/homelab/infra/caddy/sites/<projeto>.caddy
+{
+	# CA interna do homelab: certificados para <host>.local e para o IP da LAN
+	local_certs
+	skip_install_trust
+}
+
+import sites/*.caddy
+EOF
+
+cat > "$INFRA_DIR/caddy/sites/00-snippets.caddy" <<'EOF'
+# Gerado por homelab-setup.sh — snippets compartilhados pelos sites dos projetos.
+# Uso dentro de um site:  import security_headers
+#        dentro de reverse_proxy:  import sse
+
+# SSE / streaming: repassa a resposta sem buffer
+(sse) {
+	flush_interval -1
+}
+
+(security_headers) {
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+EOF
+
+cat > "$INFRA_DIR/caddy/sites/_exemplo.caddy.txt" <<'EOF'
+# Exemplo de site de projeto — copie para sites/<projeto>.caddy e rode:
+#   /opt/homelab/scripts/caddy-reload.sh
+#
+# {$HOMELAB_HOST} e {$HOMELAB_IP} vêm do .env (o IP é atualizado a cada execução do setup).
+# Upstreams = nome do container na rede devnet + porta INTERNA do container.
+# Portas publicadas pelo Caddy: 80, 443 e a faixa CADDY_APP_PORTS (padrão 8081-8089).
+
+# Site principal (443; a porta 80 redireciona para HTTPS)
+{$HOMELAB_HOST}, {$HOMELAB_IP} {
+	import security_headers
+	reverse_proxy site:8080
+}
+
+# Sistema em porta própria
+{$HOMELAB_HOST}:8081, {$HOMELAB_IP}:8081 {
+	import security_headers
+	reverse_proxy pdv:8080
+}
+
+# API com SSE (sem buffer)
+{$HOMELAB_HOST}:8083, {$HOMELAB_IP}:8083 {
+	reverse_proxy api:8080 {
+		import sse
+	}
+}
+EOF
+chown -R "$HOMELAB_USER":docker "$INFRA_DIR/caddy"
+chmod 2775 "$INFRA_DIR/caddy/sites"   # deploys (gh-runner, grupo docker) podem gravar sites
+ok "Caddy: Caddyfile base + snippets em $INFRA_DIR/caddy"
 
 cat > "$INFRA_DIR/mysql/conf.d/homelab.cnf" <<'EOF'
 [mysqld]
@@ -482,6 +554,25 @@ services:
         condition: service_healthy
     networks: [devnet]
 
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    environment:
+      HOMELAB_HOST: ${HOMELAB_HOST}
+      HOMELAB_IP: ${HOMELAB_IP}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+      - "${CADDY_APP_PORTS}:${CADDY_APP_PORTS}"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/sites:/etc/caddy/sites:ro
+      - caddy_data:/data        # CA interna e certificados — NÃO apague
+      - caddy_config:/config
+    networks: [devnet]
+
   rabbitmq:
     image: rabbitmq:4-management
     container_name: rabbitmq
@@ -509,6 +600,8 @@ volumes:
   redis_data:
   redisinsight_data:
   rabbitmq_data:
+  caddy_data:
+  caddy_config:
 
 networks:
   devnet:
@@ -548,7 +641,27 @@ echo; echo "== UIs =="
 echo "Adminer      http://$HOST:8080"
 echo "RedisInsight http://$HOST:5540"
 echo "RabbitMQ     http://$HOST:15672"
+echo "Caddy        https://$HOST  (sites em /opt/homelab/infra/caddy/sites)"
 EOF
+cat > "$HOMELAB_DIR/scripts/caddy-reload.sh" <<'EOF'
+#!/usr/bin/env bash
+# Valida e recarrega o Caddy sem derrubar conexões (use após alterar caddy/sites/*.caddy)
+set -euo pipefail
+docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+docker exec caddy caddy reload   --config /etc/caddy/Caddyfile --adapter caddyfile
+echo "Caddy recarregado."
+EOF
+
+cat > "$HOMELAB_DIR/scripts/caddy-ca.sh" <<'EOF'
+#!/usr/bin/env bash
+# Exporta o certificado raiz da CA interna do Caddy e mostra a impressão digital (SHA-256)
+set -euo pipefail
+OUT="${1:-/opt/homelab/infra/caddy/homelab-root-ca.crt}"
+docker exec caddy cat /data/caddy/pki/authorities/local/root.crt > "$OUT"
+echo "CA exportada: $OUT"
+openssl x509 -in "$OUT" -noout -subject -enddate -fingerprint -sha256
+EOF
+
 chmod 750 "$HOMELAB_DIR"/scripts/*.sh
 chown "$HOMELAB_USER":docker "$HOMELAB_DIR"/scripts/*.sh
 
@@ -556,7 +669,21 @@ chown "$HOMELAB_USER":docker "$HOMELAB_DIR"/scripts/*.sh
 step "10/11 Baixando imagens e subindo serviços (pode levar alguns minutos)"
 cd "$INFRA_DIR"
 docker compose pull -q
-docker compose up -d --wait --wait-timeout 240
+
+# Não sobe o Caddy da stack se já houver outro Caddy/servidor ocupando a 443
+UP_ARGS=(-d --wait --wait-timeout 240)
+CADDY_CONFLICT=""
+if systemctl is-active --quiet caddy 2>/dev/null; then
+  CADDY_CONFLICT="Caddy instalado no host (apt) está ativo"
+elif ss -tlnH 'sport = :443' | grep -q . && \
+     [[ "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' caddy 2>/dev/null)" != "homelab" ]]; then
+  CADDY_CONFLICT="a porta 443 já está em uso por outro processo/container"
+fi
+if [[ -n "$CADDY_CONFLICT" ]]; then
+  warn "Container caddy da stack NÃO iniciado: ${CADDY_CONFLICT}. Veja 'Migrar um Caddy existente' no README."
+  UP_ARGS+=(--scale caddy=0)
+fi
+docker compose up "${UP_ARGS[@]}"
 ok "Serviços no ar"
 docker compose ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}'
 
@@ -621,6 +748,8 @@ ${C_GREEN}=====================================================================
   MySQL .......... ${HOST}:3306
   Redis .......... ${HOST}:6379
   RabbitMQ AMQP .. ${HOST}:5672
+  Caddy (HTTPS) .. https://${HOST}  — sites em ${INFRA_DIR}/caddy/sites
+  CA do Caddy .... ${HOMELAB_DIR}/scripts/caddy-ca.sh  (instale nos dispositivos)
 
   Use o nome ${HOST}: o IP pode mudar a cada reboot (DHCP).
 
