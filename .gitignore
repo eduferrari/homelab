@@ -1,0 +1,12 @@
+# Credenciais e dados gerados pelo script
+.env
+*.env
+backups/
+*.sql
+*.sql.gz
+*.log
+
+# Editores / SO
+.idea/
+.vscode/
+.DS_Store
