@@ -3,7 +3,7 @@
 #  homelab-setup.sh — Provisionamento do homelab (ThinkPad L14 + Ubuntu Server)
 #
 #  Stack: Docker Engine + Compose | MySQL 8.4 + Adminer | Redis 7 + RedisInsight
-#         RabbitMQ 4 + Management | rede "devnet" | SSH | UFW | fail2ban
+#         RabbitMQ 4 + Management | rede "devnet" | SSH | UFW | fail2ban | mDNS (.local)
 #         tampa fechada sem suspender | preparação GitHub Actions (self-hosted)
 #
 #  Uso:   sudo ./homelab-setup.sh
@@ -87,8 +87,20 @@ apt-get update -qq
 apt-get upgrade -y -qq >/dev/null
 apt_install ca-certificates curl gnupg lsb-release git jq unzip zip htop btop tmux \
   net-tools dnsutils iputils-ping vim nano openssl software-properties-common \
-  unattended-upgrades apt-transport-https bash-completion
-ok "Pacotes base instalados"
+  unattended-upgrades apt-transport-https bash-completion \
+  tcpdump netcat-openbsd avahi-daemon libnss-mdns
+ok "Pacotes base instalados (inclui tcpdump e netcat para diagnóstico)"
+
+# mDNS: o notebook responde como <hostname>.local na LAN, sem depender de IP fixo
+# Anuncia só IPv4: pelo IPv6 as portas dos containers caem no UFW (timeout),
+# e os clientes esperariam esse timeout antes de tentar o IPv4.
+AVAHI_CONF=/etc/avahi/avahi-daemon.conf
+if [[ -f "$AVAHI_CONF" ]]; then
+  sed -i 's/^#\?use-ipv6=.*/use-ipv6=no/; s/^#\?publish-aaaa-on-ipv4=.*/publish-aaaa-on-ipv4=no/' "$AVAHI_CONF"
+fi
+systemctl enable avahi-daemon >/dev/null 2>&1
+systemctl restart avahi-daemon
+ok "mDNS ativo: acesse por $(hostname).local"
 
 timedatectl set-timezone "$TIMEZONE"
 ok "Timezone: $TIMEZONE"
@@ -271,6 +283,10 @@ apt_install ufw
 ufw default deny incoming  >/dev/null
 ufw default allow outgoing >/dev/null
 ufw limit "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
+# mDNS (resolução de <hostname>.local) — apenas redes privadas
+for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12; do
+  ufw allow from "$net" to any port 5353 proto udp comment 'mDNS' >/dev/null
+done
 
 # O Docker publica portas direto no iptables e IGNORA as regras do UFW.
 # Este bloco (padrão ufw-docker) libera as portas dos containers apenas
@@ -313,7 +329,7 @@ fi
 ufw --force enable >/dev/null
 ufw reload >/dev/null
 systemctl restart docker
-ok "UFW ativo: entrada negada por padrão, SSH liberado (com rate-limit)"
+ok "UFW ativo: entrada negada por padrão, SSH liberado (com rate-limit), mDNS na LAN"
 
 # ======================= 7. Estrutura de diretórios ==========================
 step "7/11 Criando estrutura de diretórios"
@@ -522,14 +538,16 @@ cat > "$HOMELAB_DIR/scripts/status.sh" <<'EOF'
 #!/usr/bin/env bash
 # Visão rápida do homelab
 IP="$(hostname -I | awk '{print $1}')"
+HOST="$(hostname).local"
+echo "== Rede =="; echo "IP: $IP | mDNS: $HOST"; echo
 echo "== Containers =="; docker compose -f /opt/homelab/infra/docker-compose.yml ps
 echo; echo "== Firewall =="; sudo ufw status numbered
 echo; echo "== Disco =="; df -h / | tail -1
 echo; echo "== Bateria =="; cat /sys/class/power_supply/BAT0/capacity 2>/dev/null | sed 's/$/%/' || echo "n/d"
 echo; echo "== UIs =="
-echo "Adminer      http://$IP:8080"
-echo "RedisInsight http://$IP:5540"
-echo "RabbitMQ     http://$IP:15672"
+echo "Adminer      http://$HOST:8080"
+echo "RedisInsight http://$HOST:5540"
+echo "RabbitMQ     http://$HOST:15672"
 EOF
 chmod 750 "$HOMELAB_DIR"/scripts/*.sh
 chown "$HOMELAB_USER":docker "$HOMELAB_DIR"/scripts/*.sh
@@ -590,18 +608,21 @@ fi
 
 # ================================ Resumo =====================================
 IP="$(hostname -I | awk '{print $1}')"
+HOST="$(hostname).local"
 cat <<EOF
 
 ${C_GREEN}=====================================================================
-  Homelab pronto!  IP: ${IP}
+  Homelab pronto!  ${HOST}  (IP atual: ${IP})
 =====================================================================${C_RESET}
-  SSH ............ ssh ${HOMELAB_USER}@${IP} -p ${SSH_PORT}
-  Adminer ........ http://${IP}:8080       (servidor: mysql)
-  RedisInsight ... http://${IP}:5540
-  RabbitMQ UI .... http://${IP}:15672
-  MySQL .......... ${IP}:3306
-  Redis .......... ${IP}:6379
-  RabbitMQ AMQP .. ${IP}:5672
+  SSH ............ ssh ${HOMELAB_USER}@${HOST} -p ${SSH_PORT}
+  Adminer ........ http://${HOST}:8080       (servidor: mysql)
+  RedisInsight ... http://${HOST}:5540
+  RabbitMQ UI .... http://${HOST}:15672
+  MySQL .......... ${HOST}:3306
+  Redis .......... ${HOST}:6379
+  RabbitMQ AMQP .. ${HOST}:5672
+
+  Use o nome ${HOST}: o IP pode mudar a cada reboot (DHCP).
 
   Credenciais .... cat ${ENV_FILE}
   Compose ........ cd ${INFRA_DIR} && docker compose ps
