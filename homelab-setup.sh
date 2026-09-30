@@ -92,7 +92,14 @@ apt_install ca-certificates curl gnupg lsb-release git jq unzip zip htop btop tm
 ok "Pacotes base instalados (inclui tcpdump e netcat para diagnóstico)"
 
 # mDNS: o notebook responde como <hostname>.local na LAN, sem depender de IP fixo
-systemctl enable --now avahi-daemon >/dev/null 2>&1
+# Anuncia só IPv4: pelo IPv6 as portas dos containers caem no UFW (timeout),
+# e os clientes esperariam esse timeout antes de tentar o IPv4.
+AVAHI_CONF=/etc/avahi/avahi-daemon.conf
+if [[ -f "$AVAHI_CONF" ]]; then
+  sed -i 's/^#\?use-ipv6=.*/use-ipv6=no/; s/^#\?publish-aaaa-on-ipv4=.*/publish-aaaa-on-ipv4=no/' "$AVAHI_CONF"
+fi
+systemctl enable avahi-daemon >/dev/null 2>&1
+systemctl restart avahi-daemon
 ok "mDNS ativo: acesse por $(hostname).local"
 
 timedatectl set-timezone "$TIMEZONE"

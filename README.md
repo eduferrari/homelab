@@ -243,6 +243,8 @@ O script instala o `avahi-daemon`: o L14 anuncia `<hostname>.local` na LAN e lib
 ping -c 2 homelab-eduardo.local       # do Mac
 ```
 
+O anúncio é **só IPv4** (`use-ipv6=no` no avahi): pelo IPv6 as portas dos containers seriam barradas pelo UFW e cada conexão esperaria um timeout antes de cair no IPv4.
+
 Use sempre o nome nas connection strings: sem acesso ao roteador, o IP pode mudar a cada reboot (DHCP).
 
 > Containers **dentro** do Docker (rede `devnet`) não resolvem `.local` — entre containers use os nomes dos serviços (`mysql`, `redis`, `rabbitmq`).
@@ -409,6 +411,7 @@ sudo tlp fullcharge BAT0
 | `permission denied ... docker.sock` | Faltou reiniciar após a instalação (ou faça logout/login) |
 | UI não abre de outra máquina | Teste `ping <hostname>.local`; confira o IP atual (`hostname -I`) e `docker compose ps` |
 | `Connection refused` em **todas** as portas, mas o SSH pelo Terminal funciona | Permissão de **Rede Local** do macOS: *Ajustes do Sistema → Privacidade e Segurança → Rede Local* — libere o app (Rider, Claude, iTerm…) e reabra-o |
+| 1ª tentativa dá *timeout* e a 2ª conecta | O nome resolveu para IPv6. Confira `use-ipv6=no` em `/etc/avahi/avahi-daemon.conf` e limpe o cache no Mac: `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` |
 | `<hostname>.local` não resolve | `systemctl status avahi-daemon` e `sudo ufw status \| grep 5353` |
 | Servidor mudou de IP | Esperado com DHCP — use `<hostname>.local` |
 | Diagnóstico de rede | `sudo tcpdump -ni any host <IP-do-cliente> -c 20` no L14 e `nc -vz <host> 3306` no cliente |
