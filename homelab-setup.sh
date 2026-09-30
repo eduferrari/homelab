@@ -58,7 +58,12 @@ apt_install() {
 
 # ------------------------------- Pré-checagens -------------------------------
 [[ $EUID -eq 0 ]] || die "Execute com sudo: sudo ./homelab-setup.sh"
-[[ -n "$HOMELAB_USER" ]] || die "Não foi possível detectar o usuário. Use: sudo HOMELAB_USER=<usuario> ./homelab-setup.sh"
+# Executado de dentro de "sudo su"/"sudo -i", o SUDO_USER vira root: tenta o dono da sessão
+if [[ -z "$HOMELAB_USER" || "$HOMELAB_USER" == "root" ]]; then
+  HOMELAB_USER="$(logname 2>/dev/null || true)"
+fi
+[[ -n "$HOMELAB_USER" && "$HOMELAB_USER" != "root" ]] || \
+  die "Não foi possível detectar seu usuário (não use root). Rode a partir do seu usuário: sudo ./homelab-setup.sh  — ou: sudo HOMELAB_USER=<usuario> ./homelab-setup.sh"
 id "$HOMELAB_USER" &>/dev/null || die "Usuário '$HOMELAB_USER' não existe."
 
 # shellcheck disable=SC1091
@@ -200,10 +205,15 @@ if systemctl list-unit-files ssh.socket 2>/dev/null | grep -q '^ssh.socket'; the
   systemctl daemon-reload
 fi
 systemctl enable ssh.service >/dev/null 2>&1
-systemctl restart ssh.service
+if ! systemctl restart ssh.service; then
+  # fallback: algumas instalações ainda dependem do socket — reativa para não perder o acesso
+  warn "ssh.service não subiu sozinho; reativando ssh.socket"
+  systemctl enable --now ssh.socket >/dev/null 2>&1 || true
+  systemctl restart ssh.socket || true
+fi
 sleep 1
 ss -tln | grep -q ":${SSH_PORT} " || die "sshd não está escutando na porta ${SSH_PORT} — veja: journalctl -u ssh -n 30"
-ok "SSH na porta ${SSH_PORT} | root bloqueado | login por senha: ${PASSWORD_AUTH}"
+ok "SSH na porta ${SSH_PORT} | usuário permitido: ${HOMELAB_USER} | root bloqueado | login por senha: ${PASSWORD_AUTH}"
 if [[ "$PASSWORD_AUTH" == "yes" ]]; then
   warn "Login por senha ainda ativo. Copie sua chave (ssh-copy-id) e rode novamente com DISABLE_SSH_PASSWORD=true"
 fi
