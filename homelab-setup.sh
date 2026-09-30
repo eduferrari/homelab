@@ -164,7 +164,16 @@ elif [[ "$DISABLE_SSH_PASSWORD" == "auto" && -s "$USER_HOME/.ssh/authorized_keys
   PASSWORD_AUTH="no"
 fi
 
-cat > /etc/ssh/sshd_config.d/99-homelab.conf <<EOF
+# O Ubuntu lê sshd_config.d em ordem alfabética e a PRIMEIRA ocorrência vence.
+# Por isso o prefixo 00- (antes do 50-cloud-init.conf, que força PasswordAuthentication yes).
+SSHD_DROPIN="/etc/ssh/sshd_config.d/00-homelab.conf"
+rm -f /etc/ssh/sshd_config.d/99-homelab.conf   # nome usado em versões anteriores do script
+
+# No Ubuntu 24.04 o SSH é ativado por socket: /run/sshd só existe depois que
+# o serviço sobe, e sem ele o "sshd -t" falha com "Missing privilege separation directory".
+install -d -m 0755 /run/sshd
+
+cat > "$SSHD_DROPIN" <<EOF
 Port ${SSH_PORT}
 PermitRootLogin no
 PasswordAuthentication ${PASSWORD_AUTH}
@@ -177,11 +186,25 @@ ClientAliveInterval 300
 ClientAliveCountMax 2
 AllowUsers ${HOMELAB_USER}
 EOF
-sshd -t || die "Configuração do SSH inválida — verifique /etc/ssh/sshd_config.d/99-homelab.conf"
-systemctl enable ssh >/dev/null 2>&1
-systemctl restart ssh
+if ! SSHD_CHECK="$(/usr/sbin/sshd -t 2>&1)"; then
+  rm -f "$SSHD_DROPIN"   # não deixa o SSH com configuração quebrada
+  die "Configuração do SSH inválida (arquivo revertido):
+$SSHD_CHECK"
+fi
+
+# 24.04+: o ssh.socket define a porta — o generator relê o sshd_config no daemon-reload
+if systemctl list-unit-files ssh.socket &>/dev/null && systemctl is-enabled ssh.socket &>/dev/null; then
+  systemctl daemon-reload
+  systemctl restart ssh.socket
+  systemctl restart ssh.service 2>/dev/null || true
+else
+  systemctl enable ssh >/dev/null 2>&1
+  systemctl restart ssh
+fi
 ok "SSH na porta ${SSH_PORT} | root bloqueado | login por senha: ${PASSWORD_AUTH}"
-[[ "$PASSWORD_AUTH" == "yes" ]] && warn "Login por senha ainda ativo. Copie sua chave (ssh-copy-id) e rode novamente com DISABLE_SSH_PASSWORD=true"
+if [[ "$PASSWORD_AUTH" == "yes" ]]; then
+  warn "Login por senha ainda ativo. Copie sua chave (ssh-copy-id) e rode novamente com DISABLE_SSH_PASSWORD=true"
+fi
 
 apt_install fail2ban
 cat > /etc/fail2ban/jail.d/homelab.local <<EOF

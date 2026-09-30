@@ -396,7 +396,7 @@ sudo tlp fullcharge BAT0
 | RabbitMQ perdeu filas após recriar | O `hostname: rabbitmq` foi alterado — o nó grava os dados pelo nome |
 | RedisInsight sem o banco pré-cadastrado | Adicione manualmente (seção 7.2) |
 | Notebook suspendeu com a tampa fechada | Rode `systemctl status systemd-logind` e reinicie; confirme a seção 11 |
-| Bloqueado fora do SSH | Acesse pelo teclado local e revise `/etc/ssh/sshd_config.d/99-homelab.conf` |
+| Bloqueado fora do SSH | Acesse pelo teclado local e revise `/etc/ssh/sshd_config.d/00-homelab.conf` |
 | Porta 8080 conflita com uma API | Altere `ADMINER_PORT` no `.env` e rode `docker compose up -d` |
 
 Log completo da instalação: `/var/log/homelab-setup.log`
