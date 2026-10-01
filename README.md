@@ -153,6 +153,7 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
     ├── status.sh               # visão rápida do homelab
     ├── backup.sh               # backup completo ou por componente (root)
     ├── restore.sh              # restauração por componente (root)
+    ├── backup-disk-setup.sh    # prepara o SSD externo (comando separado)
     ├── backup-mysql.sh         # atalho para "backup.sh mysql" (compatibilidade)
     ├── caddy-reload.sh         # valida e recarrega o Caddy
     ├── caddy-ca.sh             # exporta a CA interna + impressão digital
@@ -163,6 +164,7 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
 ├── libs/      # bibliotecas / pacotes
 └── sandbox/   # experimentos
 
+/mnt/backup-ssd/homelab/        # cópia dos backups no SSD externo (seção 9.1)
 /opt/actions-runner/            # runner do GitHub Actions
 /var/log/homelab-setup.log      # log da instalação
 ```
@@ -384,7 +386,7 @@ docker compose down                   # parar tudo (dados preservados)
 
 ### 9.1 Backup e restauração
 
-Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd, com até 15 min de atraso aleatório; se o L14 estiver desligado, roda ao ligar). Cada execução cria um diretório `/opt/homelab/backups/AAAA-MM-DD_HHMMSS/`:
+Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd, com até 15 min de atraso aleatório; se o L14 estiver desligado, roda ao ligar). Ele grava em `/opt/homelab/backups/AAAA-MM-DD_HHMMSS/` (disco interno) e, em seguida, **copia para o SSD externo** (veja *SSD externo* abaixo):
 
 | Arquivo | Conteúdo | Como é gerado |
 |---|---|---|
@@ -431,16 +433,73 @@ sudo /opt/homelab/scripts/restore.sh latest config   # só extrai em /tmp para c
 | `rabbitmq` | Importa as definições (mescla com as existentes) |
 | `caddy` | Substitui a CA e os certificados — confira depois com `caddy-ca.sh` |
 
-#### Cópia fora do L14 (recomendado)
+#### SSD externo
 
-O backup fica no mesmo disco do servidor: protege contra erro humano e dados corrompidos, **não** contra perda/roubo do notebook ou falha do SSD. Puxe uma cópia para o Mac periodicamente:
+O backup no disco interno protege contra erro humano e dados corrompidos; a cópia no **SSD externo** protege contra falha do SSD do notebook. Cada backup completo é copiado para o SSD com conferência de checksums.
+
+**Configurar (comando separado, uma vez):**
 
 ```bash
-# no Mac
-rsync -a --delete eduardo@homelab-eduardo.local:/opt/homelab/backups/ ~/Backups/homelab/
+# 1. Conecte o SSD na USB e identifique o disco (nada é alterado)
+sudo /opt/homelab/scripts/backup-disk-setup.sh
+
+# 2a. SSD novo/vazio — APAGA o disco e cria ext4 (pede para digitar o caminho do disco)
+sudo /opt/homelab/scripts/backup-disk-setup.sh /dev/sdX --format
+
+# 2b. ou: SSD que já tem uma partição Linux (ext4/xfs/btrfs) — não apaga nada
+sudo /opt/homelab/scripts/backup-disk-setup.sh /dev/sdX1
 ```
 
-Para automatizar, agende esse comando no Mac (por exemplo, com um `launchd` diário depois das 03:30).
+> Use o nome que a listagem mostrar (`/dev/sda`, `/dev/sdb`…). O script **recusa** o disco do sistema e partições exFAT/NTFS (os backups precisam de permissões Unix e links).
+
+O que ele faz:
+- monta a partição **por UUID** em `/mnt/backup-ssd` via `/etc/fstab` com `nofail` — o servidor inicia normalmente mesmo sem o SSD;
+- cria `/mnt/backup-ssd/homelab` (`750`, dono `root`, grupo do seu usuário);
+- grava no `.env`: `BACKUP_EXTERNAL_MOUNT`, `BACKUP_EXTERNAL_DIR` e `BACKUP_EXTERNAL_KEEP_DAYS=30`;
+- copia para o SSD os backups locais que já existem.
+
+**Como a cópia funciona**
+- O SSD guarda mais histórico que o disco interno: **30 dias** (`BACKUP_EXTERNAL_KEEP_DAYS`) contra 7 (`BACKUP_KEEP_DAYS`).
+- Se o SSD não estiver montado, o backup local acontece normalmente, **nada é gravado no ponto de montagem vazio** e o serviço termina com erro (código 2) para aparecer no `journalctl`/`status.sh`.
+- Ao reconectar o SSD, o próximo backup copia **todos** os backups locais que faltam no SSD — os dias desconectados são recuperados (enquanto ainda estiverem na retenção local de 7 dias).
+- Cópias são gravadas como `*.partial` e só são renomeadas após conferir os checksums.
+
+```bash
+sudo /opt/homelab/scripts/backup.sh --sync-external   # copia agora, sem gerar backup novo
+/opt/homelab/scripts/status.sh                        # mostra se o SSD está montado e o último backup nele
+ls -l /mnt/backup-ssd/homelab/
+```
+
+**Restaurar a partir do SSD** — o `restore.sh` aceita caminho absoluto:
+
+```bash
+sudo /opt/homelab/scripts/restore.sh /mnt/backup-ssd/homelab/latest redis
+```
+
+**Desconectar o SSD com segurança:** `sudo umount /mnt/backup-ssd` antes de remover.
+
+> ⚠️ O SSD guarda segredos sem criptografia (`.env`, chave privada da CA do Caddy, senha do Wi-Fi). Guarde-o como guardaria as senhas.
+
+#### Recuperação total (L14 novo ou SSD interno trocado)
+
+```bash
+# 1. Instale o Ubuntu Server, clone o repositório e conecte o SSD de backup
+sudo mkdir -p /mnt/backup-ssd && sudo mount /dev/sdX1 /mnt/backup-ssd
+
+# 2. Recupere o .env ANTES do setup (as senhas antigas são reaproveitadas)
+sudo mkdir -p /opt/homelab/infra
+sudo tar xzf /mnt/backup-ssd/homelab/latest/config.tar.gz -C / opt/homelab/infra/.env
+sudo umount /mnt/backup-ssd
+
+# 3. Rode o setup e reconfigure o SSD (sem --format!)
+sudo ./homelab-setup.sh
+sudo /opt/homelab/scripts/backup-disk-setup.sh /dev/sdX1
+
+# 4. Restaure os dados
+B=/mnt/backup-ssd/homelab/latest
+for c in mysql redis rabbitmq caddy; do sudo /opt/homelab/scripts/restore.sh $B $c --yes; done
+sudo /opt/homelab/scripts/restore.sh $B config   # compare SSH/UFW/netplan e copie o que precisar
+```
 
 ### Volumes
 
@@ -565,6 +624,8 @@ sudo tlp fullcharge BAT0
 | Navegador acusa certificado inválido | A CA não está instalada no dispositivo, ou o volume `caddy_data` foi recriado (CA nova) — rode `caddy-ca.sh` e reinstale |
 | Certificado não vale para o IP novo | Rode o setup (atualiza `HOMELAB_IP`) e `docker compose up -d caddy` |
 | Backup falhou | `journalctl -u homelab-backup -n 50` mostra o componente com `✘`; corrija e rode `sudo /opt/homelab/scripts/backup.sh <componente>` |
+| Backup terminou com código 2 / `SSD externo não está montado` | Conecte o SSD e rode `sudo mount /mnt/backup-ssd && sudo /opt/homelab/scripts/backup.sh --sync-external` |
+| SSD não monta no boot | `lsblk -f` (o UUID mudou? reformatado?) — rode de novo `backup-disk-setup.sh /dev/sdX1`; o fstab anterior fica em `/etc/fstab.homelab.bak` |
 | `Checksum inválido` no restore | Arquivo do backup corrompido — use outro backup (`ls /opt/homelab/backups`) |
 | `Permission denied` ao listar backups | Esperado para outros usuários; use o seu usuário ou `sudo` |
 | RabbitMQ perdeu filas após recriar | O `hostname: rabbitmq` foi alterado — o nó grava os dados pelo nome |

@@ -89,7 +89,7 @@ apt-get upgrade -y -qq >/dev/null
 apt_install ca-certificates curl gnupg lsb-release git jq unzip zip htop btop tmux \
   net-tools dnsutils iputils-ping vim nano openssl software-properties-common \
   unattended-upgrades apt-transport-https bash-completion \
-  tcpdump netcat-openbsd avahi-daemon libnss-mdns
+  tcpdump netcat-openbsd avahi-daemon libnss-mdns rsync parted
 ok "Pacotes base instalados (inclui tcpdump e netcat para diagnóstico)"
 
 # mDNS: o notebook responde como <hostname>.local na LAN, sem depender de IP fixo
@@ -623,7 +623,10 @@ printf '#!/usr/bin/env bash\nHOMELAB_DIR="%s"\nBACKUP_GROUP="%s"\n' "$HOMELAB_DI
 cat >> "$HOMELAB_DIR/scripts/backup.sh" <<'EOF'
 # Backup do homelab: MySQL, Redis, RabbitMQ (definições), Caddy (CA) e configurações.
 # Uso: sudo backup.sh [all|mysql|redis|rabbitmq|caddy|config ...]
+#      sudo backup.sh --sync-external      # só copia para o SSD externo
 # Agendado diariamente pelo homelab-backup.timer (systemd).
+# Backup completo: grava em $HOMELAB_DIR/backups e copia para o SSD externo
+# (configurado por backup-disk-setup.sh).
 set -Eeuo pipefail
 
 INFRA="$HOMELAB_DIR/infra"
@@ -638,6 +641,13 @@ log()    { echo "[$(date '+%F %T')] $*"; }
 
 KEEP_DAYS="${KEEP_DAYS:-$(envget BACKUP_KEEP_DAYS)}"
 KEEP_DAYS="${KEEP_DAYS:-7}"
+EXT_MNT="$(envget BACKUP_EXTERNAL_MOUNT)"
+EXT_DIR="$(envget BACKUP_EXTERNAL_DIR)"
+EXT_KEEP="$(envget BACKUP_EXTERNAL_KEEP_DAYS)"
+EXT_KEEP="${EXT_KEEP:-30}"
+
+SYNC_ONLY=0
+if [[ "${1:-}" == "--sync-external" ]]; then SYNC_ONLY=1; shift; fi
 
 COMPONENTS=("$@")
 if [[ ${#COMPONENTS[@]} -eq 0 || "${COMPONENTS[0]}" == "all" ]]; then
@@ -650,6 +660,50 @@ fi
 # Um backup por vez
 exec 9>/run/homelab-backup.lock
 flock -n 9 || { log "Outro backup já está em execução"; exit 1; }
+
+# ------------------------------------------------ Cópia para o SSD externo
+# Copia todo backup local que ainda não está no SSD (recupera dias em que ele
+# estava desconectado), confere os checksums na cópia e aplica a retenção do SSD.
+sync_external() {
+  if [[ -z "$EXT_MNT" || -z "$EXT_DIR" ]]; then
+    log "SSD externo não configurado (rode backup-disk-setup.sh) — cópia externa ignorada"
+    return 0
+  fi
+  # nofail no fstab: sem o disco, o diretório existe vazio no disco interno — nunca grave nele
+  mountpoint -q "$EXT_MNT" || mount "$EXT_MNT" 2>/dev/null || true
+  if ! mountpoint -q "$EXT_MNT"; then
+    log "✘ SSD externo não está montado em $EXT_MNT — conecte o disco"
+    return 1
+  fi
+  mkdir -p "$EXT_DIR"
+  rm -rf "$EXT_DIR"/*.partial
+
+  local d name copied=0 latest
+  for d in "$ROOT"/20??-??-??_*; do
+    [[ -f "$d/SHA256SUMS" ]] || continue
+    name="$(basename "$d")"
+    [[ -d "$EXT_DIR/$name" ]] && continue
+    rsync -a "$d/" "$EXT_DIR/$name.partial/" || { log "✘ falha ao copiar $name"; return 1; }
+    if ! (cd "$EXT_DIR/$name.partial" && sha256sum -c --quiet SHA256SUMS); then
+      log "✘ checksum divergente na cópia de $name"
+      return 1
+    fi
+    mv "$EXT_DIR/$name.partial" "$EXT_DIR/$name"
+    copied=$(( copied + 1 ))
+  done
+
+  latest="$(readlink "$ROOT/latest" 2>/dev/null || true)"
+  if [[ -n "$latest" && -d "$EXT_DIR/$latest" ]]; then ln -sfn "$latest" "$EXT_DIR/latest"; fi
+  find "$EXT_DIR" -mindepth 1 -maxdepth 1 -type d -name '20??-??-??_*' \
+    -mtime +"$EXT_KEEP" -print -exec rm -rf {} + | sed 's/^/  removido do SSD: /'
+  sync
+  log "SSD externo: ${copied} backup(s) copiado(s) | livre: $(df -h --output=avail "$EXT_MNT" | tail -1 | tr -d ' ') | retenção: ${EXT_KEEP} dias"
+}
+
+if (( SYNC_ONLY )); then
+  sync_external && exit 0
+  exit 2
+fi
 
 mkdir -p "$ROOT"
 AVAIL_KB="$(df --output=avail -k "$ROOT" | tail -1 | tr -d ' ')"
@@ -789,6 +843,11 @@ if (( FULL_RUN )); then
   # retenção só após um backup completo bem-sucedido
   find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name '20??-??-??_*' \
     -mtime +"$KEEP_DAYS" -print -exec rm -rf {} + | sed 's/^/  removido: /'
+
+  if ! sync_external; then
+    log "Backup local concluído, mas a cópia para o SSD externo FALHOU"
+    exit 2
+  fi
 fi
 log "Backup concluído com sucesso"
 EOF
@@ -936,6 +995,151 @@ case "$COMP" in
 esac
 EOF
 
+# Preparação do SSD externo (comando separado — veja o README)
+printf '#!/usr/bin/env bash\nHOMELAB_DIR="%s"\nBACKUP_GROUP="%s"\n' "$HOMELAB_DIR" "$BACKUP_GROUP" \
+  > "$HOMELAB_DIR/scripts/backup-disk-setup.sh"
+cat >> "$HOMELAB_DIR/scripts/backup-disk-setup.sh" <<'EOF'
+# Prepara um SSD externo como destino da cópia dos backups do homelab.
+#
+#   sudo backup-disk-setup.sh                     # lista os discos (não altera nada)
+#   sudo backup-disk-setup.sh /dev/sdX --format   # APAGA o disco, cria GPT + ext4 e configura
+#   sudo backup-disk-setup.sh /dev/sdX1           # usa uma partição Linux existente (sem apagar)
+#
+# Monta por UUID em /mnt/backup-ssd (fstab com nofail: o servidor inicia mesmo sem o disco),
+# grava BACKUP_EXTERNAL_* no .env e copia os backups locais existentes.
+set -Eeuo pipefail
+
+INFRA="$HOMELAB_DIR/infra"
+ENV_FILE="$INFRA/.env"
+MNT="${BACKUP_MOUNT:-/mnt/backup-ssd}"
+LABEL="HOMELAB-BKP"
+FSTAB_MARK="# homelab-backup-ssd (gerenciado por backup-disk-setup.sh)"
+
+log() { echo "==> $*"; }
+die() { echo "✘ $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "Execute com sudo: sudo $0 $*"
+[[ -f "$ENV_FILE" ]] || die "$ENV_FILE não encontrado — rode o homelab-setup.sh antes"
+
+set_env() {
+  if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
+}
+disk_of() { { lsblk -lnpso NAME,TYPE "$1" 2>/dev/null || true; } | awk '$2=="disk"||$2=="loop"{print $1; exit}'; }
+is_whole_disk() { [[ "$(lsblk -dno TYPE "$1")" =~ ^(disk|loop)$ ]]; }
+
+ROOT_DISK="$(disk_of "$(findmnt -n -o SOURCE /)")"
+
+usage() {
+  echo
+  echo "Uso:"
+  echo "  sudo $0 /dev/sdX --format    # apaga o disco e prepara (ext4)"
+  echo "  sudo $0 /dev/sdX1            # usa partição ext4/xfs/btrfs existente"
+}
+
+list_disks() {
+  echo "Discos encontrados:"
+  local name rest
+  while read -r name rest; do
+    if [[ "$name" == "$ROOT_DISK" ]]; then
+      echo "  $name $rest   ← DISCO DO SISTEMA (não use)"
+    else
+      echo "  $name $rest"
+    fi
+  done < <(lsblk -dpno NAME,SIZE,TRAN,MODEL -e 7,11)
+  echo
+  lsblk -po NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS -e 7,11
+}
+
+DEV=""; FORMAT=0
+for arg in "$@"; do
+  case "$arg" in
+    --format) FORMAT=1 ;;
+    /dev/*)   DEV="$arg" ;;
+    *) die "Argumento inválido: $arg" ;;
+  esac
+done
+
+if [[ -z "$DEV" ]]; then list_disks; usage; exit 0; fi
+[[ -b "$DEV" ]] || die "$DEV não é um dispositivo de bloco"
+[[ "$(disk_of "$DEV")" != "$ROOT_DISK" ]] || die "$DEV pertence ao disco do sistema ($ROOT_DISK)"
+
+# Re-execução: libera o ponto de montagem atual
+if mountpoint -q "$MNT"; then umount "$MNT" || die "Não foi possível desmontar $MNT (em uso?)"; fi
+
+if (( FORMAT )); then
+  is_whole_disk "$DEV" || die "--format exige o disco inteiro (ex.: /dev/sdb), não uma partição"
+  if lsblk -nro MOUNTPOINTS "$DEV" | grep -q .; then
+    die "Há partições de $DEV montadas (automount?). Desmonte antes: lsblk $DEV"
+  fi
+  echo
+  lsblk -po NAME,SIZE,FSTYPE,LABEL,MODEL "$DEV"
+  echo
+  echo "⚠️  TODOS os dados de $DEV serão APAGADOS."
+  read -rp "Para confirmar, digite o caminho do disco ($DEV): " answer
+  [[ "$answer" == "$DEV" ]] || die "Cancelado"
+
+  log "Criando tabela GPT e partição ext4..."
+  wipefs -a "$DEV" >/dev/null
+  parted -s "$DEV" mklabel gpt mkpart homelab-backup ext4 0% 100%
+  partprobe "$DEV" 2>/dev/null || true
+  udevadm settle 2>/dev/null || sleep 2
+  PART="$(lsblk -lnpo NAME,TYPE "$DEV" | awk '$2=="part"{print $1; exit}')"
+  [[ -n "$PART" && -b "$PART" ]] || die "Partição não encontrada após o particionamento"
+  mkfs.ext4 -F -q -L "$LABEL" -m 0 "$PART"
+else
+  PART="$DEV"
+  if is_whole_disk "$DEV"; then
+    PART="$(lsblk -lnpo NAME,TYPE "$DEV" | awk '$2=="part"{print $1; exit}')"
+    [[ -n "$PART" ]] || die "$DEV não tem partições. Use --format para preparar o disco."
+  fi
+  if lsblk -nro MOUNTPOINTS "$PART" | grep -q .; then
+    die "$PART está montada em $(lsblk -nro MOUNTPOINTS "$PART"). Desmonte antes: sudo umount $PART"
+  fi
+fi
+
+FSTYPE="$(blkid -s TYPE -o value "$PART" 2>/dev/null || true)"
+case "$FSTYPE" in
+  ext4|xfs|btrfs) ;;
+  *) die "$PART tem sistema de arquivos '${FSTYPE:-nenhum}'. Os backups exigem ext4/xfs/btrfs (permissões e links). Use --format." ;;
+esac
+UUID="$(blkid -s UUID -o value "$PART")"
+[[ -n "$UUID" ]] || die "UUID de $PART não encontrado"
+
+log "Configurando montagem automática (fstab, por UUID)..."
+mkdir -p "$MNT"
+cp -a /etc/fstab /etc/fstab.homelab.bak
+awk -v m="$MNT" -v mark="$FSTAB_MARK" '$0 != mark && $2 != m' /etc/fstab.homelab.bak > /etc/fstab
+printf '%s\nUUID=%s %s %s defaults,noatime,nofail,x-systemd.device-timeout=10s 0 2\n' \
+  "$FSTAB_MARK" "$UUID" "$MNT" "$FSTYPE" >> /etc/fstab
+if ! findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; then
+  cp -a /etc/fstab.homelab.bak /etc/fstab
+  die "fstab inválido — arquivo original restaurado"
+fi
+systemctl daemon-reload 2>/dev/null || true
+mount "$MNT" || { cp -a /etc/fstab.homelab.bak /etc/fstab; systemctl daemon-reload 2>/dev/null || true; die "Falha ao montar — fstab restaurado"; }
+mountpoint -q "$MNT" || die "$MNT não ficou montado"
+
+EXT_DIR="$MNT/homelab"
+install -d -m 750 -o root -g "$BACKUP_GROUP" "$EXT_DIR"
+echo ok > "$EXT_DIR/.write-test" && rm -f "$EXT_DIR/.write-test" || die "Sem permissão de escrita em $EXT_DIR"
+
+set_env BACKUP_EXTERNAL_MOUNT "$MNT"
+set_env BACKUP_EXTERNAL_DIR "$EXT_DIR"
+grep -q '^BACKUP_EXTERNAL_KEEP_DAYS=' "$ENV_FILE" || set_env BACKUP_EXTERNAL_KEEP_DAYS 30
+log "Configuração gravada em $ENV_FILE (BACKUP_EXTERNAL_*)"
+
+log "Copiando backups locais existentes para o SSD..."
+"$HOMELAB_DIR/scripts/backup.sh" --sync-external || echo "  ! cópia inicial falhou — veja a mensagem acima"
+
+echo
+echo "✔ SSD externo pronto"
+echo "  Partição ...... $PART ($FSTYPE, UUID=$UUID)"
+echo "  Montado em .... $MNT  →  backups em $EXT_DIR"
+echo "  Espaço ........ $(df -h --output=size,avail "$MNT" | tail -1 | awk '{print $2" livres de "$1}')"
+echo "  Retenção ...... $(grep '^BACKUP_EXTERNAL_KEEP_DAYS=' "$ENV_FILE" | cut -d= -f2) dias (BACKUP_EXTERNAL_KEEP_DAYS no .env)"
+echo "  O backup diário (03:00) copia para o SSD automaticamente."
+EOF
+
 # Compatibilidade com a versão anterior
 cat > "$HOMELAB_DIR/scripts/backup-mysql.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -962,6 +1166,15 @@ echo; echo "== Backup =="
 LAST="$(readlink /opt/homelab/backups/latest 2>/dev/null || echo 'nenhum')"
 echo "Último backup completo: $LAST"
 systemctl list-timers homelab-backup.timer --no-pager 2>/dev/null | sed -n 2p
+EXT_MNT="$(grep -m1 '^BACKUP_EXTERNAL_MOUNT=' /opt/homelab/infra/.env 2>/dev/null | cut -d= -f2-)"
+EXT_DIR="$(grep -m1 '^BACKUP_EXTERNAL_DIR=' /opt/homelab/infra/.env 2>/dev/null | cut -d= -f2-)"
+if [[ -z "$EXT_MNT" ]]; then
+  echo "SSD externo: não configurado (sudo /opt/homelab/scripts/backup-disk-setup.sh)"
+elif mountpoint -q "$EXT_MNT"; then
+  echo "SSD externo: montado em $EXT_MNT | livre $(df -h --output=avail "$EXT_MNT" | tail -1 | tr -d ' ') | último: $(readlink "$EXT_DIR/latest" 2>/dev/null || echo 'nenhum')"
+else
+  echo "SSD externo: ⚠️  NÃO montado em $EXT_MNT — conecte o disco"
+fi
 EOF
 cat > "$HOMELAB_DIR/scripts/caddy-reload.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -988,7 +1201,7 @@ chown "$HOMELAB_USER":docker "$HOMELAB_DIR"/scripts/*.sh
 # Backup diário às 03:00 (systemd: roda como root, log no journal, recupera execuções perdidas)
 cat > /etc/systemd/system/homelab-backup.service <<EOF
 [Unit]
-Description=Backup do homelab (MySQL, Redis, RabbitMQ, Caddy e configurações)
+Description=Backup do homelab (MySQL, Redis, RabbitMQ, Caddy, configurações) + cópia para SSD externo
 Wants=docker.service
 After=docker.service
 
@@ -1101,6 +1314,7 @@ ${C_GREEN}=====================================================================
   Caddy (HTTPS) .. https://${HOST}  — sites em ${INFRA_DIR}/caddy/sites
   CA do Caddy .... ${HOMELAB_DIR}/scripts/caddy-ca.sh  (instale nos dispositivos)
   Backup ......... diário 03:00 → ${HOMELAB_DIR}/backups  (manual: sudo ${HOMELAB_DIR}/scripts/backup.sh)
+  SSD externo .... sudo ${HOMELAB_DIR}/scripts/backup-disk-setup.sh  (lista discos e prepara a cópia)
 
   Use o nome ${HOST}: o IP pode mudar a cada reboot (DHCP).
 
