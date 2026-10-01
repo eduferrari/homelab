@@ -123,7 +123,7 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
 | 6 | Firewall | UFW: entrada negada, saída liberada, SSH com rate-limit, mDNS só da LAN; integração UFW+Docker (ver seção 8.2) |
 | 7 | Diretórios | Estrutura da seção 6 |
 | 8 | Rede | `docker network create devnet` |
-| 9 | Stack | Gera `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf`, Caddyfile base + snippets e scripts utilitários |
+| 9 | Stack | Gera `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf`, Caddyfile base + snippets, scripts utilitários e o backup diário (`homelab-backup.timer`) |
 | 10 | Subida | `docker compose up -d --wait` (aguarda os healthchecks) |
 | 11 | GitHub Actions | Usuário `gh-runner`, download da última versão do runner e script de registro |
 
@@ -146,10 +146,14 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
 │           ├── _exemplo.caddy.txt     # modelo de site de projeto
 │           └── <projeto>.caddy        # um arquivo por projeto
 ├── apps/                       # destino de deploy dos seus projetos (CI/CD)
-├── backups/mysql/              # dumps gerados pelo backup-mysql.sh
+├── backups/                    # root:<seu grupo> 750 — contém segredos
+│   ├── AAAA-MM-DD_HHMMSS/      # um diretório por backup (ver seção 9.1)
+│   └── latest -> ...           # último backup COMPLETO bem-sucedido
 └── scripts/
     ├── status.sh               # visão rápida do homelab
-    ├── backup-mysql.sh         # backup de todos os bancos (retém 7 dias)
+    ├── backup.sh               # backup completo ou por componente (root)
+    ├── restore.sh              # restauração por componente (root)
+    ├── backup-mysql.sh         # atalho para "backup.sh mysql" (compatibilidade)
     ├── caddy-reload.sh         # valida e recarrega o Caddy
     ├── caddy-ca.sh             # exporta a CA interna + impressão digital
     └── register-runner.sh      # registra o runner do GitHub Actions
@@ -378,24 +382,65 @@ docker compose down                   # parar tudo (dados preservados)
 /opt/homelab/scripts/status.sh        # resumo geral (containers, firewall, disco, bateria)
 ```
 
-### Backup do MySQL
+### 9.1 Backup e restauração
+
+Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd, com até 15 min de atraso aleatório; se o L14 estiver desligado, roda ao ligar). Cada execução cria um diretório `/opt/homelab/backups/AAAA-MM-DD_HHMMSS/`:
+
+| Arquivo | Conteúdo | Como é gerado |
+|---|---|---|
+| `mysql-all.sql.gz` | Todos os bancos, usuários, rotinas, triggers e eventos | `mysqldump --single-transaction` (sem travar as tabelas) — validado pela linha `Dump completed` |
+| `redis-dump.rdb.gz` | Snapshot do Redis | `BGSAVE` consistente, sem parar o serviço |
+| `rabbitmq-definitions.json` | vhosts, usuários, permissões, filas, exchanges, bindings, policies | `rabbitmqctl export_definitions` |
+| `caddy-data.tar.gz` | **CA interna** + certificados do Caddy | cópia do volume `caddy_data` (ou de `/var/lib/caddy` se o Caddy for do host) |
+| `config.tar.gz` | `.env`, compose, `my.cnf`, Caddyfile e sites, SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do backup | `tar` |
+| `SHA256SUMS` | Checksums de todos os arquivos | conferidos antes de qualquer restauração |
+
+**Não entram no backup:** mensagens que estão nas filas do RabbitMQ (só as definições), código dos projetos (fica no Git), registro do runner do GitHub (registre de novo) e preferências do RedisInsight.
+
+**Regras de segurança do processo**
+- Um backup por vez (`flock`); aborta se houver menos de 1 GB livre.
+- Se **qualquer** componente falhar, o comando sai com erro e a **retenção não é aplicada** — backups antigos nunca são apagados por causa de um backup ruim.
+- Retenção: `BACKUP_KEEP_DAYS` no `.env` (padrão **7** dias). O link `latest` aponta sempre para o último backup completo bem-sucedido.
+- Os arquivos contêm segredos (`.env`, chave da CA): diretórios `750` e arquivos `640`, dono `root`, grupo do seu usuário — só você e o root leem.
+
+**Comandos**
 
 ```bash
-/opt/homelab/scripts/backup-mysql.sh
+sudo /opt/homelab/scripts/backup.sh                  # backup completo agora
+sudo /opt/homelab/scripts/backup.sh redis rabbitmq   # só alguns componentes
+
+systemctl list-timers homelab-backup.timer           # próxima execução
+journalctl -u homelab-backup -n 50 --no-pager        # log da última execução
+ls -l /opt/homelab/backups/                          # backups disponíveis
 ```
 
-Agendar diariamente às 3h (`crontab -e`):
-
-```cron
-0 3 * * * /opt/homelab/scripts/backup-mysql.sh >> /opt/homelab/backups/backup.log 2>&1
-```
-
-Restaurar:
+**Restaurar** (pede confirmação digitando `SIM`; `--yes` pula):
 
 ```bash
-gunzip -c /opt/homelab/backups/mysql/mysql-AAAA-MM-DD_HHMM.sql.gz \
-  | docker exec -i -e MYSQL_PWD='<MYSQL_ROOT_PASSWORD>' mysql mysql -uroot
+sudo /opt/homelab/scripts/restore.sh latest mysql
+sudo /opt/homelab/scripts/restore.sh 2026-10-01_030512 redis
+sudo /opt/homelab/scripts/restore.sh latest rabbitmq
+sudo /opt/homelab/scripts/restore.sh latest caddy
+sudo /opt/homelab/scripts/restore.sh latest config   # só extrai em /tmp para comparar — não sobrescreve nada
 ```
+
+| Componente | O que a restauração faz |
+|---|---|
+| `mysql` | Sobrescreve todos os bancos **e usuários** com o dump |
+| `redis` | Para o Redis, troca os dados do volume, carrega o snapshot sem AOF, regenera o AOF a partir da memória e sobe de novo (*trocar só o `dump.rdb` não funciona com AOF ativo — o Redis ignoraria o snapshot*) |
+| `rabbitmq` | Importa as definições (mescla com as existentes) |
+| `caddy` | Substitui a CA e os certificados — confira depois com `caddy-ca.sh` |
+
+#### Cópia fora do L14 (recomendado)
+
+O backup fica no mesmo disco do servidor: protege contra erro humano e dados corrompidos, **não** contra perda/roubo do notebook ou falha do SSD. Puxe uma cópia para o Mac periodicamente:
+
+```bash
+# no Mac
+rsync -a --delete eduardo@homelab-eduardo.local:/opt/homelab/backups/ ~/Backups/homelab/
+```
+
+Para automatizar, agende esse comando no Mac (por exemplo, com um `launchd` diário depois das 03:30).
 
 ### Volumes
 
@@ -519,6 +564,9 @@ sudo tlp fullcharge BAT0
 | Container `caddy` não subiu no setup | Outro Caddy/servidor ocupa a 443 — veja *Migrar um Caddy existente* (seção 8.3) |
 | Navegador acusa certificado inválido | A CA não está instalada no dispositivo, ou o volume `caddy_data` foi recriado (CA nova) — rode `caddy-ca.sh` e reinstale |
 | Certificado não vale para o IP novo | Rode o setup (atualiza `HOMELAB_IP`) e `docker compose up -d caddy` |
+| Backup falhou | `journalctl -u homelab-backup -n 50` mostra o componente com `✘`; corrija e rode `sudo /opt/homelab/scripts/backup.sh <componente>` |
+| `Checksum inválido` no restore | Arquivo do backup corrompido — use outro backup (`ls /opt/homelab/backups`) |
+| `Permission denied` ao listar backups | Esperado para outros usuários; use o seu usuário ou `sudo` |
 | RabbitMQ perdeu filas após recriar | O `hostname: rabbitmq` foi alterado — o nó grava os dados pelo nome |
 | RedisInsight sem o banco pré-cadastrado | Adicione manualmente (seção 7.2) |
 | Notebook suspendeu com a tampa fechada | Rode `systemctl status systemd-logind` e reinicie; confirme a seção 11 |

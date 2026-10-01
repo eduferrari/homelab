@@ -4,7 +4,7 @@
 #
 #  Stack: Docker Engine + Compose | MySQL 8.4 + Adminer | Redis 7 + RedisInsight
 #         RabbitMQ 4 + Management | Caddy (proxy + CA interna) | rede "devnet"
-#         SSH | UFW | fail2ban | mDNS (.local)
+#         SSH | UFW | fail2ban | mDNS (.local) | backup diário + restauração
 #         tampa fechada sem suspender | preparação GitHub Actions (self-hosted)
 #
 #  Uso:   sudo ./homelab-setup.sh
@@ -340,8 +340,13 @@ mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} "$INFRA_DIR"/caddy/sites \
          "$USER_HOME"/projects/{apps,libs,sandbox}
 
 chown -R "$HOMELAB_USER":"$HOMELAB_USER" "$USER_HOME/projects"
-chown -R "$HOMELAB_USER":docker "$HOMELAB_DIR"
+chown "$HOMELAB_USER":docker "$HOMELAB_DIR"
+chown -R "$HOMELAB_USER":docker "$HOMELAB_DIR"/{infra,apps,scripts}
 chmod 2775 "$HOMELAB_DIR/apps"   # setgid: arquivos de deploy herdam o grupo docker
+# Backups contêm segredos (.env, CA do Caddy): só root grava; só o seu usuário lê (para copiar ao Mac)
+BACKUP_GROUP="$(id -gn "$HOMELAB_USER")"
+chown -R root:"$BACKUP_GROUP" "$HOMELAB_DIR/backups"
+chmod 750 "$HOMELAB_DIR/backups"
 ok "Infra em $HOMELAB_DIR | projetos em $USER_HOME/projects"
 
 # ============================ 8. Rede Docker =================================
@@ -395,6 +400,7 @@ set_env() {
 }
 grep -q '^# Caddy' "$ENV_FILE" || printf '\n# Caddy (proxy reverso + CA interna)\n' >> "$ENV_FILE"
 grep -q '^CADDY_APP_PORTS=' "$ENV_FILE" || echo 'CADDY_APP_PORTS=8081-8089' >> "$ENV_FILE"
+grep -q '^BACKUP_KEEP_DAYS=' "$ENV_FILE" || printf '\n# Backup (dias de retenção)\nBACKUP_KEEP_DAYS=7\n' >> "$ENV_FILE"
 set_env HOMELAB_HOST "$(hostname).local"
 set_env HOMELAB_IP "$(hostname -I | awk '{print $1}')"
 chown "$HOMELAB_USER":docker "$ENV_FILE"
@@ -611,20 +617,330 @@ chown "$HOMELAB_USER":docker "$INFRA_DIR/docker-compose.yml"
 ok "docker-compose.yml gerado em $INFRA_DIR"
 
 # ---- Scripts utilitários ----
+# backup.sh / restore.sh: cabeçalho com os caminhos desta instalação + corpo fixo
+printf '#!/usr/bin/env bash\nHOMELAB_DIR="%s"\nBACKUP_GROUP="%s"\n' "$HOMELAB_DIR" "$BACKUP_GROUP" \
+  > "$HOMELAB_DIR/scripts/backup.sh"
+cat >> "$HOMELAB_DIR/scripts/backup.sh" <<'EOF'
+# Backup do homelab: MySQL, Redis, RabbitMQ (definições), Caddy (CA) e configurações.
+# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|caddy|config ...]
+# Agendado diariamente pelo homelab-backup.timer (systemd).
+set -Eeuo pipefail
+
+INFRA="$HOMELAB_DIR/infra"
+ENV_FILE="$INFRA/.env"
+ROOT="$HOMELAB_DIR/backups"
+
+[[ $EUID -eq 0 ]] || { echo "Execute com sudo: sudo $0 $*" >&2; exit 1; }
+[[ -r "$ENV_FILE" ]] || { echo "Arquivo $ENV_FILE não encontrado" >&2; exit 1; }
+
+envget() { grep -m1 "^$1=" "$ENV_FILE" | cut -d= -f2- || true; }
+log()    { echo "[$(date '+%F %T')] $*"; }
+
+KEEP_DAYS="${KEEP_DAYS:-$(envget BACKUP_KEEP_DAYS)}"
+KEEP_DAYS="${KEEP_DAYS:-7}"
+
+COMPONENTS=("$@")
+if [[ ${#COMPONENTS[@]} -eq 0 || "${COMPONENTS[0]}" == "all" ]]; then
+  COMPONENTS=(mysql redis rabbitmq caddy config)
+  FULL_RUN=1
+else
+  FULL_RUN=0
+fi
+
+# Um backup por vez
+exec 9>/run/homelab-backup.lock
+flock -n 9 || { log "Outro backup já está em execução"; exit 1; }
+
+mkdir -p "$ROOT"
+AVAIL_KB="$(df --output=avail -k "$ROOT" | tail -1 | tr -d ' ')"
+if (( AVAIL_KB < 1048576 )); then
+  log "Menos de 1 GB livre em $ROOT — backup abortado"
+  exit 1
+fi
+
+STAMP="$(date +%F_%H%M%S)"
+DEST="$ROOT/$STAMP"
+umask 027
+mkdir -p "$DEST"
+FAILED=()
+
+container_up() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]; }
+volume_of()    { docker inspect -f "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{.Name}}{{end}}{{end}}" "$1" 2>/dev/null; }
+
+# ------------------------------------------------------------------- MySQL
+backup_mysql() {
+  container_up mysql || { log "  container mysql não está rodando"; return 1; }
+  local out="$DEST/mysql-all.sql.gz"
+  docker exec -e MYSQL_PWD="$(envget MYSQL_ROOT_PASSWORD)" mysql \
+    mysqldump -uroot --all-databases --single-transaction --quick \
+      --routines --triggers --events --hex-blob \
+    | gzip > "$out" || return 1
+  gzip -t "$out" || return 1
+  # mysqldump grava esta linha só quando termina com sucesso
+  zcat "$out" | tail -n 1 | grep -q 'Dump completed' || { log "  dump incompleto"; return 1; }
+}
+
+# ------------------------------------------------------------------- Redis
+backup_redis() {
+  container_up redis || { log "  container redis não está rodando"; return 1; }
+  local pass t0 info last i saved=0
+  pass="$(envget REDIS_PASSWORD)"
+  rcli() { docker exec -e REDISCLI_AUTH="$pass" redis redis-cli "$@" | tr -d '\r'; }
+
+  # Relógio do próprio Redis: LASTSAVE tem resolução de segundos, então
+  # considera concluído o save que terminar no mesmo segundo ou depois de t0.
+  t0="$(rcli TIME | head -n 1)" || return 1
+  rcli BGSAVE SCHEDULE >/dev/null || return 1
+  for (( i = 0; i < 300; i++ )); do
+    sleep 1
+    info="$(rcli INFO persistence)" || return 1
+    last="$(grep '^rdb_last_save_time:' <<<"$info" | cut -d: -f2)"
+    if grep -q '^rdb_bgsave_in_progress:0' <<<"$info" && (( last >= t0 )); then saved=1; break; fi
+  done
+  (( saved )) || { log "  BGSAVE não concluiu em 300s"; return 1; }
+  rcli INFO persistence | grep -q '^rdb_last_bgsave_status:ok' || { log "  BGSAVE falhou"; return 1; }
+
+  local dir file
+  dir="$(rcli CONFIG GET dir | sed -n 2p)"
+  file="$(rcli CONFIG GET dbfilename | sed -n 2p)"
+  docker exec redis cat "${dir:-/data}/${file:-dump.rdb}" | gzip > "$DEST/redis-dump.rdb.gz" || return 1
+  gzip -t "$DEST/redis-dump.rdb.gz" || return 1
+  rcli DBSIZE | sed 's/^/  chaves no db0: /'
+}
+
+# ---------------------------------------------------------------- RabbitMQ
+backup_rabbitmq() {
+  container_up rabbitmq || { log "  container rabbitmq não está rodando"; return 1; }
+  local out="$DEST/rabbitmq-definitions.json"
+  docker exec rabbitmq rabbitmqctl -q export_definitions /tmp/definitions.json >/dev/null || return 1
+  docker exec rabbitmq cat /tmp/definitions.json > "$out" || return 1
+  docker exec rabbitmq rm -f /tmp/definitions.json || true
+  jq -e '.vhosts and .users' "$out" >/dev/null || { log "  JSON de definições inválido"; return 1; }
+}
+
+# ------------------------------------------------------------------- Caddy
+backup_caddy() {
+  local out="$DEST/caddy-data.tar.gz" vol
+  if docker inspect caddy >/dev/null 2>&1; then
+    vol="$(volume_of caddy /data)"
+    [[ -n "$vol" ]] || { log "  volume /data do caddy não encontrado"; return 1; }
+    docker run --rm --entrypoint tar -v "$vol":/data:ro caddy:2-alpine \
+      czf - -C /data . > "$out" || return 1
+  elif [[ -d /var/lib/caddy/.local/share/caddy ]]; then
+    log "  usando Caddy instalado no host (/var/lib/caddy)"
+    tar czf "$out" -C /var/lib/caddy/.local/share/caddy . || return 1
+  else
+    log "  nenhum Caddy encontrado — pulando"
+    return 0
+  fi
+  gzip -t "$out" || return 1
+}
+
+# ----------------------------------------------------------- Configurações
+backup_config() {
+  local candidates=(
+    "$INFRA/docker-compose.yml" "$INFRA/.env" "$INFRA/mysql" "$INFRA/caddy"
+    /etc/caddy
+    /etc/ssh/sshd_config.d/00-homelab.conf
+    /etc/fail2ban/jail.d/homelab.local
+    /etc/ufw
+    /etc/docker/daemon.json
+    /etc/avahi/avahi-daemon.conf
+    /etc/tlp.d/01-homelab.conf
+    /etc/systemd/logind.conf.d/99-homelab-lid.conf
+    /etc/sysctl.d/99-homelab.conf
+    /etc/systemd/system/homelab-backup.service
+    /etc/systemd/system/homelab-backup.timer
+    /etc/netplan
+  )
+  local rel=() p
+  for p in "${candidates[@]}"; do
+    [[ -e "$p" ]] && rel+=("${p#/}")
+  done
+  tar czf "$DEST/config.tar.gz" -C / "${rel[@]}" || return 1
+  gzip -t "$DEST/config.tar.gz" || return 1
+}
+
+# --------------------------------------------------------------- Execução
+log "Backup iniciado → $DEST (${COMPONENTS[*]})"
+for c in "${COMPONENTS[@]}"; do
+  if ! declare -F "backup_$c" >/dev/null; then
+    log "✘ componente desconhecido: $c"; FAILED+=("$c"); continue
+  fi
+  log "→ $c"
+  if "backup_$c"; then log "✔ $c"; else log "✘ $c FALHOU"; FAILED+=("$c"); fi
+done
+
+if compgen -G "$DEST/*" >/dev/null; then
+  (cd "$DEST" && sha256sum -- * > SHA256SUMS)
+fi
+chown -R "root:$BACKUP_GROUP" "$DEST"
+chmod 750 "$DEST"
+find "$DEST" -type f -exec chmod 640 {} +
+log "Tamanho: $(du -sh "$DEST" | cut -f1)"
+
+if (( ${#FAILED[@]} )); then
+  log "Backup concluído COM FALHAS: ${FAILED[*]} — retenção não aplicada"
+  exit 1
+fi
+
+if (( FULL_RUN )); then
+  ln -sfn "$STAMP" "$ROOT/latest"
+  # retenção só após um backup completo bem-sucedido
+  find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name '20??-??-??_*' \
+    -mtime +"$KEEP_DAYS" -print -exec rm -rf {} + | sed 's/^/  removido: /'
+fi
+log "Backup concluído com sucesso"
+EOF
+
+printf '#!/usr/bin/env bash\nHOMELAB_DIR="%s"\n' "$HOMELAB_DIR" > "$HOMELAB_DIR/scripts/restore.sh"
+cat >> "$HOMELAB_DIR/scripts/restore.sh" <<'EOF'
+# Restaura um componente a partir de um backup do homelab.
+# Uso: sudo restore.sh <pasta-do-backup|latest> <mysql|redis|rabbitmq|caddy|config> [--yes]
+set -Eeuo pipefail
+
+INFRA="$HOMELAB_DIR/infra"
+ENV_FILE="$INFRA/.env"
+ROOT="$HOMELAB_DIR/backups"
+
+[[ $EUID -eq 0 ]] || { echo "Execute com sudo: sudo $0 $*" >&2; exit 1; }
+
+usage() {
+  echo "Uso: sudo $0 <pasta-do-backup|latest> <mysql|redis|rabbitmq|caddy|config> [--yes]"
+  echo "Backups disponíveis:"
+  local d
+  for d in "$ROOT"/20* "$ROOT"/latest; do [[ -e "$d" ]] && echo "  $(basename "$d")"; done
+  exit 1
+}
+[[ $# -ge 2 ]] || usage
+
+SRC="$1"; COMP="$2"; YES="${3:-}"
+[[ "$SRC" == /* ]] || SRC="$ROOT/$SRC"
+SRC="$(readlink -f "$SRC")"
+[[ -d "$SRC" ]] || { echo "Backup não encontrado: $SRC" >&2; usage; }
+
+envget() { grep -m1 "^$1=" "$ENV_FILE" | cut -d= -f2- || true; }
+log()    { echo "[$(date +%T)] $*"; }
+dc()     { docker compose -f "$INFRA/docker-compose.yml" "$@"; }
+volume_of() { docker inspect -f "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{.Name}}{{end}}{{end}}" "$1" 2>/dev/null; }
+
+need() { [[ -f "$SRC/$1" ]] || { echo "Arquivo $1 não existe em $SRC" >&2; exit 1; }; }
+
+confirm() {
+  [[ "$YES" == "--yes" ]] && return 0
+  echo "⚠️  $1"
+  read -rp "Digite SIM para continuar: " answer
+  [[ "$answer" == "SIM" ]] || { echo "Cancelado."; exit 1; }
+}
+
+# Confere a integridade dos arquivos antes de qualquer alteração
+if [[ -f "$SRC/SHA256SUMS" ]]; then
+  (cd "$SRC" && sha256sum -c --quiet SHA256SUMS) || { echo "Checksum inválido — backup corrompido" >&2; exit 1; }
+fi
+
+case "$COMP" in
+  mysql)
+    need mysql-all.sql.gz
+    confirm "Isto SOBRESCREVE todos os bancos do MySQL (inclusive usuários) com o backup $(basename "$SRC")."
+    log "Restaurando MySQL..."
+    gunzip -c "$SRC/mysql-all.sql.gz" \
+      | docker exec -i -e MYSQL_PWD="$(envget MYSQL_ROOT_PASSWORD)" mysql mysql -uroot
+    docker exec -e MYSQL_PWD="$(envget MYSQL_ROOT_PASSWORD)" mysql mysql -uroot -e 'FLUSH PRIVILEGES;'
+    log "MySQL restaurado."
+    ;;
+
+  redis)
+    need redis-dump.rdb.gz
+    confirm "Isto APAGA os dados atuais do Redis e carrega o snapshot de $(basename "$SRC")."
+    PASS="$(envget REDIS_PASSWORD)"
+    VOL="$(volume_of redis /data)"
+    [[ -n "$VOL" ]] || { echo "Volume do Redis não encontrado" >&2; exit 1; }
+    IMAGE="$(docker inspect -f '{{.Config.Image}}' redis)"
+
+    log "Parando Redis..."
+    dc stop redisinsight redis >/dev/null
+
+    log "Substituindo dados no volume $VOL..."
+    docker run --rm -i -v "$VOL":/data --entrypoint sh "$IMAGE" -c \
+      'rm -rf /data/appendonlydir /data/*.aof /data/dump.rdb && gzip -dc > /data/dump.rdb && chown -R redis:redis /data' \
+      < "$SRC/redis-dump.rdb.gz"
+
+    # AOF está ativo: se o Redis subir direto, ignoraria o dump.rdb.
+    # Sobe temporário sem AOF, carrega o RDB e regrava o AOF a partir da memória.
+    log "Carregando snapshot e regenerando AOF..."
+    docker rm -f redis-restore >/dev/null 2>&1 || true
+    docker run -d --name redis-restore -v "$VOL":/data "$IMAGE" \
+      redis-server --appendonly no --requirepass "$PASS" >/dev/null
+    rcli() { docker exec -e REDISCLI_AUTH="$PASS" redis-restore redis-cli "$@" | tr -d '\r'; }
+    for (( i = 0; i < 120; i++ )); do
+      [[ "$(rcli PING 2>/dev/null)" == "PONG" ]] && break; sleep 1
+    done
+    [[ "$(rcli PING)" == "PONG" ]] || { echo "Redis temporário não respondeu" >&2; docker logs redis-restore | tail; exit 1; }
+    rcli CONFIG SET appendonly yes >/dev/null
+    for (( i = 0; i < 300; i++ )); do
+      sleep 1
+      INFO="$(rcli INFO persistence)"
+      grep -q '^aof_rewrite_in_progress:0' <<<"$INFO" && grep -q '^aof_rewrite_scheduled:0' <<<"$INFO" \
+        && grep -q '^aof_enabled:1' <<<"$INFO" && break
+    done
+    grep -q '^aof_last_bgrewrite_status:ok' <<<"$INFO" || { echo "Falha ao regenerar o AOF" >&2; exit 1; }
+    log "Chaves restauradas: $(rcli DBSIZE)"
+    rcli SHUTDOWN SAVE >/dev/null 2>&1 || true
+    docker wait redis-restore >/dev/null 2>&1 || true
+    docker rm -f redis-restore >/dev/null
+
+    log "Subindo Redis da stack..."
+    dc start redis redisinsight >/dev/null
+    log "Redis restaurado."
+    ;;
+
+  rabbitmq)
+    need rabbitmq-definitions.json
+    confirm "Isto importa as definições (vhosts, usuários, filas, exchanges, bindings, policies) de $(basename "$SRC"). Mensagens NÃO fazem parte do backup."
+    docker cp "$SRC/rabbitmq-definitions.json" rabbitmq:/tmp/definitions.json
+    docker exec rabbitmq rabbitmqctl import_definitions /tmp/definitions.json
+    docker exec rabbitmq rm -f /tmp/definitions.json
+    log "Definições do RabbitMQ importadas."
+    ;;
+
+  caddy)
+    need caddy-data.tar.gz
+    if ! docker inspect caddy >/dev/null 2>&1; then
+      echo "Container caddy não existe. Para Caddy instalado no host:"
+      echo "  sudo systemctl stop caddy"
+      echo "  sudo tar xzf $SRC/caddy-data.tar.gz -C /var/lib/caddy/.local/share/caddy"
+      echo "  sudo chown -R caddy:caddy /var/lib/caddy && sudo systemctl start caddy"
+      exit 1
+    fi
+    confirm "Isto SUBSTITUI a CA interna e os certificados do Caddy pelos de $(basename "$SRC")."
+    VOL="$(volume_of caddy /data)"
+    dc stop caddy >/dev/null
+    docker run --rm -i -v "$VOL":/data --entrypoint sh caddy:2-alpine -c \
+      'find /data -mindepth 1 -delete && tar xzf - -C /data' < "$SRC/caddy-data.tar.gz"
+    dc start caddy >/dev/null
+    log "Caddy restaurado. Confira a impressão digital: $HOMELAB_DIR/scripts/caddy-ca.sh"
+    ;;
+
+  config)
+    need config.tar.gz
+    OUT="/tmp/homelab-config-$(basename "$SRC")"
+    rm -rf "$OUT"; mkdir -p "$OUT"; chmod 700 "$OUT"
+    tar xzf "$SRC/config.tar.gz" -C "$OUT"
+    log "Configurações extraídas em $OUT (nada foi sobrescrito)."
+    echo "Compare e copie o que precisar, por exemplo:"
+    echo "  sudo diff -ru $OUT/etc/ufw /etc/ufw"
+    echo "  sudo cp $OUT/opt/homelab/infra/.env $INFRA/.env"
+    ;;
+
+  *) usage ;;
+esac
+EOF
+
+# Compatibilidade com a versão anterior
 cat > "$HOMELAB_DIR/scripts/backup-mysql.sh" <<'EOF'
 #!/usr/bin/env bash
-# Backup de todos os bancos do MySQL (mantém os últimos 7 dias)
-set -euo pipefail
-DIR="/opt/homelab/backups/mysql"
-ENV="/opt/homelab/infra/.env"
-KEEP_DAYS="${KEEP_DAYS:-7}"
-PASS="$(grep '^MYSQL_ROOT_PASSWORD=' "$ENV" | cut -d= -f2-)"
-FILE="$DIR/mysql-$(date +%F_%H%M).sql.gz"
-docker exec -e MYSQL_PWD="$PASS" mysql \
-  mysqldump -uroot --all-databases --single-transaction --routines --triggers --events \
-  | gzip > "$FILE"
-find "$DIR" -name 'mysql-*.sql.gz' -mtime +"$KEEP_DAYS" -delete
-echo "Backup: $FILE"
+# Mantido por compatibilidade — use backup.sh
+exec "$(dirname "$0")/backup.sh" mysql
 EOF
 
 cat > "$HOMELAB_DIR/scripts/status.sh" <<'EOF'
@@ -642,6 +958,10 @@ echo "Adminer      http://$HOST:8080"
 echo "RedisInsight http://$HOST:5540"
 echo "RabbitMQ     http://$HOST:15672"
 echo "Caddy        https://$HOST  (sites em /opt/homelab/infra/caddy/sites)"
+echo; echo "== Backup =="
+LAST="$(readlink /opt/homelab/backups/latest 2>/dev/null || echo 'nenhum')"
+echo "Último backup completo: $LAST"
+systemctl list-timers homelab-backup.timer --no-pager 2>/dev/null | sed -n 2p
 EOF
 cat > "$HOMELAB_DIR/scripts/caddy-reload.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -664,6 +984,36 @@ EOF
 
 chmod 750 "$HOMELAB_DIR"/scripts/*.sh
 chown "$HOMELAB_USER":docker "$HOMELAB_DIR"/scripts/*.sh
+
+# Backup diário às 03:00 (systemd: roda como root, log no journal, recupera execuções perdidas)
+cat > /etc/systemd/system/homelab-backup.service <<EOF
+[Unit]
+Description=Backup do homelab (MySQL, Redis, RabbitMQ, Caddy e configurações)
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=${HOMELAB_DIR}/scripts/backup.sh
+Nice=10
+IOSchedulingClass=idle
+EOF
+
+cat > /etc/systemd/system/homelab-backup.timer <<'EOF'
+[Unit]
+Description=Backup diário do homelab
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now homelab-backup.timer >/dev/null 2>&1
+ok "Backup diário agendado (homelab-backup.timer, 03:00) — retenção: BACKUP_KEEP_DAYS no .env"
 
 # ======================= 10. Subindo os serviços =============================
 step "10/11 Baixando imagens e subindo serviços (pode levar alguns minutos)"
@@ -750,6 +1100,7 @@ ${C_GREEN}=====================================================================
   RabbitMQ AMQP .. ${HOST}:5672
   Caddy (HTTPS) .. https://${HOST}  — sites em ${INFRA_DIR}/caddy/sites
   CA do Caddy .... ${HOMELAB_DIR}/scripts/caddy-ca.sh  (instale nos dispositivos)
+  Backup ......... diário 03:00 → ${HOMELAB_DIR}/backups  (manual: sudo ${HOMELAB_DIR}/scripts/backup.sh)
 
   Use o nome ${HOST}: o IP pode mudar a cada reboot (DHCP).
 
