@@ -1,6 +1,6 @@
 # Homelab — ThinkPad L14
 
-Provisionamento do ThinkPad L14 como servidor: Ubuntu endurecido, **stack de dados** (MySQL, Redis, RabbitMQ) em Docker e **Coolify** para hospedar e gerenciar os projetos (deploy do GitHub, domínios, HTTPS, logs, variáveis).
+Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação limpa do Ubuntu Server**: Ubuntu endurecido, **stack de dados** (MySQL, Redis, RabbitMQ) em Docker e **Coolify** para hospedar e gerenciar os projetos (deploy do GitHub, domínios, HTTPS, logs, variáveis).
 
 ---
 
@@ -71,7 +71,7 @@ sudo ./homelab-setup.sh
 sudo reboot        # na primeira instalação
 ```
 
-> O setup precisa da pasta `scripts/` do repositório — rode sempre a partir do clone. É **idempotente**: pode rodar de novo a qualquer momento (preserva `.env`, senhas, volumes e a CA). Para atualizar: `git pull && sudo ./homelab-setup.sh`.
+> Pensado para uma máquina **recém-instalada** (seção 13 tem o roteiro completo). O setup precisa da pasta `scripts/` do repositório — rode sempre a partir do clone. É **idempotente**: pode rodar de novo a qualquer momento (preserva `.env`, senhas, volumes e a CA). Para atualizar: `git pull && sudo ./homelab-setup.sh`.
 
 ### Opções (variáveis de ambiente)
 
@@ -90,6 +90,7 @@ sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-set
 | `COOLIFY_ADMIN_EMAIL` | `admin@homelab.local` | E-mail do admin do Coolify (senha gerada no `.env`) |
 | `COOLIFY_AUTOUPDATE` | `false` | Atualizações automáticas do Coolify |
 | `PUBLIC_IP` | — | IP público fixo do provedor (registrado no `.env`, informativo) |
+| `CA_IMPORT_DIR` | — | Pasta com `root.crt` e `root.key` de uma CA existente; sem ela, uma CA nova é criada |
 | `HEADLESS` | `true` | Desativa o boot gráfico |
 | `INSTALL_TLP` / `BATTERY_*_THRESHOLD` | `true` / `75`–`80` | Limite de carga da bateria |
 | `CONSOLE_BLANK_SECONDS` | `60` | Desliga a tela do console |
@@ -107,12 +108,12 @@ sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-set
 | 4 | SSH | Senha desligada se houver chave, fail2ban (LAN nunca é banida). **Root só por chave e só das redes Docker** — necessário para o Coolify gerenciar o próprio host |
 | 5 | Docker | Docker CE + Compose; `daemon.json` com logs rotativos, `live-restore` e pool `10.0.0.0/8` (o mesmo do Coolify, que assim não reescreve o arquivo) |
 | 6 | Firewall | UFW: entrada negada, SSH com rate-limit (exceto vindo do Coolify), mDNS na LAN; containers **só para redes privadas** |
-| 7 | Estrutura | Diretórios, `/etc/homelab.conf`; **remove versões anteriores** (painel, Caddy da stack, Cockpit — dados preservados em `legacy/`) |
+| 7 | Estrutura | Diretórios e `/etc/homelab.conf` (lido pelos scripts) |
 | 8 | Rede | `docker network create devnet` |
 | 9 | Stack de dados | `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf` |
-| 10 | Subida | `docker compose up --wait --remove-orphans` |
+| 10 | Subida | `docker compose up --wait` |
 | 11 | Utilitários | `scripts/*.sh` → `/opt/homelab/scripts`; timers de backup (diário) e de renovação do certificado da LAN (semanal) |
-| 12 | Coolify | Instalador oficial, admin já criado (sem cadastro aberto), certificado da LAN no Traefik |
+| 12 | Coolify + CA | Instalador oficial com admin já criado (sem cadastro aberto); CA do homelab criada (ou importada) e certificado da LAN instalado no Traefik |
 | 13 | GitHub Actions | Usuário `gh-runner` e runner baixado (registro manual com token) |
 
 ---
@@ -128,7 +129,6 @@ sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-set
 ├── ca/                         # CA do homelab + certificado da LAN (700, root)
 ├── apps/                       # área livre para arquivos de projetos
 ├── backups/                    # backups diários (750 root:<seu grupo>)
-├── legacy/                     # restos de versões anteriores (pode apagar)
 └── scripts/
     ├── status.sh               # visão geral
     ├── homelab-ca.sh           # CA e HTTPS na LAN
@@ -253,6 +253,10 @@ traefik.http.services.pdv.loadbalancer.server.port=80
 
 `homelab-lan-only@file` e o certificado padrão vêm de `/data/coolify/proxy/dynamic/homelab-lan.yaml`, gerado pelo `homelab-ca.sh` (seção 8).
 
+**Exemplo — sistema com várias portas na LAN (MesaFácil):** site na 443, PDV 8081, CRM 8082 e API 8083 (SSE), acessados por nome e por IP pelos tablets. Um router por serviço, como acima (`p8081`, `p8082`, `p8083`; o site usa `entrypoints=https` e ``rule=Host(`homelab-eduardo.local`) || Host(`192.168.101.28`)``). Na API, **não** use compressão — o SSE precisa sair sem buffer.
+
+Para containers que **não** são gerenciados pelo Coolify, as mesmas rotas podem ser declaradas em arquivo: veja [`docs/exemplos/mesafacil-traefik.yaml`](docs/exemplos/mesafacil-traefik.yaml) (copie para `/data/coolify/proxy/dynamic/` e coloque os containers na rede `coolify`). Validado com Traefik v3: acesso por IP sem SNI, `.local`, lan-only (403 de fora), redirect 80→443, headers e SSE.
+
 ### 7.6 Deploy automático a partir do GitHub
 
 | Opção | Requisito |
@@ -301,12 +305,13 @@ Apps na LAN são acessadas pelo nome `.local` e pelo **IP** (tablets Android nã
 
 ```bash
 sudo /opt/homelab/scripts/homelab-ca.sh                    # status
-sudo /opt/homelab/scripts/homelab-ca.sh import-caddy       # reaproveita a CA do Caddy antigo (dispositivos continuam confiando)
-sudo /opt/homelab/scripts/homelab-ca.sh init               # ou: CA nova (instale nos dispositivos)
-sudo /opt/homelab/scripts/homelab-ca.sh issue              # emite e instala no Traefik do Coolify
-sudo /opt/homelab/scripts/homelab-ca.sh export             # exporta o raiz e mostra o SHA-256
+sudo /opt/homelab/scripts/homelab-ca.sh export             # exporta o raiz (para instalar nos dispositivos) e mostra o SHA-256
+sudo /opt/homelab/scripts/homelab-ca.sh issue              # reemite e reinstala no Traefik do Coolify
+sudo /opt/homelab/scripts/homelab-ca.sh init               # CA nova (só se não houver nenhuma)
+sudo /opt/homelab/scripts/homelab-ca.sh import root.crt root.key   # CA existente (só se não houver nenhuma)
 ```
 
+- O setup **cria a CA automaticamente** (ou importa a de `CA_IMPORT_DIR`) e emite o certificado da LAN.
 - Certificado da LAN: 365 dias; o timer semanal `homelab-ca-renew` reemite quando faltam < 30 dias **ou quando o IP muda**.
 - Nomes extras: `HOMELAB_CA_EXTRA_NAMES="pdv.local 192.168.101.29"` no `.env` + `issue`.
 - A chave da CA fica em `/opt/homelab/ca/root.key` (600, root) e entra no backup (`config.tar.gz`). **Não a perca**: uma CA nova exige reinstalar o raiz em todos os dispositivos.
@@ -565,67 +570,41 @@ Uso típico: o job de deploy chama a API local do Coolify (seção 7.6).
 
 ---
 
-## 13. Migração da versão anterior (Caddy + painel → Coolify)
+## 13. Roteiro: do zero ao primeiro projeto
 
-Para o L14 que já rodava a versão anterior **com o MesaFácil em produção** (tablets acessando pelo IP). Tudo é feito em duas etapas, com rollback.
-
-### Etapa 1 — trocar o proxy (Caddy → Traefik do Coolify), MesaFácil continua igual
-
-Janela estimada: 15–30 min com o MesaFácil fora do ar.
-
-```bash
-# 0. Backup e impressão digital da CA atual (anote)
-sudo /opt/homelab/scripts/backup.sh
-docker exec mesafacil-caddy cat /data/caddy/pki/authorities/local/root.crt | openssl x509 -noout -fingerprint -sha256
-
-# 1. Código novo
-cd ~/homelab && git fetch && git checkout feature/coolify && git pull
-
-# 2. Importa a CA do Caddy do MesaFácil (com o Caddy ainda rodando — só lê o volume)
-sudo mkdir -p /opt/homelab/scripts && sudo install -m 750 scripts/homelab-ca.sh /opt/homelab/scripts/
-sudo /opt/homelab/scripts/homelab-ca.sh import-caddy mesafacil_caddy_data    # SHA-256 deve ser IGUAL ao passo 0
-
-# 3. Libera 80/443: para o Caddy do MesaFácil  ── início da indisponibilidade ──
-cd /opt/homelab/apps/mesafacil && docker compose stop caddy
-
-# 4. Setup: remove painel/Caddy da stack, instala o Coolify e o certificado da LAN no Traefik
-cd ~/homelab && sudo ./homelab-setup.sh
-```
-
-5. **Coolify:** primeiro acesso (seção 7.1) e **portas extras 8081–8083 no proxy** (seção 7.4) → *Restart Proxy*.
-6. **Containers do MesaFácil na rede do Coolify** (o Traefik os alcança pelo nome) — no `docker-compose.yml` do MesaFácil, nos serviços `site`, `pdv`, `crm` e `api`:
-   ```yaml
-       networks: [default, coolify]
-   # ...e no fim do arquivo:
-   networks:
-     coolify:
-       external: true
-   ```
+1. **BIOS** (F1): *After Power Loss = Power On* e virtualização habilitada (seção 2).
+2. **Ubuntu Server 24.04 LTS**: instale com **OpenSSH server**, usuário comum (ex.: `eduardo`), hostname `homelab-eduardo`. Configure a rede (cabo ou Wi-Fi) no instalador.
+3. **Chave SSH** do seu Mac (seção 3):
    ```bash
-   cd /opt/homelab/apps/mesafacil && docker compose up -d site pdv crm api
+   ssh-copy-id eduardo@homelab-eduardo.local
    ```
-7. **Rotas do MesaFácil no Traefik** (porta 80 → 443, site na 443, PDV 8081, CRM 8082, API 8083 com SSE sem buffer, somente LAN):
+4. *(Opcional)* **Manter uma CA existente** (dispositivos que já confiam nela): copie `root.crt` e `root.key` para o L14, por exemplo em `~/ca-antiga/`, e rode o setup com `CA_IMPORT_DIR=~/ca-antiga`. Sem isso, uma CA nova é criada.
+5. **Setup**:
    ```bash
-   sudo cp ~/homelab/docs/exemplos/mesafacil-traefik.yaml /data/coolify/proxy/dynamic/mesafacil.yaml
+   sudo apt-get update && sudo apt-get install -y git
+   git clone https://github.com/eduferrari/homelab.git && cd homelab
+   sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-setup.sh
+   sudo reboot
    ```
-   O Traefik recarrega sozinho. Ajuste o IP no arquivo se não for `192.168.101.28`.
-8. **Teste nos tablets e no Mac**: `https://192.168.101.28`, `:8081`, `:8082`, `:8083` (sem aviso de certificado) e a chamada de garçom (SSE).  ── fim da indisponibilidade ──
+6. **IP fixo na LAN** (seção 9.3) — confirme no IP novo e rode o setup de novo:
+   ```bash
+   sudo /opt/homelab/scripts/network-static.sh 192.168.101.28/24
+   ```
+7. **CA nos dispositivos** (Mac, tablets, celulares — seção 8):
+   ```bash
+   sudo /opt/homelab/scripts/homelab-ca.sh export
+   ```
+8. **Coolify** — primeiro acesso, *Validate Server*, 2FA (seção 7.1). Se for usar portas próprias na LAN, configure os entrypoints extras (seção 7.4).
+9. **Primeiro projeto** — API .NET por Dockerfile, porta 8080, variáveis de ambiente (seção 7.2); domínio público ou rota na LAN (seções 7.3 e 7.5).
+10. **Deploy automático** — runner + API do Coolify (seções 7.6 e 12).
+11. **Backup** — confira o primeiro backup e prepare o SSD externo (seção 11):
+    ```bash
+    sudo /opt/homelab/scripts/backup.sh
+    sudo /opt/homelab/scripts/backup-disk-setup.sh
+    ```
+12. **Internet** (quando houver domínio): roteador, DNS e `public-access.sh enable` (seção 9.4).
 
-**Rollback** (volta ao estado anterior em segundos):
-
-```bash
-docker stop coolify-proxy
-cd /opt/homelab/apps/mesafacil && docker compose start caddy
-```
-
-Depois de validar: remova o serviço `caddy` e o `Caddyfile` do repositório do MesaFácil (o volume `mesafacil_caddy_data` pode ficar como cópia da CA por um tempo).
-
-### Etapa 2 — MesaFácil gerenciado pelo Coolify (quando a etapa 1 estiver estável)
-
-1. **Projects → New → Docker Compose** apontando para o repositório do MesaFácil (APIs .NET com Dockerfile — seção 7.2). Variáveis de ambiente no Coolify.
-2. Rotas por **labels** nos serviços (seção 7.5), uma por sistema (`p8081` PDV, `p8082` CRM, `p8083` API, `https` + `Host(...)` para o site).
-3. Pare o compose antigo, faça o deploy pelo Coolify, teste e **remova** `/data/coolify/proxy/dynamic/mesafacil.yaml` (as labels o substituem).
-4. Deploy automático: runner + API (seção 7.6).
+> Reinstalando a partir de um backup? Siga *Recuperação total* (seção 11): o `.env` e a CA voltam antes do setup, então as senhas e a confiança dos dispositivos são mantidas.
 
 ---
 
@@ -654,9 +633,8 @@ sudo tlp fullcharge BAT0
 
 | Sintoma | Causa provável / solução |
 |---|---|
-| Setup: *Coolify NÃO instalado: portas em uso* | Algo ocupa 80/443/8000/8080 (ex.: `mesafacil-caddy`). `sudo ss -tlnp \| grep -E ':(80\|443\|8000\|8080) '`, pare o processo e rode o setup de novo (seção 13) |
+| Setup: *Coolify NÃO instalado: portas em uso* | Algo ocupa 80/443/8000/8080: `sudo ss -tlnp \| grep -E ':(80\|443\|8000\|8080) '`, pare o processo e rode o setup de novo |
 | Coolify: *Server is not reachable* ao validar | SSH do root a partir dos containers: `sudo sshd -T \| grep -E 'permitrootlogin\|allowusers'` (deve ter `prohibit-password` e `root@10.0.0.0/8`) e `sudo grep coolify /root/.ssh/authorized_keys` |
-| Adminer não abre na 8080 | Mudou para **8088** (a 8080 é do painel do Traefik) |
 | App no Coolify não conecta no MySQL/Redis | Use o **IP fixo da LAN** (não `.local`); confira usuário/senha do `.env` |
 | Navegador/tablet: certificado inválido | CA não instalada no dispositivo, ou o IP mudou: `sudo /opt/homelab/scripts/homelab-ca.sh` (status) e `issue` |
 | Acesso pelo IP falha com erro de TLS | `/data/coolify/proxy/dynamic/homelab-lan.yaml` ausente: `sudo /opt/homelab/scripts/homelab-ca.sh issue` |

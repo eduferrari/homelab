@@ -9,6 +9,7 @@
 #  Extras:   CA local p/ HTTPS na LAN | backup diário + SSD externo | IP fixo
 #            preparação GitHub Actions (self-hosted)
 #
+#  Pensado para uma máquina instalada do ZERO (Ubuntu Server 24.04 recém-instalado).
 #  Uso:   git clone https://github.com/eduferrari/homelab.git && cd homelab
 #         sudo ./homelab-setup.sh
 #  Idempotente: pode ser executado novamente com segurança.
@@ -50,6 +51,10 @@ COOLIFY_AUTOUPDATE="${COOLIFY_AUTOUPDATE:-false}"   # atualizações manuais (ma
 
 # IP público fixo do provedor (informativo: status e README)
 PUBLIC_IP="${PUBLIC_IP:-}"
+
+# CA do HTTPS na LAN: criada automaticamente. Para manter uma CA existente (dispositivos que já
+# confiam nela), informe uma pasta com root.crt e root.key: CA_IMPORT_DIR=/caminho
+CA_IMPORT_DIR="${CA_IMPORT_DIR:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
@@ -201,7 +206,6 @@ fi
 # O Ubuntu lê sshd_config.d em ordem alfabética e a PRIMEIRA ocorrência vence.
 # Por isso o prefixo 00- (antes do 50-cloud-init.conf, que força PasswordAuthentication yes).
 SSHD_DROPIN="/etc/ssh/sshd_config.d/00-homelab.conf"
-rm -f /etc/ssh/sshd_config.d/99-homelab.conf   # nome usado em versões anteriores do script
 
 # No Ubuntu 24.04 o SSH é ativado por socket: /run/sshd só existe depois que
 # o serviço sobe, e sem ele o "sshd -t" falha com "Missing privilege separation directory".
@@ -315,13 +319,6 @@ ufw limit "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
 for net in 10.0.0.0/8 172.16.0.0/12; do
   ufw insert 1 allow proto tcp from "$net" to any port "${SSH_PORT}" comment 'SSH (Coolify)' >/dev/null 2>&1 || true
 done
-# Remove regras de versões anteriores (Caddy na rede do host, painel e acesso público do Caddy)
-for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 100.64.0.0/10; do
-  ufw delete allow proto tcp from "$net" to any port 80,443,8081:8089,9000:9002,9090 >/dev/null 2>&1 || true
-  ufw delete allow proto udp from "$net" to any port 443 >/dev/null 2>&1 || true
-done
-for r in 80/tcp 443/tcp 443/udp; do ufw delete allow "$r" >/dev/null 2>&1 || true; done
-ufw delete allow from 172.16.0.0/12 to any port 9091 proto tcp >/dev/null 2>&1 || true
 # mDNS (resolução de <hostname>.local) — apenas redes privadas
 for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12; do
   ufw allow from "$net" to any port 5353 proto udp comment 'mDNS' >/dev/null
@@ -372,7 +369,7 @@ ok "UFW ativo: entrada negada por padrão, SSH com rate-limit, mDNS na LAN; cont
 
 
 # ======================= 7. Estrutura, configuração e limpeza ================
-step "7/13 Estrutura de diretórios e limpeza de versões anteriores"
+step "7/13 Estrutura de diretórios e configuração"
 INFRA_DIR="$HOMELAB_DIR/infra"
 mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} "$HOMELAB_DIR"/{apps,backups,scripts} \
          "$USER_HOME"/projects/{apps,libs,sandbox}
@@ -398,22 +395,6 @@ GH_RUNNER_DIR="${GH_RUNNER_DIR}"
 EOF
 chmod 644 /etc/homelab.conf
 
-# --- Limpeza das versões anteriores (painel, Caddy da stack, Cockpit) — dados preservados
-LEGACY_DIR="$HOMELAB_DIR/legacy/$(date +%F_%H%M%S)"
-for d in caddy homepage portainer; do
-  if [[ -d "$INFRA_DIR/$d" ]]; then
-    mkdir -p "$LEGACY_DIR"; mv "$INFRA_DIR/$d" "$LEGACY_DIR/"
-    warn "infra/$d movido para $LEGACY_DIR (não é mais usado)"
-  fi
-done
-if [[ -f /etc/cockpit/cockpit.conf ]] && grep -q 'homelab-setup.sh' /etc/cockpit/cockpit.conf; then
-  systemctl disable --now cockpit.socket >/dev/null 2>&1 || true
-  rm -rf /etc/systemd/system/cockpit.socket.d /etc/cockpit/cockpit.conf
-  apt-get purge -y -qq cockpit cockpit-storaged cockpit-packagekit cockpit-bridge cockpit-ws >/dev/null 2>&1 || true
-  apt-get autoremove -y -qq >/dev/null 2>&1 || true
-  systemctl daemon-reload
-  ok "Cockpit removido"
-fi
 ok "Infra em $HOMELAB_DIR | projetos em $USER_HOME/projects | config em /etc/homelab.conf"
 
 # ============================ 8. Rede Docker =================================
@@ -455,6 +436,16 @@ RABBITMQ_PORT=5672
 RABBITMQ_UI_PORT=15672
 RABBITMQ_DEFAULT_USER=admin
 RABBITMQ_DEFAULT_PASS=$(gen_secret)
+
+# Backup (dias de retenção local)
+BACKUP_KEEP_DAYS=7
+
+# Nomes extras no certificado da LAN (separados por espaço) — homelab-ca.sh
+HOMELAB_CA_EXTRA_NAMES=
+
+# Coolify — admin criado na instalação (usuário: admin)
+COOLIFY_ADMIN_EMAIL=${COOLIFY_ADMIN_EMAIL}
+COOLIFY_ADMIN_PASSWORD=$(gen_password)
 EOF
   ok "Credenciais geradas em $ENV_FILE"
 else
@@ -464,21 +455,7 @@ fi
 set_env() {
   if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
 }
-# A porta 8080 passa a ser do painel do Traefik (proxy do Coolify): Adminer vai para 8088
-if grep -q '^ADMINER_PORT=8080$' "$ENV_FILE"; then
-  set_env ADMINER_PORT 8088
-  warn "Adminer mudou de porta: 8080 → 8088 (a 8080 é do proxy do Coolify)"
-fi
-# Chaves de versões anteriores que não são mais usadas
-sed -i -E '/^(CADDY_APP_PORTS|PORTAINER_ADMIN_PASSWORD|UPTIME_KUMA_PUSH_TOKEN|PUBLIC_ACCESS)=/d;
-           /^# (Caddy \(proxy reverso|Painel de administração|Token do monitor|Acesso da internet ao Caddy|Acesso público \(public)/d' "$ENV_FILE"
-grep -q '^BACKUP_KEEP_DAYS=' "$ENV_FILE" || printf '\n# Backup (dias de retenção)\nBACKUP_KEEP_DAYS=7\n' >> "$ENV_FILE"
-grep -q '^HOMELAB_CA_EXTRA_NAMES=' "$ENV_FILE" || \
-  printf '\n# Nomes extras no certificado da LAN (separados por espaço) — homelab-ca.sh\nHOMELAB_CA_EXTRA_NAMES=\n' >> "$ENV_FILE"
-if [[ "$INSTALL_COOLIFY" == "true" ]] && ! grep -q '^COOLIFY_ADMIN_PASSWORD=' "$ENV_FILE"; then
-  printf '\n# Coolify — admin criado na instalação (usuário: admin)\nCOOLIFY_ADMIN_EMAIL=%s\nCOOLIFY_ADMIN_PASSWORD=%s\n' \
-    "$COOLIFY_ADMIN_EMAIL" "$(gen_password)" >> "$ENV_FILE"
-fi
+# Host e IP atualizados a cada execução (usados pelo certificado da LAN e pelo status)
 set_env HOMELAB_HOST "$(hostname).local"
 set_env HOMELAB_IP "$(hostname -I | awk '{print $1}')"
 [[ -n "$PUBLIC_IP" ]] && set_env HOMELAB_PUBLIC_IP "$PUBLIC_IP"
@@ -615,19 +592,15 @@ ok "docker-compose.yml gerado em $INFRA_DIR"
 step "10/13 Baixando imagens e subindo MySQL, Redis e RabbitMQ"
 cd "$INFRA_DIR"
 docker compose pull -q
-# --remove-orphans: remove containers de versões anteriores desta stack (Caddy, painel)
-docker compose up -d --remove-orphans --wait --wait-timeout 240
+docker compose up -d --wait --wait-timeout 240
 ok "Stack de dados no ar"
 docker compose ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}'
-LEGACY_VOLS="$(docker volume ls -q | grep -E '^homelab_(caddy_data|caddy_config|portainer_data|uptime_kuma_data)$' || true)"
-[[ -n "$LEGACY_VOLS" ]] && warn "Volumes de versões anteriores mantidos (remova quando não precisar): $(echo $LEGACY_VOLS)"
 
 # ================ 11. Scripts utilitários, backup e certificado ==============
 step "11/13 Instalando scripts utilitários e agendamentos"
 for f in "$SCRIPT_DIR"/scripts/*.sh; do
   install -m 750 -o "$HOMELAB_USER" -g docker "$f" "$HOMELAB_DIR/scripts/$(basename "$f")"
 done
-rm -f "$HOMELAB_DIR"/scripts/{caddy-reload.sh,caddy-ca.sh}   # versões anteriores
 ok "Scripts em $HOMELAB_DIR/scripts: $(cd "$HOMELAB_DIR/scripts" && ls | tr '\n' ' ')"
 
 # Backup diário às 03:00 (roda como root, log no journal, recupera execuções perdidas)
@@ -696,7 +669,7 @@ else
     COOLIFY_STATE="pendente (portas ${BUSY[*]} em uso)"
     warn "Coolify NÃO instalado: portas em uso: ${BUSY[*]}"
     ss -tlnpH | grep -E ":($(IFS='|'; echo "${BUSY[*]}")) " | sed 's/^/    /' || true
-    warn "Libere as portas (ex.: pare o mesafacil-caddy — veja 'Migração' no README) e rode o setup de novo."
+    warn "Libere as portas e rode o setup de novo (o Coolify precisa de 80, 443, 8000 e 8080)."
   else
     curl -fsSL https://cdn.coollabs.io/coolify/install.sh -o /tmp/coolify-install.sh
     ROOT_USERNAME=admin \
@@ -709,14 +682,17 @@ else
     ok "Coolify instalado"
   fi
 fi
-if [[ "$COOLIFY_STATE" == "instalado" ]]; then
-  if [[ -s "$HOMELAB_DIR/ca/root.key" ]]; then
-    "$HOMELAB_DIR/scripts/homelab-ca.sh" renew
+# HTTPS na LAN: CA do homelab (nova ou importada) + certificado instalado no Traefik do Coolify
+CA="$HOMELAB_DIR/scripts/homelab-ca.sh"
+if [[ ! -s "$HOMELAB_DIR/ca/root.key" ]]; then
+  if [[ -n "$CA_IMPORT_DIR" ]]; then
+    "$CA" import "$CA_IMPORT_DIR/root.crt" "$CA_IMPORT_DIR/root.key"
   else
-    warn "HTTPS na LAN: configure a CA — reaproveitar a do Caddy antigo:  sudo $HOMELAB_DIR/scripts/homelab-ca.sh import-caddy"
-    warn "                                        ou criar uma nova:        sudo $HOMELAB_DIR/scripts/homelab-ca.sh init"
+    "$CA" init
   fi
 fi
+"$CA" renew
+ok "CA do homelab: instale o certificado raiz nos dispositivos — sudo $CA export"
 
 # =================== 13. Preparação GitHub Actions ===========================
 step "13/13 Preparando GitHub Actions self-hosted runner"

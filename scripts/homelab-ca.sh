@@ -2,8 +2,8 @@
 # CA local do homelab — HTTPS na LAN (nome .local e IP) pelo proxy do Coolify (Traefik).
 #
 #   sudo homelab-ca.sh                       # status (CA, certificado, integração com o Coolify)
-#   sudo homelab-ca.sh import-caddy [VOL]    # reaproveita a CA de um Caddy antigo (dispositivos continuam confiando)
 #   sudo homelab-ca.sh init                  # cria uma CA nova (só se não houver nenhuma)
+#   sudo homelab-ca.sh import CRT KEY        # usa uma CA existente (dispositivos que já confiam nela)
 #   sudo homelab-ca.sh issue [nome ...]      # emite o certificado da LAN e instala no Traefik do Coolify
 #   sudo homelab-ca.sh renew                 # reemite se faltar menos de 30 dias (usado pelo timer semanal)
 #   sudo homelab-ca.sh export [ARQUIVO]      # exporta o certificado raiz para instalar em dispositivos
@@ -59,29 +59,18 @@ cmd_init() {
   echo "  Instale o certificado raiz nos dispositivos: sudo $0 export"
 }
 
-cmd_import_caddy() {
+cmd_import() {
   have_ca && die "Já existe uma CA em $CA_DIR — não sobrescrevo"
-  local vol="${1:-}" v img tmp
-  if [[ -z "$vol" ]]; then
-    for v in homelab_caddy_data mesafacil_caddy_data; do
-      docker volume inspect "$v" >/dev/null 2>&1 && { vol="$v"; break; }
-    done
-  fi
-  [[ -n "$vol" ]] || die "Volume do Caddy não encontrado. Informe: sudo $0 import-caddy <volume>"
-  img="$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -m1 -E '^(redis|alpine|busybox|caddy)' || echo busybox:latest)"
-  tmp="$(mktemp -d -p "$WORK")"
-  log "Importando a CA do volume $vol"
-  docker run --rm -v "$vol":/d:ro --entrypoint cat "$img" /d/caddy/pki/authorities/local/root.crt > "$tmp/root.crt" \
-    || die "root.crt não encontrado em $vol"
-  docker run --rm -v "$vol":/d:ro --entrypoint cat "$img" /d/caddy/pki/authorities/local/root.key > "$tmp/root.key" \
-    || die "root.key não encontrado em $vol"
-  save_ca "$tmp/root.crt" "$tmp/root.key"
+  local crt="${1:-}" key="${2:-}"
+  [[ -r "$crt" && -r "$key" ]] || die "Uso: sudo $0 import <root.crt> <root.key>"
+  log "Importando CA de $crt"
+  save_ca "$crt" "$key"
   log "CA importada — SHA-256: $(fingerprint "$CA_DIR/root.crt")"
   echo "  Deve ser a MESMA impressão digital instalada nos dispositivos."
 }
 
 cmd_issue() {
-  have_ca || die "Nenhuma CA. Use: sudo $0 import-caddy  (reaproveitar)  ou  sudo $0 init  (nova)"
+  have_ca || die "Nenhuma CA. Use: sudo $0 init  (nova)  ou  sudo $0 import <root.crt> <root.key>"
   local host ip extra names san tmp
   host="$(lan_host)"; ip="$(lan_ip)"
   extra="$(envget HOMELAB_CA_EXTRA_NAMES)"
@@ -191,7 +180,7 @@ cmd_status() {
     echo "  SHA-256 ..... $(fingerprint "$CA_DIR/root.crt")"
     echo "  validade .... $(openssl x509 -in "$CA_DIR/root.crt" -noout -enddate | cut -d= -f2)"
   else
-    echo "CA ............ não configurada (import-caddy ou init)"
+    echo "CA ............ não configurada (init ou import)"
   fi
   if [[ -s "$CA_DIR/lan.crt" ]]; then
     echo "Certificado ... $(openssl x509 -in "$CA_DIR/lan.crt" -noout -ext subjectAltName | tail -1 | xargs)"
@@ -209,9 +198,9 @@ cmd_status() {
 case "${1:-status}" in
   status)       cmd_status ;;
   init)         cmd_init ;;
-  import-caddy) shift; cmd_import_caddy "${1:-}" ;;
+  import)       shift; cmd_import "${1:-}" "${2:-}" ;;
   issue)        shift; cmd_issue "$@" ;;
   renew)        cmd_renew ;;
   export)       shift; cmd_export "${1:-}" ;;
-  *) die "Uso: sudo $0 [status|import-caddy [volume]|init|issue [nomes]|renew|export [arquivo]]" ;;
+  *) die "Uso: sudo $0 [status|init|import <crt> <key>|issue [nomes]|renew|export [arquivo]]" ;;
 esac
