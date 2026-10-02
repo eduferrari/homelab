@@ -2,12 +2,16 @@
 # =============================================================================
 #  homelab-setup.sh — Provisionamento do homelab (ThinkPad L14 + Ubuntu Server)
 #
-#  Stack: Docker Engine + Compose | MySQL 8.4 + Adminer | Redis 7 + RedisInsight
-#         RabbitMQ 4 + Management | Caddy (proxy + CA interna) | rede "devnet"
-#         SSH | UFW | fail2ban | mDNS (.local)
-#         tampa fechada sem suspender | preparação GitHub Actions (self-hosted)
+#  Base:     Ubuntu servidor | SSH + fail2ban | UFW (+Docker) | mDNS | tampa fechada/TLP
+#  Dados:    Docker Engine + Compose | rede "devnet" | MySQL 8.4 + Adminer
+#            Redis 7 + RedisInsight | RabbitMQ 4 + Management | volumes persistentes
+#  Projetos: Coolify (PaaS self-hosted: deploy do GitHub, domínios, HTTPS, logs)
+#  Extras:   CA local p/ HTTPS na LAN | backup diário + SSD externo | IP fixo
+#            preparação GitHub Actions (self-hosted)
 #
-#  Uso:   sudo ./homelab-setup.sh
+#  Pensado para uma máquina instalada do ZERO (Ubuntu Server 24.04 recém-instalado).
+#  Uso:   git clone https://github.com/eduferrari/homelab.git && cd homelab
+#         sudo ./homelab-setup.sh
 #  Idempotente: pode ser executado novamente com segurança.
 # =============================================================================
 set -Eeuo pipefail
@@ -40,6 +44,20 @@ PREPARE_GH_RUNNER="${PREPARE_GH_RUNNER:-true}"
 GH_RUNNER_USER="${GH_RUNNER_USER:-gh-runner}"
 GH_RUNNER_DIR="${GH_RUNNER_DIR:-/opt/actions-runner}"
 
+# Coolify (gerenciador de projetos). Instala só se as portas 80, 443, 8000 e 8080 estiverem livres.
+INSTALL_COOLIFY="${INSTALL_COOLIFY:-true}"
+COOLIFY_ADMIN_EMAIL="${COOLIFY_ADMIN_EMAIL:-admin@homelab.local}"
+COOLIFY_AUTOUPDATE="${COOLIFY_AUTOUPDATE:-false}"   # atualizações manuais (mais previsível)
+
+# IP público fixo do provedor (informativo: status e README)
+PUBLIC_IP="${PUBLIC_IP:-}"
+
+# CA do HTTPS na LAN: criada automaticamente. Para manter uma CA existente (dispositivos que já
+# confiam nela), informe uma pasta com root.crt e root.key: CA_IMPORT_DIR=/caminho
+CA_IMPORT_DIR="${CA_IMPORT_DIR:-}"
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
 LOG_FILE="/var/log/homelab-setup.log"
 
 # --------------------------------- Helpers -----------------------------------
@@ -52,6 +70,8 @@ die()  { echo -e "${C_RED}  ✘ $*${C_RESET}" >&2; exit 1; }
 trap 'die "Falha na linha $LINENO (comando: $BASH_COMMAND). Veja $LOG_FILE"' ERR
 
 gen_secret() { openssl rand -hex 16; }
+# Senha aceita pelas regras do Coolify (maiúscula, minúscula, número e símbolo)
+gen_password() { echo "$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)Aa1-"; }
 
 apt_install() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$@" >/dev/null
@@ -77,19 +97,20 @@ esac
 [[ "$(uname -m)" == "x86_64" ]] || warn "Arquitetura $(uname -m) — o runner do GitHub será baixado para x64."
 
 USER_HOME="$(getent passwd "$HOMELAB_USER" | cut -d: -f6)"
+[[ -d "$SCRIPT_DIR/scripts" ]] || die "Pasta scripts/ não encontrada ao lado do setup. Rode a partir do clone do repositório."
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "===== homelab-setup $(date '+%F %T') — usuário: $HOMELAB_USER ====="
 
 # ============================ 1. Sistema base ================================
-step "1/11 Atualizando sistema e instalando pacotes base"
+step "1/13 Atualizando sistema e instalando pacotes base"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq >/dev/null
 apt_install ca-certificates curl gnupg lsb-release git jq unzip zip htop btop tmux \
   net-tools dnsutils iputils-ping vim nano openssl software-properties-common \
   unattended-upgrades apt-transport-https bash-completion \
-  tcpdump netcat-openbsd avahi-daemon libnss-mdns
+  tcpdump netcat-openbsd avahi-daemon libnss-mdns rsync parted iputils-arping
 ok "Pacotes base instalados (inclui tcpdump e netcat para diagnóstico)"
 
 # mDNS: o notebook responde como <hostname>.local na LAN, sem depender de IP fixo
@@ -125,7 +146,7 @@ sysctl --system >/dev/null
 ok "sysctl ajustado (swappiness, overcommit p/ Redis, inotify)"
 
 # ============================ 2. Modo servidor ===============================
-step "2/11 Preparando Ubuntu para uso como servidor"
+step "2/13 Preparando Ubuntu para uso como servidor"
 if [[ "$HEADLESS" == "true" && "$(systemctl get-default)" == "graphical.target" ]]; then
   systemctl set-default multi-user.target >/dev/null
   ok "Boot alterado para modo texto (multi-user.target) — economiza RAM"
@@ -134,7 +155,7 @@ else
 fi
 
 # ======================= 3. Tampa fechada / energia ==========================
-step "3/11 Configurando notebook para ficar ligado com a tampa fechada"
+step "3/13 Configurando notebook para ficar ligado com a tampa fechada"
 mkdir -p /etc/systemd/logind.conf.d
 cat > /etc/systemd/logind.conf.d/99-homelab-lid.conf <<'EOF'
 [Login]
@@ -173,7 +194,7 @@ EOF
 fi
 
 # ================================ 4. SSH =====================================
-step "4/11 Configurando SSH"
+step "4/13 Configurando SSH"
 apt_install openssh-server
 PASSWORD_AUTH="yes"
 if [[ "$DISABLE_SSH_PASSWORD" == "true" ]]; then
@@ -185,15 +206,22 @@ fi
 # O Ubuntu lê sshd_config.d em ordem alfabética e a PRIMEIRA ocorrência vence.
 # Por isso o prefixo 00- (antes do 50-cloud-init.conf, que força PasswordAuthentication yes).
 SSHD_DROPIN="/etc/ssh/sshd_config.d/00-homelab.conf"
-rm -f /etc/ssh/sshd_config.d/99-homelab.conf   # nome usado em versões anteriores do script
 
 # No Ubuntu 24.04 o SSH é ativado por socket: /run/sshd só existe depois que
 # o serviço sobe, e sem ele o "sshd -t" falha com "Missing privilege separation directory".
 install -d -m 0755 /run/sshd
 
+# O Coolify gerencia o próprio host por SSH como root (chave gerada por ele), a partir dos
+# seus containers. Root: só com chave e só das redes Docker/loopback — nunca da LAN.
+ROOT_LOGIN="no"; ALLOW_USERS="${HOMELAB_USER}"
+if [[ "$INSTALL_COOLIFY" == "true" ]]; then
+  ROOT_LOGIN="prohibit-password"
+  ALLOW_USERS="${HOMELAB_USER} root@10.0.0.0/8 root@172.16.0.0/12 root@127.0.0.1"
+fi
+
 cat > "$SSHD_DROPIN" <<EOF
 Port ${SSH_PORT}
-PermitRootLogin no
+PermitRootLogin ${ROOT_LOGIN}
 PasswordAuthentication ${PASSWORD_AUTH}
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
@@ -202,7 +230,7 @@ LoginGraceTime 30
 X11Forwarding no
 ClientAliveInterval 300
 ClientAliveCountMax 2
-AllowUsers ${HOMELAB_USER}
+AllowUsers ${ALLOW_USERS}
 EOF
 if ! SSHD_CHECK="$(/usr/sbin/sshd -t 2>&1)"; then
   rm -f "$SSHD_DROPIN"   # não deixa o SSH com configuração quebrada
@@ -226,7 +254,7 @@ if ! systemctl restart ssh.service; then
 fi
 sleep 1
 ss -tln | grep -q ":${SSH_PORT} " || die "sshd não está escutando na porta ${SSH_PORT} — veja: journalctl -u ssh -n 30"
-ok "SSH na porta ${SSH_PORT} | usuário permitido: ${HOMELAB_USER} | root bloqueado | login por senha: ${PASSWORD_AUTH}"
+ok "SSH na porta ${SSH_PORT} | usuário: ${HOMELAB_USER} | root: $([[ $ROOT_LOGIN == no ]] && echo bloqueado || echo 'só chave, só redes Docker (Coolify)') | senha: ${PASSWORD_AUTH}"
 if [[ "$PASSWORD_AUTH" == "yes" ]]; then
   warn "Login por senha ainda ativo. Copie sua chave (ssh-copy-id) e rode novamente com DISABLE_SSH_PASSWORD=true"
 fi
@@ -249,7 +277,7 @@ systemctl restart fail2ban
 ok "fail2ban protegendo o SSH"
 
 # ============================== 5. Docker ====================================
-step "5/11 Instalando Docker Engine + Docker Compose (repositório oficial)"
+step "5/13 Instalando Docker Engine + Docker Compose (repositório oficial)"
 if ! command -v docker &>/dev/null || ! docker compose version &>/dev/null; then
   for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
     apt-get remove -y -qq "$pkg" >/dev/null 2>&1 || true
@@ -264,11 +292,14 @@ if ! command -v docker &>/dev/null || ! docker compose version &>/dev/null; then
 fi
 
 mkdir -p /etc/docker
+# default-address-pools igual ao padrão do Coolify: com o pool já definido, o instalador
+# dele mantém este arquivo (e o live-restore) em vez de reescrevê-lo.
 cat > /etc/docker/daemon.json <<'EOF'
 {
   "log-driver": "json-file",
   "log-opts": { "max-size": "10m", "max-file": "3" },
-  "live-restore": true
+  "live-restore": true,
+  "default-address-pools": [ { "base": "10.0.0.0/8", "size": 24 } ]
 }
 EOF
 systemctl enable docker containerd >/dev/null 2>&1
@@ -279,11 +310,15 @@ ok "$(docker compose version)"
 ok "Usuário $HOMELAB_USER adicionado ao grupo docker"
 
 # ============================== 6. Firewall ==================================
-step "6/11 Configurando firewall UFW (+ integração com Docker)"
+step "6/13 Configurando firewall UFW (+ integração com Docker)"
 apt_install ufw
 ufw default deny incoming  >/dev/null
 ufw default allow outgoing >/dev/null
 ufw limit "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
+# SSH vindo dos containers do Coolify: sem rate-limit (ele abre várias conexões seguidas)
+for net in 10.0.0.0/8 172.16.0.0/12; do
+  ufw insert 1 allow proto tcp from "$net" to any port "${SSH_PORT}" comment 'SSH (Coolify)' >/dev/null 2>&1 || true
+done
 # mDNS (resolução de <hostname>.local) — apenas redes privadas
 for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12; do
   ufw allow from "$net" to any port 5353 proto udp comment 'mDNS' >/dev/null
@@ -330,22 +365,40 @@ fi
 ufw --force enable >/dev/null
 ufw reload >/dev/null
 systemctl restart docker
-ok "UFW ativo: entrada negada por padrão, SSH liberado (com rate-limit), mDNS na LAN"
+ok "UFW ativo: entrada negada por padrão, SSH com rate-limit, mDNS na LAN; containers só na LAN"
 
-# ======================= 7. Estrutura de diretórios ==========================
-step "7/11 Criando estrutura de diretórios"
+
+# ======================= 7. Estrutura, configuração e limpeza ================
+step "7/13 Estrutura de diretórios e configuração"
 INFRA_DIR="$HOMELAB_DIR/infra"
-mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} "$INFRA_DIR"/caddy/sites \
-         "$HOMELAB_DIR"/{apps,backups/mysql,scripts} \
+mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} "$HOMELAB_DIR"/{apps,backups,scripts} \
          "$USER_HOME"/projects/{apps,libs,sandbox}
+install -d -m 700 -o root -g root "$HOMELAB_DIR/ca"
 
 chown -R "$HOMELAB_USER":"$HOMELAB_USER" "$USER_HOME/projects"
-chown -R "$HOMELAB_USER":docker "$HOMELAB_DIR"
-chmod 2775 "$HOMELAB_DIR/apps"   # setgid: arquivos de deploy herdam o grupo docker
-ok "Infra em $HOMELAB_DIR | projetos em $USER_HOME/projects"
+chown "$HOMELAB_USER":docker "$HOMELAB_DIR"
+chown -R "$HOMELAB_USER":docker "$INFRA_DIR" "$HOMELAB_DIR/apps" "$HOMELAB_DIR/scripts"
+chmod 2775 "$HOMELAB_DIR/apps"
+# Backups contêm segredos (.env, CA): só root grava; só o seu usuário lê (para copiar ao Mac)
+BACKUP_GROUP="$(id -gn "$HOMELAB_USER")"
+chown -R root:"$BACKUP_GROUP" "$HOMELAB_DIR/backups"
+chmod 750 "$HOMELAB_DIR/backups"
+
+# Configuração lida pelos scripts utilitários
+cat > /etc/homelab.conf <<EOF
+# Gerado por homelab-setup.sh
+HOMELAB_DIR="${HOMELAB_DIR}"
+HOMELAB_USER="${HOMELAB_USER}"
+BACKUP_GROUP="${BACKUP_GROUP}"
+GH_RUNNER_USER="${GH_RUNNER_USER}"
+GH_RUNNER_DIR="${GH_RUNNER_DIR}"
+EOF
+chmod 644 /etc/homelab.conf
+
+ok "Infra em $HOMELAB_DIR | projetos em $USER_HOME/projects | config em /etc/homelab.conf"
 
 # ============================ 8. Rede Docker =================================
-step "8/11 Criando rede Docker '$DOCKER_NETWORK'"
+step "8/13 Criando rede Docker '$DOCKER_NETWORK'"
 if ! docker network inspect "$DOCKER_NETWORK" &>/dev/null; then
   docker network create --driver bridge "$DOCKER_NETWORK" >/dev/null
   ok "Rede $DOCKER_NETWORK criada"
@@ -353,9 +406,8 @@ else
   ok "Rede $DOCKER_NETWORK já existe"
 fi
 
-# ======================= 9. Stack de serviços (Compose) ======================
-step "9/11 Gerando stack Docker Compose"
-
+# ======================= 9. Stack de dados (Compose) =========================
+step "9/13 Gerando stack de dados (MySQL, Redis, RabbitMQ)"
 ENV_FILE="$INFRA_DIR/.env"
 if [[ ! -f "$ENV_FILE" ]]; then
   cat > "$ENV_FILE" <<EOF
@@ -370,7 +422,7 @@ MYSQL_USER=dev
 MYSQL_PASSWORD=$(gen_secret)
 
 # Adminer
-ADMINER_PORT=8080
+ADMINER_PORT=8088
 
 # Redis 7
 REDIS_PORT=6379
@@ -384,84 +436,31 @@ RABBITMQ_PORT=5672
 RABBITMQ_UI_PORT=15672
 RABBITMQ_DEFAULT_USER=admin
 RABBITMQ_DEFAULT_PASS=$(gen_secret)
+
+# Backup (dias de retenção local)
+BACKUP_KEEP_DAYS=7
+
+# Nomes extras no certificado da LAN (separados por espaço) — homelab-ca.sh
+HOMELAB_CA_EXTRA_NAMES=
+
+# Coolify — admin criado na instalação (usuário: admin)
+COOLIFY_ADMIN_EMAIL=${COOLIFY_ADMIN_EMAIL}
+COOLIFY_ADMIN_PASSWORD=$(gen_password)
 EOF
   ok "Credenciais geradas em $ENV_FILE"
 else
   ok "$ENV_FILE já existe — credenciais preservadas"
 fi
-# Chaves do Caddy: adicionadas em instalações antigas; host/IP atualizados a cada execução
+
 set_env() {
   if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
 }
-grep -q '^# Caddy' "$ENV_FILE" || printf '\n# Caddy (proxy reverso + CA interna)\n' >> "$ENV_FILE"
-grep -q '^CADDY_APP_PORTS=' "$ENV_FILE" || echo 'CADDY_APP_PORTS=8081-8089' >> "$ENV_FILE"
+# Host e IP atualizados a cada execução (usados pelo certificado da LAN e pelo status)
 set_env HOMELAB_HOST "$(hostname).local"
 set_env HOMELAB_IP "$(hostname -I | awk '{print $1}')"
+[[ -n "$PUBLIC_IP" ]] && set_env HOMELAB_PUBLIC_IP "$PUBLIC_IP"
 chown "$HOMELAB_USER":docker "$ENV_FILE"
 chmod 640 "$ENV_FILE"
-
-# ---- Caddy: arquivo base (plataforma) + snippets; sites de cada projeto em caddy/sites/*.caddy ----
-cat > "$INFRA_DIR/caddy/Caddyfile" <<'EOF'
-# Gerado por homelab-setup.sh — NÃO edite (é sobrescrito).
-# Sites dos projetos: /opt/homelab/infra/caddy/sites/<projeto>.caddy
-{
-	# CA interna do homelab: certificados para <host>.local e para o IP da LAN
-	local_certs
-	skip_install_trust
-}
-
-import sites/*.caddy
-EOF
-
-cat > "$INFRA_DIR/caddy/sites/00-snippets.caddy" <<'EOF'
-# Gerado por homelab-setup.sh — snippets compartilhados pelos sites dos projetos.
-# Uso dentro de um site:  import security_headers
-#        dentro de reverse_proxy:  import sse
-
-# SSE / streaming: repassa a resposta sem buffer
-(sse) {
-	flush_interval -1
-}
-
-(security_headers) {
-	header {
-		X-Content-Type-Options nosniff
-		Referrer-Policy strict-origin-when-cross-origin
-		-Server
-	}
-}
-EOF
-
-cat > "$INFRA_DIR/caddy/sites/_exemplo.caddy.txt" <<'EOF'
-# Exemplo de site de projeto — copie para sites/<projeto>.caddy e rode:
-#   /opt/homelab/scripts/caddy-reload.sh
-#
-# {$HOMELAB_HOST} e {$HOMELAB_IP} vêm do .env (o IP é atualizado a cada execução do setup).
-# Upstreams = nome do container na rede devnet + porta INTERNA do container.
-# Portas publicadas pelo Caddy: 80, 443 e a faixa CADDY_APP_PORTS (padrão 8081-8089).
-
-# Site principal (443; a porta 80 redireciona para HTTPS)
-{$HOMELAB_HOST}, {$HOMELAB_IP} {
-	import security_headers
-	reverse_proxy site:8080
-}
-
-# Sistema em porta própria
-{$HOMELAB_HOST}:8081, {$HOMELAB_IP}:8081 {
-	import security_headers
-	reverse_proxy pdv:8080
-}
-
-# API com SSE (sem buffer)
-{$HOMELAB_HOST}:8083, {$HOMELAB_IP}:8083 {
-	reverse_proxy api:8080 {
-		import sse
-	}
-}
-EOF
-chown -R "$HOMELAB_USER":docker "$INFRA_DIR/caddy"
-chmod 2775 "$INFRA_DIR/caddy/sites"   # deploys (gh-runner, grupo docker) podem gravar sites
-ok "Caddy: Caddyfile base + snippets em $INFRA_DIR/caddy"
 
 cat > "$INFRA_DIR/mysql/conf.d/homelab.cnf" <<'EOF'
 [mysqld]
@@ -554,25 +553,6 @@ services:
         condition: service_healthy
     networks: [devnet]
 
-  caddy:
-    image: caddy:2-alpine
-    container_name: caddy
-    restart: unless-stopped
-    environment:
-      HOMELAB_HOST: ${HOMELAB_HOST}
-      HOMELAB_IP: ${HOMELAB_IP}
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-      - "${CADDY_APP_PORTS}:${CADDY_APP_PORTS}"
-    volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./caddy/sites:/etc/caddy/sites:ro
-      - caddy_data:/data        # CA interna e certificados — NÃO apague
-      - caddy_config:/config
-    networks: [devnet]
-
   rabbitmq:
     image: rabbitmq:4-management
     container_name: rabbitmq
@@ -600,8 +580,6 @@ volumes:
   redis_data:
   redisinsight_data:
   rabbitmq_data:
-  caddy_data:
-  caddy_config:
 
 networks:
   devnet:
@@ -610,85 +588,114 @@ EOF
 chown "$HOMELAB_USER":docker "$INFRA_DIR/docker-compose.yml"
 ok "docker-compose.yml gerado em $INFRA_DIR"
 
-# ---- Scripts utilitários ----
-cat > "$HOMELAB_DIR/scripts/backup-mysql.sh" <<'EOF'
-#!/usr/bin/env bash
-# Backup de todos os bancos do MySQL (mantém os últimos 7 dias)
-set -euo pipefail
-DIR="/opt/homelab/backups/mysql"
-ENV="/opt/homelab/infra/.env"
-KEEP_DAYS="${KEEP_DAYS:-7}"
-PASS="$(grep '^MYSQL_ROOT_PASSWORD=' "$ENV" | cut -d= -f2-)"
-FILE="$DIR/mysql-$(date +%F_%H%M).sql.gz"
-docker exec -e MYSQL_PWD="$PASS" mysql \
-  mysqldump -uroot --all-databases --single-transaction --routines --triggers --events \
-  | gzip > "$FILE"
-find "$DIR" -name 'mysql-*.sql.gz' -mtime +"$KEEP_DAYS" -delete
-echo "Backup: $FILE"
-EOF
-
-cat > "$HOMELAB_DIR/scripts/status.sh" <<'EOF'
-#!/usr/bin/env bash
-# Visão rápida do homelab
-IP="$(hostname -I | awk '{print $1}')"
-HOST="$(hostname).local"
-echo "== Rede =="; echo "IP: $IP | mDNS: $HOST"; echo
-echo "== Containers =="; docker compose -f /opt/homelab/infra/docker-compose.yml ps
-echo; echo "== Firewall =="; sudo ufw status numbered
-echo; echo "== Disco =="; df -h / | tail -1
-echo; echo "== Bateria =="; cat /sys/class/power_supply/BAT0/capacity 2>/dev/null | sed 's/$/%/' || echo "n/d"
-echo; echo "== UIs =="
-echo "Adminer      http://$HOST:8080"
-echo "RedisInsight http://$HOST:5540"
-echo "RabbitMQ     http://$HOST:15672"
-echo "Caddy        https://$HOST  (sites em /opt/homelab/infra/caddy/sites)"
-EOF
-cat > "$HOMELAB_DIR/scripts/caddy-reload.sh" <<'EOF'
-#!/usr/bin/env bash
-# Valida e recarrega o Caddy sem derrubar conexões (use após alterar caddy/sites/*.caddy)
-set -euo pipefail
-docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-docker exec caddy caddy reload   --config /etc/caddy/Caddyfile --adapter caddyfile
-echo "Caddy recarregado."
-EOF
-
-cat > "$HOMELAB_DIR/scripts/caddy-ca.sh" <<'EOF'
-#!/usr/bin/env bash
-# Exporta o certificado raiz da CA interna do Caddy e mostra a impressão digital (SHA-256)
-set -euo pipefail
-OUT="${1:-/opt/homelab/infra/caddy/homelab-root-ca.crt}"
-docker exec caddy cat /data/caddy/pki/authorities/local/root.crt > "$OUT"
-echo "CA exportada: $OUT"
-openssl x509 -in "$OUT" -noout -subject -enddate -fingerprint -sha256
-EOF
-
-chmod 750 "$HOMELAB_DIR"/scripts/*.sh
-chown "$HOMELAB_USER":docker "$HOMELAB_DIR"/scripts/*.sh
-
-# ======================= 10. Subindo os serviços =============================
-step "10/11 Baixando imagens e subindo serviços (pode levar alguns minutos)"
+# ======================= 10. Subindo a stack de dados ========================
+step "10/13 Baixando imagens e subindo MySQL, Redis e RabbitMQ"
 cd "$INFRA_DIR"
 docker compose pull -q
-
-# Não sobe o Caddy da stack se já houver outro Caddy/servidor ocupando a 443
-UP_ARGS=(-d --wait --wait-timeout 240)
-CADDY_CONFLICT=""
-if systemctl is-active --quiet caddy 2>/dev/null; then
-  CADDY_CONFLICT="Caddy instalado no host (apt) está ativo"
-elif ss -tlnH 'sport = :443' | grep -q . && \
-     [[ "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' caddy 2>/dev/null)" != "homelab" ]]; then
-  CADDY_CONFLICT="a porta 443 já está em uso por outro processo/container"
-fi
-if [[ -n "$CADDY_CONFLICT" ]]; then
-  warn "Container caddy da stack NÃO iniciado: ${CADDY_CONFLICT}. Veja 'Migrar um Caddy existente' no README."
-  UP_ARGS+=(--scale caddy=0)
-fi
-docker compose up "${UP_ARGS[@]}"
-ok "Serviços no ar"
+docker compose up -d --wait --wait-timeout 240
+ok "Stack de dados no ar"
 docker compose ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}'
 
-# =================== 11. Preparação GitHub Actions ===========================
-step "11/11 Preparando GitHub Actions self-hosted runner"
+# ================ 11. Scripts utilitários, backup e certificado ==============
+step "11/13 Instalando scripts utilitários e agendamentos"
+for f in "$SCRIPT_DIR"/scripts/*.sh; do
+  install -m 750 -o "$HOMELAB_USER" -g docker "$f" "$HOMELAB_DIR/scripts/$(basename "$f")"
+done
+ok "Scripts em $HOMELAB_DIR/scripts: $(cd "$HOMELAB_DIR/scripts" && ls | tr '\n' ' ')"
+
+# Backup diário às 03:00 (roda como root, log no journal, recupera execuções perdidas)
+cat > /etc/systemd/system/homelab-backup.service <<EOF
+[Unit]
+Description=Backup do homelab (MySQL, Redis, RabbitMQ, Coolify, configurações) + cópia para SSD externo
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=${HOMELAB_DIR}/scripts/backup.sh
+Nice=10
+IOSchedulingClass=idle
+EOF
+cat > /etc/systemd/system/homelab-backup.timer <<'EOF'
+[Unit]
+Description=Backup diário do homelab
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# Renovação semanal do certificado da LAN (reemite se faltar < 30 dias ou se o IP mudou)
+cat > /etc/systemd/system/homelab-ca-renew.service <<EOF
+[Unit]
+Description=Renova o certificado HTTPS da LAN (CA do homelab)
+
+[Service]
+Type=oneshot
+ExecStart=${HOMELAB_DIR}/scripts/homelab-ca.sh renew
+EOF
+cat > /etc/systemd/system/homelab-ca-renew.timer <<'EOF'
+[Unit]
+Description=Verificação semanal do certificado da LAN
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now homelab-backup.timer homelab-ca-renew.timer >/dev/null 2>&1
+ok "Agendado: backup diário (03:00) e renovação semanal do certificado da LAN"
+
+# ============================== 12. Coolify ==================================
+step "12/13 Coolify (gerenciador de projetos)"
+COOLIFY_STATE="não instalado"
+if [[ "$INSTALL_COOLIFY" != "true" ]]; then
+  warn "Instalação do Coolify ignorada (INSTALL_COOLIFY=false)"
+elif [[ -f /data/coolify/source/.env ]]; then
+  COOLIFY_STATE="instalado"
+  ok "Coolify já instalado (atualize pelo painel ou: curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sudo bash)"
+else
+  BUSY=()
+  for p in 80 443 8000 8080; do ss -tlnH "sport = :$p" | grep -q . && BUSY+=("$p"); done
+  if (( ${#BUSY[@]} )); then
+    COOLIFY_STATE="pendente (portas ${BUSY[*]} em uso)"
+    warn "Coolify NÃO instalado: portas em uso: ${BUSY[*]}"
+    ss -tlnpH | grep -E ":($(IFS='|'; echo "${BUSY[*]}")) " | sed 's/^/    /' || true
+    warn "Libere as portas e rode o setup de novo (o Coolify precisa de 80, 443, 8000 e 8080)."
+  else
+    curl -fsSL https://cdn.coollabs.io/coolify/install.sh -o /tmp/coolify-install.sh
+    ROOT_USERNAME=admin \
+    ROOT_USER_EMAIL="$(grep -m1 '^COOLIFY_ADMIN_EMAIL=' "$ENV_FILE" | cut -d= -f2-)" \
+    ROOT_USER_PASSWORD="$(grep -m1 '^COOLIFY_ADMIN_PASSWORD=' "$ENV_FILE" | cut -d= -f2-)" \
+    AUTOUPDATE="$COOLIFY_AUTOUPDATE" \
+      bash /tmp/coolify-install.sh
+    rm -f /tmp/coolify-install.sh
+    COOLIFY_STATE="instalado"
+    ok "Coolify instalado"
+  fi
+fi
+# HTTPS na LAN: CA do homelab (nova ou importada) + certificado instalado no Traefik do Coolify
+CA="$HOMELAB_DIR/scripts/homelab-ca.sh"
+if [[ ! -s "$HOMELAB_DIR/ca/root.key" ]]; then
+  if [[ -n "$CA_IMPORT_DIR" ]]; then
+    "$CA" import "$CA_IMPORT_DIR/root.crt" "$CA_IMPORT_DIR/root.key"
+  else
+    "$CA" init
+  fi
+fi
+"$CA" renew
+ok "CA do homelab: instale o certificado raiz nos dispositivos — sudo $CA export"
+
+# =================== 13. Preparação GitHub Actions ===========================
+step "13/13 Preparando GitHub Actions self-hosted runner"
 if [[ "$PREPARE_GH_RUNNER" == "true" ]]; then
   if ! id "$GH_RUNNER_USER" &>/dev/null; then
     useradd -m -s /bin/bash "$GH_RUNNER_USER"
@@ -711,23 +718,6 @@ if [[ "$PREPARE_GH_RUNNER" == "true" ]]; then
   fi
   chown -R "$GH_RUNNER_USER":"$GH_RUNNER_USER" "$GH_RUNNER_DIR"
 
-  cat > "$HOMELAB_DIR/scripts/register-runner.sh" <<EOF
-#!/usr/bin/env bash
-# Registra o runner no GitHub e instala como serviço systemd.
-# Uso: sudo $HOMELAB_DIR/scripts/register-runner.sh <URL_REPO_OU_ORG> <TOKEN> [NOME] [LABELS]
-set -euo pipefail
-URL="\${1:?Informe a URL do repositório/organização}"
-TOKEN="\${2:?Informe o token de registro (Settings > Actions > Runners > New)}"
-NAME="\${3:-\$(hostname)}"
-LABELS="\${4:-homelab,linux,x64,docker}"
-cd "$GH_RUNNER_DIR"
-sudo -u "$GH_RUNNER_USER" ./config.sh --unattended --replace \\
-  --url "\$URL" --token "\$TOKEN" --name "\$NAME" --labels "\$LABELS" --work _work
-./svc.sh install "$GH_RUNNER_USER"
-./svc.sh start
-./svc.sh status
-EOF
-  chmod 750 "$HOMELAB_DIR/scripts/register-runner.sh"
   ok "Para registrar: sudo $HOMELAB_DIR/scripts/register-runner.sh <url> <token>"
 else
   warn "Preparação do runner ignorada (PREPARE_GH_RUNNER=false)"
@@ -739,25 +729,24 @@ HOST="$(hostname).local"
 cat <<EOF
 
 ${C_GREEN}=====================================================================
-  Homelab pronto!  ${HOST}  (IP atual: ${IP})
+  Homelab pronto!  ${HOST}  (IP na LAN: ${IP})
 =====================================================================${C_RESET}
   SSH ............ ssh ${HOMELAB_USER}@${HOST} -p ${SSH_PORT}
-  Adminer ........ http://${HOST}:8080       (servidor: mysql)
+  Coolify ........ http://${HOST}:8000   [${COOLIFY_STATE}]
+                   admin: COOLIFY_ADMIN_EMAIL / COOLIFY_ADMIN_PASSWORD no .env
+  Adminer ........ http://${HOST}:$(grep -m1 '^ADMINER_PORT=' "$ENV_FILE" | cut -d= -f2)   (servidor: mysql)
   RedisInsight ... http://${HOST}:5540
   RabbitMQ UI .... http://${HOST}:15672
-  MySQL .......... ${HOST}:3306
-  Redis .......... ${HOST}:6379
-  RabbitMQ AMQP .. ${HOST}:5672
-  Caddy (HTTPS) .. https://${HOST}  — sites em ${INFRA_DIR}/caddy/sites
-  CA do Caddy .... ${HOMELAB_DIR}/scripts/caddy-ca.sh  (instale nos dispositivos)
+  MySQL / Redis .. ${IP}:3306 / ${IP}:6379   |   RabbitMQ AMQP ${IP}:5672
 
-  Use o nome ${HOST}: o IP pode mudar a cada reboot (DHCP).
-
-  Credenciais .... cat ${ENV_FILE}
-  Compose ........ cd ${INFRA_DIR} && docker compose ps
+  Credenciais .... sudo cat ${ENV_FILE}
   Status ......... ${HOMELAB_DIR}/scripts/status.sh
+  HTTPS na LAN ... sudo ${HOMELAB_DIR}/scripts/homelab-ca.sh  (CA, certificado, exportar raiz)
+  Backup ......... diário 03:00 → ${HOMELAB_DIR}/backups  (manual: sudo ${HOMELAB_DIR}/scripts/backup.sh)
+  SSD externo .... sudo ${HOMELAB_DIR}/scripts/backup-disk-setup.sh
+  IP fixo (LAN) .. sudo ${HOMELAB_DIR}/scripts/network-static.sh
+  Internet ....... sudo ${HOMELAB_DIR}/scripts/public-access.sh status|enable|disable
   Log ............ ${LOG_FILE}
 
-${C_YELLOW}  ► Reinicie agora para aplicar tudo:  sudo reboot${C_RESET}
-    (grupo docker, modo texto, tampa fechada e consoleblank)
+${C_YELLOW}  ► Na primeira instalação, reinicie:  sudo reboot${C_RESET}
 EOF
