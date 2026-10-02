@@ -4,6 +4,7 @@
 #
 #  Stack: Docker Engine + Compose | MySQL 8.4 + Adminer | Redis 7 + RedisInsight
 #         RabbitMQ 4 + Management | Caddy (proxy + CA interna) | rede "devnet"
+#         Painel: Homepage + Portainer + Uptime Kuma + Cockpit (via Caddy, HTTPS)
 #         SSH | UFW | fail2ban | mDNS (.local) | backup diário + restauração
 #         tampa fechada sem suspender | preparação GitHub Actions (self-hosted)
 #
@@ -284,6 +285,8 @@ apt_install ufw
 ufw default deny incoming  >/dev/null
 ufw default allow outgoing >/dev/null
 ufw limit "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
+# Cockpit (:9091) só para as redes Docker — o acesso do usuário é via Caddy (https :9090)
+ufw allow from 172.16.0.0/12 to any port 9091 proto tcp comment 'Cockpit via Caddy' >/dev/null
 # mDNS (resolução de <hostname>.local) — apenas redes privadas
 for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12; do
   ufw allow from "$net" to any port 5353 proto udp comment 'mDNS' >/dev/null
@@ -335,7 +338,7 @@ ok "UFW ativo: entrada negada por padrão, SSH liberado (com rate-limit), mDNS n
 # ======================= 7. Estrutura de diretórios ==========================
 step "7/11 Criando estrutura de diretórios"
 INFRA_DIR="$HOMELAB_DIR/infra"
-mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} "$INFRA_DIR"/caddy/sites \
+mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} "$INFRA_DIR"/caddy/sites "$INFRA_DIR"/{homepage,portainer} \
          "$HOMELAB_DIR"/{apps,backups/mysql,scripts} \
          "$USER_HOME"/projects/{apps,libs,sandbox}
 
@@ -401,6 +404,10 @@ set_env() {
 grep -q '^# Caddy' "$ENV_FILE" || printf '\n# Caddy (proxy reverso + CA interna)\n' >> "$ENV_FILE"
 grep -q '^CADDY_APP_PORTS=' "$ENV_FILE" || echo 'CADDY_APP_PORTS=8081-8089' >> "$ENV_FILE"
 grep -q '^BACKUP_KEEP_DAYS=' "$ENV_FILE" || printf '\n# Backup (dias de retenção)\nBACKUP_KEEP_DAYS=7\n' >> "$ENV_FILE"
+grep -q '^PORTAINER_ADMIN_PASSWORD=' "$ENV_FILE" || \
+  printf '\n# Painel de administração\nPORTAINER_ADMIN_PASSWORD=%s\n' "$(gen_secret)" >> "$ENV_FILE"
+# Token do monitor "Push" do Uptime Kuma (preenchido por você — veja o README)
+grep -q '^UPTIME_KUMA_PUSH_TOKEN=' "$ENV_FILE" || echo 'UPTIME_KUMA_PUSH_TOKEN=' >> "$ENV_FILE"
 set_env HOMELAB_HOST "$(hostname).local"
 set_env HOMELAB_IP "$(hostname -I | awk '{print $1}')"
 chown "$HOMELAB_USER":docker "$ENV_FILE"
@@ -468,6 +475,184 @@ EOF
 chown -R "$HOMELAB_USER":docker "$INFRA_DIR/caddy"
 chmod 2775 "$INFRA_DIR/caddy/sites"   # deploys (gh-runner, grupo docker) podem gravar sites
 ok "Caddy: Caddyfile base + snippets em $INFRA_DIR/caddy"
+
+# ---- Painel de administração -------------------------------------------------
+PANEL_HOST="$(hostname).local"
+PANEL_IP="$(hostname -I | awk '{print $1}')"
+
+# Sites das ferramentas (plataforma — sobrescrito a cada execução)
+cat > "$INFRA_DIR/caddy/sites/10-homelab-admin.caddy" <<'EOF'
+# Gerado por homelab-setup.sh — painel de administração do homelab (não editar)
+
+# Homepage (início)
+{$HOMELAB_HOST}:9000, {$HOMELAB_IP}:9000 {
+	import security_headers
+	reverse_proxy homepage:3000
+}
+
+# Portainer (containers)
+{$HOMELAB_HOST}:9001, {$HOMELAB_IP}:9001 {
+	reverse_proxy portainer:9000
+}
+
+# Uptime Kuma (monitoramento)
+{$HOMELAB_HOST}:9002, {$HOMELAB_IP}:9002 {
+	reverse_proxy uptime-kuma:3001
+}
+
+# Cockpit (host) — escuta em :9091 no host, acessível só pelas redes Docker
+{$HOMELAB_HOST}:9090, {$HOMELAB_IP}:9090 {
+	reverse_proxy host.docker.internal:9091
+}
+EOF
+
+# Cockpit: instalado no host, servido pelo Caddy em https://<host>:9090
+apt_install cockpit cockpit-storaged cockpit-packagekit
+mkdir -p /etc/cockpit /etc/systemd/system/cockpit.socket.d
+cat > /etc/systemd/system/cockpit.socket.d/10-homelab.conf <<'EOF'
+[Socket]
+ListenStream=
+ListenStream=9091
+EOF
+cat > /etc/cockpit/cockpit.conf <<EOF
+# Gerado por homelab-setup.sh — Cockpit atrás do Caddy (HTTPS termina no Caddy)
+[WebService]
+Origins = https://${PANEL_HOST}:9090 https://${PANEL_IP}:9090
+ProtocolHeader = X-Forwarded-Proto
+AllowUnencrypted = true
+LoginTitle = Homelab
+EOF
+systemctl daemon-reload
+systemctl enable cockpit.socket >/dev/null 2>&1
+systemctl restart cockpit.socket
+ok "Cockpit configurado (host :9091 → Caddy https://${PANEL_HOST}:9090)"
+
+# Portainer: senha do admin aplicada na 1ª inicialização (evita o bloqueio de 5 min do setup web)
+grep -m1 '^PORTAINER_ADMIN_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d '\n' > "$INFRA_DIR/portainer/admin_password"
+chmod 640 "$INFRA_DIR/portainer/admin_password"
+
+# Homepage: arquivos seus (criados só se não existirem) + arquivos da plataforma (sempre)
+HP="$INFRA_DIR/homepage"
+[[ -f "$HP/settings.yaml" ]] || cat > "$HP/settings.yaml" <<'EOF'
+title: Homelab
+language: pt-BR
+theme: dark
+color: slate
+headerStyle: clean
+layout:
+  Painel:
+    style: row
+    columns: 4
+  Serviços:
+    style: row
+    columns: 4
+  Projetos:
+    style: row
+    columns: 4
+EOF
+
+[[ -f "$HP/services.yaml" ]] || cat > "$HP/services.yaml" <<'EOF'
+# Edite à vontade — este arquivo não é sobrescrito pelo setup.
+# "container" mostra o status do container (via socket proxy somente leitura).
+- Painel:
+    - Portainer:
+        href: https://{{HOMEPAGE_VAR_HOST}}:9001
+        description: "Containers, logs e console"
+        icon: portainer.png
+        server: homelab
+        container: portainer
+    - Uptime Kuma:
+        href: https://{{HOMEPAGE_VAR_HOST}}:9002
+        description: "Monitoramento e alertas"
+        icon: uptime-kuma.png
+        server: homelab
+        container: uptime-kuma
+    - Cockpit:
+        href: https://{{HOMEPAGE_VAR_HOST}}:9090
+        description: "Host, serviços, discos e atualizações"
+        icon: cockpit.png
+    - Caddy:
+        href: https://{{HOMEPAGE_VAR_HOST}}
+        description: "Proxy reverso e HTTPS"
+        icon: caddy.png
+        server: homelab
+        container: caddy
+
+- Serviços:
+    - Adminer:
+        href: http://{{HOMEPAGE_VAR_HOST}}:8080
+        description: "MySQL 8.4 (servidor: mysql)"
+        icon: adminer.png
+        server: homelab
+        container: adminer
+    - RedisInsight:
+        href: http://{{HOMEPAGE_VAR_HOST}}:5540
+        description: "Redis 7"
+        icon: redis.png
+        server: homelab
+        container: redisinsight
+    - RabbitMQ:
+        href: http://{{HOMEPAGE_VAR_HOST}}:15672
+        description: "Filas e mensageria"
+        icon: rabbitmq.png
+        server: homelab
+        container: rabbitmq
+    - MySQL:
+        description: "Banco de dados (porta 3306)"
+        icon: mysql.png
+        server: homelab
+        container: mysql
+    - Redis:
+        description: "Cache (porta 6379)"
+        icon: redis.png
+        server: homelab
+        container: redis
+
+- Projetos:
+    - Site:
+        href: https://{{HOMEPAGE_VAR_HOST}}
+        description: "Exemplo — ajuste para os seus sistemas"
+        icon: mdi-web
+EOF
+
+[[ -f "$HP/bookmarks.yaml" ]] || cat > "$HP/bookmarks.yaml" <<'EOF'
+- Homelab:
+    - Repositório:
+        - href: https://github.com/eduferrari/homelab
+          icon: github.png
+EOF
+
+# Plataforma (sobrescritos): conexão com o Docker e widgets de recursos
+cat > "$HP/docker.yaml" <<'EOF'
+# Gerado por homelab-setup.sh — acesso somente leitura via docker-socket-proxy
+homelab:
+  host: dockerproxy
+  port: 2375
+EOF
+{
+  echo "# Gerado por homelab-setup.sh"
+  echo "- resources:"
+  echo "    label: Sistema"
+  echo "    cpu: true"
+  echo "    memory: true"
+  echo "    cputemp: true"
+  echo "    uptime: true"
+  echo "    disk: /"
+  EXT_MNT_HP="$(grep -m1 '^BACKUP_EXTERNAL_MOUNT=' "$ENV_FILE" | cut -d= -f2- || true)"
+  if [[ -n "$EXT_MNT_HP" ]]; then
+    echo "- resources:"
+    echo "    label: SSD de backup"
+    echo "    disk: ${EXT_MNT_HP}"
+  fi
+  echo "- datetime:"
+  echo "    text_size: md"
+  echo "    locale: pt-BR"
+  echo "    format:"
+  echo "      dateStyle: long"
+  echo "      timeStyle: short"
+} > "$HP/widgets.yaml"
+chown -R "$HOMELAB_USER":docker "$HP" "$INFRA_DIR/portainer" "$INFRA_DIR/caddy"
+ok "Painel: Homepage, Portainer e Uptime Kuma configurados"
 
 cat > "$INFRA_DIR/mysql/conf.d/homelab.cnf" <<'EOF'
 [mysqld]
@@ -572,11 +757,69 @@ services:
       - "443:443"
       - "443:443/udp"
       - "${CADDY_APP_PORTS}:${CADDY_APP_PORTS}"
+      - "9000-9002:9000-9002"   # painel: Homepage, Portainer, Uptime Kuma
+      - "9090:9090"             # painel: Cockpit
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Cockpit roda no host (:9091)
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/sites:/etc/caddy/sites:ro
       - caddy_data:/data        # CA interna e certificados — NÃO apague
       - caddy_config:/config
+    networks: [devnet]
+
+  # ---- Painel de administração ------------------------------------------------
+  dockerproxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: dockerproxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1     # somente leitura: lista, status e estatísticas
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [mgmt]
+
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      HOMEPAGE_ALLOWED_HOSTS: ${HOMELAB_HOST}:9000,${HOMELAB_IP}:9000
+      HOMEPAGE_VAR_HOST: ${HOMELAB_HOST}
+    volumes:
+      - ./homepage:/app/config
+      - type: bind              # discos para o widget de recursos (SSD montado depois aparece)
+        source: /mnt
+        target: /mnt
+        read_only: true
+        bind:
+          propagation: rslave
+    depends_on: [dockerproxy]
+    networks: [devnet, mgmt]
+
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    restart: unless-stopped
+    command: ["--admin-password-file", "/run/secrets/portainer_admin"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+      - ./portainer/admin_password:/run/secrets/portainer_admin:ro
+    networks: [devnet]
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+    ports:
+      - "127.0.0.1:3001:3001"   # só local: recebe o aviso do backup.sh
+    volumes:
+      - uptime_kuma_data:/app/data
     networks: [devnet]
 
   rabbitmq:
@@ -608,10 +851,14 @@ volumes:
   rabbitmq_data:
   caddy_data:
   caddy_config:
+  portainer_data:
+  uptime_kuma_data:
 
 networks:
   devnet:
     external: true
+  mgmt:
+    internal: true    # só homepage ↔ dockerproxy; sem acesso externo
 EOF
 chown "$HOMELAB_USER":docker "$INFRA_DIR/docker-compose.yml"
 ok "docker-compose.yml gerado em $INFRA_DIR"
@@ -622,7 +869,7 @@ printf '#!/usr/bin/env bash\nHOMELAB_DIR="%s"\nBACKUP_GROUP="%s"\n' "$HOMELAB_DI
   > "$HOMELAB_DIR/scripts/backup.sh"
 cat >> "$HOMELAB_DIR/scripts/backup.sh" <<'EOF'
 # Backup do homelab: MySQL, Redis, RabbitMQ (definições), Caddy (CA) e configurações.
-# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|caddy|config ...]
+# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|caddy|mgmt|config ...]
 #      sudo backup.sh --sync-external      # só copia para o SSD externo
 # Agendado diariamente pelo homelab-backup.timer (systemd).
 # Backup completo: grava em $HOMELAB_DIR/backups e copia para o SSD externo
@@ -651,7 +898,7 @@ if [[ "${1:-}" == "--sync-external" ]]; then SYNC_ONLY=1; shift; fi
 
 COMPONENTS=("$@")
 if [[ ${#COMPONENTS[@]} -eq 0 || "${COMPONENTS[0]}" == "all" ]]; then
-  COMPONENTS=(mysql redis rabbitmq caddy config)
+  COMPONENTS=(mysql redis rabbitmq caddy mgmt config)
   FULL_RUN=1
 else
   FULL_RUN=0
@@ -704,6 +951,24 @@ if (( SYNC_ONLY )); then
   sync_external && exit 0
   exit 2
 fi
+
+# --------------------------------------------- Aviso para o Uptime Kuma (Push)
+# Monitor "Push" no Kuma: sem aviso "up" dentro do intervalo configurado → alerta.
+KUMA_TOKEN="$(envget UPTIME_KUMA_PUSH_TOKEN)"
+notify_kuma() {
+  local code="$1" status=up msg
+  (( FULL_RUN )) && [[ -n "$KUMA_TOKEN" ]] || return 0
+  case "$code" in
+    0) msg="Backup OK" ;;
+    2) status=down; msg="Backup local OK, SSD externo indisponível" ;;
+    *) status=down; msg="Backup falhou: ${FAILED[*]:-erro antes de iniciar}" ;;
+  esac
+  msg="$(jq -rn --arg m "$msg" '$m|@uri')"
+  curl -fsS -m 10 "http://127.0.0.1:3001/api/push/${KUMA_TOKEN}?status=${status}&msg=${msg}&ping=" >/dev/null \
+    || log "  aviso ao Uptime Kuma falhou (container no ar? token correto?)"
+}
+FAILED=()
+trap 'notify_kuma $?' EXIT
 
 mkdir -p "$ROOT"
 AVAIL_KB="$(df --output=avail -k "$ROOT" | tail -1 | tr -d ' ')"
@@ -790,6 +1055,26 @@ backup_caddy() {
   gzip -t "$out" || return 1
 }
 
+# -------------------------------------- Painel (Portainer e Uptime Kuma)
+# Bancos embarcados (BoltDB/SQLite): para o container por alguns segundos para
+# copiar um estado consistente e sobe de novo.
+backup_mgmt() {
+  local c path vol out was_running rc=0
+  for c in portainer uptime-kuma; do
+    case "$c" in portainer) path=/data ;; uptime-kuma) path=/app/data ;; esac
+    if ! docker inspect "$c" >/dev/null 2>&1; then log "  $c não existe — pulando"; continue; fi
+    vol="$(volume_of "$c" "$path")"
+    [[ -n "$vol" ]] || { log "  volume de $c não encontrado"; rc=1; continue; }
+    out="$DEST/${c}-data.tar.gz"
+    was_running=0; container_up "$c" && was_running=1
+    (( was_running )) && { docker stop -t 30 "$c" >/dev/null || { rc=1; continue; }; }
+    docker run --rm --entrypoint tar -v "$vol":/data:ro redis:7-alpine czf - -C /data . > "$out" || rc=1
+    (( was_running )) && { docker start "$c" >/dev/null || rc=1; }
+    gzip -t "$out" || rc=1
+  done
+  return "$rc"
+}
+
 # ----------------------------------------------------------- Configurações
 backup_config() {
   local candidates=(
@@ -855,7 +1140,7 @@ EOF
 printf '#!/usr/bin/env bash\nHOMELAB_DIR="%s"\n' "$HOMELAB_DIR" > "$HOMELAB_DIR/scripts/restore.sh"
 cat >> "$HOMELAB_DIR/scripts/restore.sh" <<'EOF'
 # Restaura um componente a partir de um backup do homelab.
-# Uso: sudo restore.sh <pasta-do-backup|latest> <mysql|redis|rabbitmq|caddy|config> [--yes]
+# Uso: sudo restore.sh <pasta-do-backup|latest> <mysql|redis|rabbitmq|caddy|mgmt|config> [--yes]
 set -Eeuo pipefail
 
 INFRA="$HOMELAB_DIR/infra"
@@ -865,7 +1150,7 @@ ROOT="$HOMELAB_DIR/backups"
 [[ $EUID -eq 0 ]] || { echo "Execute com sudo: sudo $0 $*" >&2; exit 1; }
 
 usage() {
-  echo "Uso: sudo $0 <pasta-do-backup|latest> <mysql|redis|rabbitmq|caddy|config> [--yes]"
+  echo "Uso: sudo $0 <pasta-do-backup|latest> <mysql|redis|rabbitmq|caddy|mgmt|config> [--yes]"
   echo "Backups disponíveis:"
   local d
   for d in "$ROOT"/20* "$ROOT"/latest; do [[ -e "$d" ]] && echo "  $(basename "$d")"; done
@@ -978,6 +1263,21 @@ case "$COMP" in
       'find /data -mindepth 1 -delete && tar xzf - -C /data' < "$SRC/caddy-data.tar.gz"
     dc start caddy >/dev/null
     log "Caddy restaurado. Confira a impressão digital: $HOMELAB_DIR/scripts/caddy-ca.sh"
+    ;;
+
+  mgmt)
+    confirm "Isto SUBSTITUI os dados do Portainer e do Uptime Kuma pelos de $(basename "$SRC")."
+    for c in portainer uptime-kuma; do
+      [[ -f "$SRC/${c}-data.tar.gz" ]] || { log "$c: sem arquivo no backup — pulando"; continue; }
+      case "$c" in portainer) path=/data ;; uptime-kuma) path=/app/data ;; esac
+      VOL="$(volume_of "$c" "$path")"
+      [[ -n "$VOL" ]] || { log "$c: container/volume não encontrado — rode o setup antes"; continue; }
+      dc stop "$c" >/dev/null
+      docker run --rm -i -v "$VOL":/data --entrypoint sh redis:7-alpine -c \
+        'find /data -mindepth 1 -delete && tar xzf - -C /data' < "$SRC/${c}-data.tar.gz"
+      dc start "$c" >/dev/null
+      log "$c restaurado."
+    done
     ;;
 
   config)
@@ -1162,6 +1462,11 @@ echo "Adminer      http://$HOST:8080"
 echo "RedisInsight http://$HOST:5540"
 echo "RabbitMQ     http://$HOST:15672"
 echo "Caddy        https://$HOST  (sites em /opt/homelab/infra/caddy/sites)"
+echo; echo "== Painel =="
+echo "Homepage     https://$HOST:9000"
+echo "Portainer    https://$HOST:9001"
+echo "Uptime Kuma  https://$HOST:9002"
+echo "Cockpit      https://$HOST:9090"
 echo; echo "== Backup =="
 LAST="$(readlink /opt/homelab/backups/latest 2>/dev/null || echo 'nenhum')"
 echo "Último backup completo: $LAST"
@@ -1244,6 +1549,7 @@ elif ss -tlnH 'sport = :443' | grep -q . && \
 fi
 if [[ -n "$CADDY_CONFLICT" ]]; then
   warn "Container caddy da stack NÃO iniciado: ${CADDY_CONFLICT}. Veja 'Migrar um Caddy existente' no README."
+  warn "Sem o Caddy da stack, o painel (portas 9000-9002 e 9090) fica inacessível."
   UP_ARGS+=(--scale caddy=0)
 fi
 docker compose up "${UP_ARGS[@]}"
@@ -1312,6 +1618,11 @@ ${C_GREEN}=====================================================================
   Redis .......... ${HOST}:6379
   RabbitMQ AMQP .. ${HOST}:5672
   Caddy (HTTPS) .. https://${HOST}  — sites em ${INFRA_DIR}/caddy/sites
+
+  Painel ......... https://${HOST}:9000  (Homepage)
+  Portainer ...... https://${HOST}:9001  (usuário admin — senha: PORTAINER_ADMIN_PASSWORD no .env)
+  Uptime Kuma .... https://${HOST}:9002  (crie o admin no 1º acesso)
+  Cockpit ........ https://${HOST}:9090  (login: ${HOMELAB_USER})
   CA do Caddy .... ${HOMELAB_DIR}/scripts/caddy-ca.sh  (instale nos dispositivos)
   Backup ......... diário 03:00 → ${HOMELAB_DIR}/backups  (manual: sudo ${HOMELAB_DIR}/scripts/backup.sh)
   SSD externo .... sudo ${HOMELAB_DIR}/scripts/backup-disk-setup.sh  (lista discos e prepara a cópia)

@@ -17,6 +17,10 @@ Manual de instalação e uso do script `homelab-setup.sh`, que transforma o Thin
 | RabbitMQ (AMQP) | `rabbitmq:4-management` | 5672 | aplicações |
 | RabbitMQ Management | (mesma imagem) | 15672 | `http://<host>:15672` |
 | Caddy (proxy + HTTPS) | `caddy:2-alpine` | 80, 443, 8081–8089 | `https://<host>` — sites de cada projeto (seção 8.3) |
+| **Homepage** (painel) | `ghcr.io/gethomepage/homepage` | 9000 | `https://<host>:9000` — página inicial do homelab |
+| **Portainer CE** | `portainer/portainer-ce:lts` | 9001 | `https://<host>:9001` — containers, logs, console |
+| **Uptime Kuma** | `louislam/uptime-kuma:1` | 9002 | `https://<host>:9002` — monitoramento e alertas |
+| **Cockpit** | pacote `cockpit` (host) | 9090 | `https://<host>:9090` — serviços, discos, atualizações |
 | SSH | OpenSSH | 22 | `ssh <usuario>@<host>` |
 
 `<host>` é o nome mDNS do servidor: `<hostname>.local` (ex.: `homelab-eduardo.local`). Ele continua válido mesmo quando o IP muda — veja a seção 8.1.
@@ -123,7 +127,7 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
 | 6 | Firewall | UFW: entrada negada, saída liberada, SSH com rate-limit, mDNS só da LAN; integração UFW+Docker (ver seção 8.2) |
 | 7 | Diretórios | Estrutura da seção 6 |
 | 8 | Rede | `docker network create devnet` |
-| 9 | Stack | Gera `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf`, Caddyfile base + snippets, scripts utilitários e o backup diário (`homelab-backup.timer`) |
+| 9 | Stack | Gera `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf`, Caddyfile base + snippets, painel (Homepage, Portainer, Uptime Kuma, Cockpit), scripts utilitários e o backup diário (`homelab-backup.timer`) |
 | 10 | Subida | `docker compose up -d --wait` (aguarda os healthchecks) |
 | 11 | GitHub Actions | Usuário `gh-runner`, download da última versão do runner e script de registro |
 
@@ -139,10 +143,13 @@ sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
 │   ├── mysql/
 │   │   ├── conf.d/homelab.cnf  # utf8mb4, buffer pool, etc.
 │   │   └── init/               # .sql/.sh executados na 1ª criação do banco
+│   ├── homepage/               # config do Homepage (services/settings/bookmarks são seus)
+│   ├── portainer/admin_password # senha inicial do admin (do .env)
 │   └── caddy/
 │       ├── Caddyfile           # base da plataforma (gerado — não editar)
 │       └── sites/
 │           ├── 00-snippets.caddy      # snippets: sse, security_headers
+│           ├── 10-homelab-admin.caddy # sites do painel (gerado)
 │           ├── _exemplo.caddy.txt     # modelo de site de projeto
 │           └── <projeto>.caddy        # um arquivo por projeto
 ├── apps/                       # destino de deploy dos seus projetos (CI/CD)
@@ -209,7 +216,53 @@ O banco **homelab-redis** já deve aparecer pré-configurado. Se não aparecer, 
 | Username | `admin` (`RABBITMQ_DEFAULT_USER`) |
 | Password | `RABBITMQ_DEFAULT_PASS` |
 
-### 7.4 Conexão a partir das aplicações
+### 7.4 Painel de administração
+
+Quatro ferramentas, cada uma no que faz melhor, todas servidas pelo Caddy com o HTTPS da CA interna (instale a CA no dispositivo — seção 8.3) e acessíveis **somente pela LAN**:
+
+| Endereço | Ferramenta | Login |
+|---|---|---|
+| `https://<host>:9000` | **Homepage** — início: links, status dos containers, CPU/RAM/temperatura/disco (inclusive o SSD de backup) | sem login (somente leitura) |
+| `https://<host>:9001` | **Portainer** — containers, logs, console, volumes, imagens | `admin` / `PORTAINER_ADMIN_PASSWORD` do `.env` |
+| `https://<host>:9002` | **Uptime Kuma** — monitores e alertas | crie o admin **no primeiro acesso** |
+| `https://<host>:9090` | **Cockpit** — host: serviços systemd, logs (`journalctl`), discos, atualizações, terminal | seu usuário Linux (`eduardo`) |
+
+> ⚠️ Faça o primeiro acesso ao **Uptime Kuma** logo após a instalação: até o admin ser criado, qualquer um na LAN pode criá-lo.
+
+#### Homepage
+
+- `services.yaml`, `settings.yaml` e `bookmarks.yaml` em `/opt/homelab/infra/homepage/` são **seus**: o setup só os cria se não existirem. Adicione seus sistemas em *Projetos*; as mudanças aparecem ao recarregar a página.
+- `docker.yaml` e `widgets.yaml` são da plataforma (regenerados pelo setup). O widget do SSD de backup aparece depois de configurar o SSD e rodar o setup de novo.
+- O status dos containers vem de um **socket proxy somente leitura** (`dockerproxy`, rede interna `mgmt` sem saída): o Homepage não consegue alterar nada no Docker.
+
+#### Uptime Kuma — alerta de backup
+
+O `backup.sh` avisa o Kuma ao fim de cada backup completo (`up` = OK, `down` = falhou ou SSD indisponível). Para ativar:
+
+1. No Kuma: **Add New Monitor → Push**, nome `Backup homelab`, **Heartbeat Interval = 93600** (26 h) — sem aviso nesse prazo, ele alerta.
+2. Copie o token do *Push URL* (o trecho depois de `/api/push/`, antes do `?`).
+3. No L14:
+   ```bash
+   sudo sed -i 's|^UPTIME_KUMA_PUSH_TOKEN=.*|UPTIME_KUMA_PUSH_TOKEN=<token>|' /opt/homelab/infra/.env
+   sudo /opt/homelab/scripts/backup.sh     # testa: o monitor fica verde
+   ```
+4. Em **Settings → Notifications**, configure Telegram/e-mail/Discord e associe ao monitor.
+
+Monitores sugeridos (o Kuma está na `devnet`, então usa os nomes dos containers):
+
+| Tipo | Alvo |
+|---|---|
+| TCP Port | `mysql:3306`, `redis:6379`, `rabbitmq:5672` |
+| HTTP(s) | `http://rabbitmq:15672`, `http://<container-do-projeto>:<porta>` (seus sistemas) |
+| Docker Container | *opcional* — exige montar o socket no Kuma; prefira TCP/HTTP |
+
+#### Segurança
+
+- **Portainer tem controle total do Docker** (equivale a root no servidor): senha forte (gerada) e acesso só pela LAN. Ative 2FA em *My account*.
+- O Cockpit escuta em `:9091` apenas para as redes Docker (regra UFW); o acesso do usuário é sempre pelo Caddy (HTTPS).
+- Os dados do Portainer e do Kuma entram no backup diário (componente `mgmt`).
+
+### 7.5 Conexão a partir das aplicações
 
 **De fora do Docker** (sua máquina, Rider, testes locais) — use o nome `.local` do L14:
 
@@ -276,7 +329,7 @@ Comandos úteis:
 
 ```bash
 sudo ufw status verbose
-sudo ufw allow 9000/tcp comment 'Portainer'   # liberar porta do HOST
+sudo ufw allow 9100/tcp comment 'Exemplo'     # liberar porta do HOST
 sudo journalctl -k | grep "UFW DOCKER BLOCK"  # ver bloqueios
 ```
 
@@ -394,6 +447,7 @@ Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd,
 | `redis-dump.rdb.gz` | Snapshot do Redis | `BGSAVE` consistente, sem parar o serviço |
 | `rabbitmq-definitions.json` | vhosts, usuários, permissões, filas, exchanges, bindings, policies | `rabbitmqctl export_definitions` |
 | `caddy-data.tar.gz` | **CA interna** + certificados do Caddy | cópia do volume `caddy_data` (ou de `/var/lib/caddy` se o Caddy for do host) |
+| `portainer-data.tar.gz`, `uptime-kuma-data.tar.gz` | Usuários, configurações, monitores e histórico do painel | para o container por alguns segundos (bancos embarcados) e copia o volume |
 | `config.tar.gz` | `.env`, compose, `my.cnf`, Caddyfile e sites, SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do backup | `tar` |
 | `SHA256SUMS` | Checksums de todos os arquivos | conferidos antes de qualquer restauração |
 
@@ -423,6 +477,7 @@ sudo /opt/homelab/scripts/restore.sh latest mysql
 sudo /opt/homelab/scripts/restore.sh 2026-10-01_030512 redis
 sudo /opt/homelab/scripts/restore.sh latest rabbitmq
 sudo /opt/homelab/scripts/restore.sh latest caddy
+sudo /opt/homelab/scripts/restore.sh latest mgmt     # Portainer + Uptime Kuma
 sudo /opt/homelab/scripts/restore.sh latest config   # só extrai em /tmp para comparar — não sobrescreve nada
 ```
 
@@ -432,6 +487,7 @@ sudo /opt/homelab/scripts/restore.sh latest config   # só extrai em /tmp para c
 | `redis` | Para o Redis, troca os dados do volume, carrega o snapshot sem AOF, regenera o AOF a partir da memória e sobe de novo (*trocar só o `dump.rdb` não funciona com AOF ativo — o Redis ignoraria o snapshot*) |
 | `rabbitmq` | Importa as definições (mescla com as existentes) |
 | `caddy` | Substitui a CA e os certificados — confira depois com `caddy-ca.sh` |
+| `mgmt` | Substitui os dados do Portainer e do Uptime Kuma |
 
 #### SSD externo
 
@@ -497,7 +553,7 @@ sudo /opt/homelab/scripts/backup-disk-setup.sh /dev/sdX1
 
 # 4. Restaure os dados
 B=/mnt/backup-ssd/homelab/latest
-for c in mysql redis rabbitmq caddy; do sudo /opt/homelab/scripts/restore.sh $B $c --yes; done
+for c in mysql redis rabbitmq caddy mgmt; do sudo /opt/homelab/scripts/restore.sh $B $c --yes; done
 sudo /opt/homelab/scripts/restore.sh $B config   # compare SSH/UFW/netplan e copie o que precisar
 ```
 
@@ -619,6 +675,10 @@ sudo tlp fullcharge BAT0
 | Servidor mudou de IP | Esperado com DHCP — use `<hostname>.local` |
 | Diagnóstico de rede | `sudo tcpdump -ni any host <IP-do-cliente> -c 20` no L14 e `nc -vz <host> 3306` no cliente |
 | Container `unhealthy` | `docker compose logs <serviço>` |
+| Homepage mostra *Host validation failed* | Acesse pelo nome `.local` ou pelo IP atual; se o IP mudou, rode o setup (atualiza `HOMEPAGE_ALLOWED_HOSTS`) |
+| Cockpit: tela em branco ou *Connection failed* | Origem fora da lista: rode o setup (atualiza `Origins` em `/etc/cockpit/cockpit.conf`) e confira `sudo ufw status \| grep 9091` |
+| Portainer pede para criar admin / senha não funciona | A senha do `.env` só vale na 1ª inicialização; depois troque pela UI. Para recomeçar: `docker compose rm -sf portainer && docker volume rm homelab_portainer_data && docker compose up -d portainer` |
+| Uptime Kuma não recebe o aviso do backup | `UPTIME_KUMA_PUSH_TOKEN` no `.env` e `curl -s http://127.0.0.1:3001/api/push/<token>` no L14 |
 | `502 Bad Gateway` no Caddy | O upstream não está na `devnet` ou o nome/porta estão errados: `docker network inspect devnet` e confira `reverse_proxy <container>:<porta-interna>` |
 | Container `caddy` não subiu no setup | Outro Caddy/servidor ocupa a 443 — veja *Migrar um Caddy existente* (seção 8.3) |
 | Navegador acusa certificado inválido | A CA não está instalada no dispositivo, ou o volume `caddy_data` foi recriado (CA nova) — rode `caddy-ca.sh` e reinstale |
