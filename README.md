@@ -259,7 +259,7 @@ Monitores sugeridos (o Kuma está na `devnet`, então usa os nomes dos container
 #### Segurança
 
 - **Portainer tem controle total do Docker** (equivale a root no servidor): senha forte (gerada) e acesso só pela LAN. Ative 2FA em *My account*.
-- O Cockpit escuta em `:9091` apenas para as redes Docker (regra UFW); o acesso do usuário é sempre pelo Caddy (HTTPS).
+- O Cockpit escuta só em `127.0.0.1:9091`; o acesso do usuário é sempre pelo Caddy (HTTPS). Homepage e Portainer também publicam apenas em `127.0.0.1` (19000/19001).
 - Os dados do Portainer e do Kuma entram no backup diário (componente `mgmt`).
 
 ### 7.5 Conexão a partir das aplicações
@@ -339,7 +339,10 @@ sudo journalctl -k | grep "UFW DOCKER BLOCK"  # ver bloqueios
 
 ### 8.3 Proxy reverso e HTTPS (Caddy)
 
-O Caddy roda como container da stack, na rede `devnet`, e é a **porta de entrada HTTPS** dos projetos. A emissão de certificados é automática conforme o nome do site: `<hostname>.local` e IPs da LAN usam a **CA interna** do homelab; domínios públicos (ex.: `api.seudominio.com.br`) usam **Let's Encrypt** (seção 8.4).
+O Caddy roda como container da stack **na rede do host** (`network_mode: host`) e é a **porta de entrada HTTPS** dos projetos.
+
+> **Por que rede do host:** clientes que acessam pelo IP (ex.: tablets Android, que não resolvem `.local` de forma confiável) não enviam SNI, e o Caddy escolhe o certificado pelo IP local da conexão. Atrás do NAT do Docker esse IP seria o do container (`172.x`) e nenhum certificado casaria — o handshake falha. Na rede do host o IP local é o da LAN. (`default_sni`/`fallback_sni` não resolvem esse caso — testado no Caddy 2.10.)
+ A emissão de certificados é automática conforme o nome do site: `<hostname>.local` e IPs da LAN usam a **CA interna** do homelab; domínios públicos (ex.: `api.seudominio.com.br`) usam **Let's Encrypt** (seção 8.4).
 
 **Divisão de responsabilidades**
 
@@ -348,16 +351,18 @@ O Caddy roda como container da stack, na rede `devnet`, e é a **porta de entrad
 | Este repositório (plataforma) | Container, Caddyfile base, snippets, volume da CA, scripts de reload/exportação |
 | Cada projeto (`deploy/homelab/*.caddy`) | Os sites: portas, upstreams, SSE, headers |
 
-**Portas publicadas:** `80` (redireciona para HTTPS), `443` e a faixa `CADDY_APP_PORTS` (padrão `8081-8089`, no `.env`) para sistemas em porta própria. Não é preciso regra no UFW: como são portas de container, valem as regras da seção 8.2 (somente LAN).
+**Portas do Caddy:** `80` (redireciona para HTTPS na 443 — bloco explícito no painel), `443`, a faixa `CADDY_APP_PORTS` (padrão `8081-8089`, no `.env`) para sistemas em porta própria e `9000–9002`/`9090` do painel. Como o Caddy está na rede do host, o setup libera essas portas no UFW **somente para redes privadas** (regras `Caddy (LAN)`).
 
 #### Publicar um projeto
 
-1. O container do projeto entra na rede `devnet` **sem publicar portas** (o Caddy chega a ele pelo nome):
+1. O container do projeto publica sua porta **só em `127.0.0.1`** (o Caddy, na rede do host, chega nela; a LAN não). Use a faixa `18080+` por convenção; a `devnet` continua servindo para o projeto falar com MySQL/Redis/RabbitMQ pelo nome:
    ```yaml
    services:
      api:
        build: .
        container_name: api
+       ports:
+         - "127.0.0.1:18083:8080"
        networks: [devnet]
    networks:
      devnet:
@@ -369,18 +374,18 @@ O Caddy roda como container da stack, na rede `devnet`, e é a **porta de entrad
    {$HOMELAB_HOST}, {$HOMELAB_IP} {
    	import lan_only
    	import security_headers
-   	reverse_proxy site:8080
+   	reverse_proxy 127.0.0.1:18080
    }
 
    # API com SSE, sem buffer
    {$HOMELAB_HOST}:8083, {$HOMELAB_IP}:8083 {
    	import lan_only
-   	reverse_proxy api:8080 {
+   	reverse_proxy 127.0.0.1:18083 {
    		import sse
    	}
    }
    ```
-   - Arquivos de site têm **só blocos de site** — opções globais ficam no Caddyfile base.
+   - Arquivos de site têm **só blocos de site** — opções globais e o redirecionamento `http://` → `https://` ficam na plataforma (não os repita: o Caddy recusa endereços duplicados).
    - `import lan_only` recusa conexões de fora da LAN/Docker/Tailscale. Coloque em **todo site que não for público** — importante quando o acesso pela internet estiver ativo (seção 8.4).
 3. Recarregue (valida antes; se houver erro, nada é aplicado):
    ```bash
@@ -418,8 +423,8 @@ docker run --rm -v homelab_caddy_data:/data -v /var/lib/caddy/.local/share/caddy
 # docker run --rm -v homelab_caddy_data:/data -v <volume-antigo>:/src:ro \
 #   alpine sh -c 'cp -a /src/. /data/'
 
-# Sites: mova os blocos do Caddyfile antigo para sites/<projeto>.caddy,
-# removendo opções globais e trocando upstreams localhost:PORTA pelo nome do container na devnet
+# Sites: mova os blocos do Caddyfile antigo para sites/<projeto>.caddy, removendo opções
+# globais e o bloco http:// de redirecionamento; upstreams 127.0.0.1:PORTA continuam válidos
 docker compose up -d caddy && /opt/homelab/scripts/caddy-reload.sh
 /opt/homelab/scripts/caddy-ca.sh                    # a impressão digital deve ser a mesma de antes
 ```
@@ -468,7 +473,7 @@ Depois de `enable`:
    ```caddyfile
    api.seudominio.com.br {
    	import security_headers
-   	reverse_proxy api:8080 {
+   	reverse_proxy 127.0.0.1:18083 {
    		import sse
    	}
    }
@@ -476,7 +481,7 @@ Depois de `enable`:
    `/opt/homelab/scripts/caddy-reload.sh` — o certificado é emitido automaticamente em alguns segundos.
 4. **Teste de fora da rede** (4G do celular): `https://api.seudominio.com.br`.
 
-Como funciona por baixo: o Docker publica portas ignorando o UFW; as regras `ufw route allow` de 80/443 entram na cadeia que a `DOCKER-USER` consulta primeiro (seção 8.2), liberando apenas o Caddy. Tudo o mais vindo de IPs públicos continua descartado.
+Como funciona por baixo: o Caddy está na rede do host, então `enable` cria regras comuns do UFW (`80/tcp`, `443/tcp`, `443/udp` de qualquer origem, comentário `Caddy publico`). As demais portas do Caddy seguem liberadas só para a LAN, e as portas dos containers continuam barradas para IPs públicos pela `DOCKER-USER` (seção 8.2). Sites sem `lan_only` passam a ser alcançáveis pela internet **se o nome do site casar** — por isso use `lan_only` em tudo que for interno.
 
 > **Não encaminhe** a porta 22 (SSH) nem as do painel/bancos no roteador. Para administrar de fora de casa, use **Tailscale** (já liberado pelas regras: faixa `100.64.0.0/10`).
 
@@ -741,7 +746,8 @@ sudo tlp fullcharge BAT0
 | `network-static.sh`: a rede voltou à configuração anterior | Não houve `--confirm` em 5 min. Confira o IP escolhido (fora do DHCP? gateway certo?) e aplique de novo |
 | Certificado Let's Encrypt não sai | DNS do domínio aponta para o IP público? Portas 80/443 encaminhadas no roteador? `public-access.sh status` mostra as regras? Veja `docker logs caddy \| grep -i acme` |
 | Site da LAN acessível pela internet | Faltou `import lan_only` no bloco do site |
-| `502 Bad Gateway` no Caddy | O upstream não está na `devnet` ou o nome/porta estão errados: `docker network inspect devnet` e confira `reverse_proxy <container>:<porta-interna>` |
+| `502 Bad Gateway` no Caddy | O container do projeto não publica a porta em `127.0.0.1` ou a porta está errada: `docker ps` (coluna PORTS) e confira `reverse_proxy 127.0.0.1:<porta>` |
+| Acesso por IP falha com erro de TLS (tablets) | O Caddy precisa estar em `network_mode: host` (seção 8.3); confira `docker inspect caddy -f '{{.HostConfig.NetworkMode}}'` |
 | Container `caddy` não subiu no setup | Outro Caddy/servidor ocupa a 443 — veja *Migrar um Caddy existente* (seção 8.3) |
 | Navegador acusa certificado inválido | A CA não está instalada no dispositivo, ou o volume `caddy_data` foi recriado (CA nova) — rode `caddy-ca.sh` e reinstale |
 | Certificado não vale para o IP novo | Rode o setup (atualiza `HOMELAB_IP`) e `docker compose up -d caddy` |

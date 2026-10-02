@@ -285,8 +285,16 @@ apt_install ufw
 ufw default deny incoming  >/dev/null
 ufw default allow outgoing >/dev/null
 ufw limit "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
-# Cockpit (:9091) só para as redes Docker — o acesso do usuário é via Caddy (https :9090)
-ufw allow from 172.16.0.0/12 to any port 9091 proto tcp comment 'Cockpit via Caddy' >/dev/null
+# Caddy roda na rede do HOST (network_mode: host — necessário para HTTPS por IP sem SNI),
+# então suas portas passam pelo UFW normalmente: liberadas apenas para redes privadas.
+CADDY_RANGE="$(grep -m1 '^CADDY_APP_PORTS=' "$HOMELAB_DIR/infra/.env" 2>/dev/null | cut -d= -f2- || true)"
+CADDY_RANGE="${CADDY_RANGE:-8081-8089}"
+for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 100.64.0.0/10; do
+  ufw allow proto tcp from "$net" to any port "80,443,${CADDY_RANGE/-/:},9000:9002,9090" comment 'Caddy (LAN)' >/dev/null
+  ufw allow proto udp from "$net" to any port 443 comment 'Caddy HTTP/3 (LAN)' >/dev/null
+done
+# Versões anteriores liberavam o Cockpit (:9091) para as redes Docker; agora ele escuta só em 127.0.0.1
+ufw delete allow from 172.16.0.0/12 to any port 9091 proto tcp >/dev/null 2>&1 || true
 # mDNS (resolução de <hostname>.local) — apenas redes privadas
 for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12; do
   ufw allow from "$net" to any port 5353 proto udp comment 'mDNS' >/dev/null
@@ -459,27 +467,28 @@ cat > "$INFRA_DIR/caddy/sites/_exemplo.caddy.txt" <<'EOF'
 #   /opt/homelab/scripts/caddy-reload.sh
 #
 # {$HOMELAB_HOST} e {$HOMELAB_IP} vêm do .env (o IP é atualizado a cada execução do setup).
-# Upstreams = nome do container na rede devnet + porta INTERNA do container.
-# Portas publicadas pelo Caddy: 80, 443 e a faixa CADDY_APP_PORTS (padrão 8081-8089).
+# O Caddy roda na rede do HOST (network_mode: host): HTTPS por IP sem SNI só funciona assim.
+# Upstreams = porta que o container do projeto publica SÓ em 127.0.0.1, ex.: "127.0.0.1:18080:80".
+# Portas atendidas pelo Caddy: 80, 443 e a faixa CADDY_APP_PORTS (padrão 8081-8089).
 
 # Site principal na LAN (443; a porta 80 redireciona para HTTPS)
 {$HOMELAB_HOST}, {$HOMELAB_IP} {
 	import lan_only
 	import security_headers
-	reverse_proxy site:8080
+	reverse_proxy 127.0.0.1:18080
 }
 
 # Sistema em porta própria (portas 8081-8089 nunca são expostas à internet)
 {$HOMELAB_HOST}:8081, {$HOMELAB_IP}:8081 {
 	import lan_only
 	import security_headers
-	reverse_proxy pdv:8080
+	reverse_proxy 127.0.0.1:18081
 }
 
 # API com SSE (sem buffer)
 {$HOMELAB_HOST}:8083, {$HOMELAB_IP}:8083 {
 	import lan_only
-	reverse_proxy api:8080 {
+	reverse_proxy 127.0.0.1:18083 {
 		import sse
 	}
 }
@@ -488,7 +497,7 @@ cat > "$INFRA_DIR/caddy/sites/_exemplo.caddy.txt" <<'EOF'
 # público e encaminhamento 80/443 no roteador. Certificado Let's Encrypt automático.
 # api.seudominio.com.br {
 # 	import security_headers
-# 	reverse_proxy api:8080 {
+# 	reverse_proxy 127.0.0.1:18083 {
 # 		import sse
 # 	}
 # }
@@ -505,29 +514,36 @@ PANEL_IP="$(hostname -I | awk '{print $1}')"
 cat > "$INFRA_DIR/caddy/sites/10-homelab-admin.caddy" <<'EOF'
 # Gerado por homelab-setup.sh — painel de administração do homelab (não editar)
 
+# Porta 80 → HTTPS na 443. Explícito: com vários sites em portas diferentes no mesmo host,
+# o redirecionamento automático do Caddy escolhe uma porta qualquer (ex.: 8082).
+# Não repita este bloco nos sites dos projetos (o Caddy recusa endereços duplicados).
+http://{$HOMELAB_HOST}, http://{$HOMELAB_IP} {
+	redir https://{host}{uri} permanent
+}
+
 # Homepage (início)
 {$HOMELAB_HOST}:9000, {$HOMELAB_IP}:9000 {
 	import lan_only
 	import security_headers
-	reverse_proxy homepage:3000
+	reverse_proxy 127.0.0.1:19000
 }
 
 # Portainer (containers)
 {$HOMELAB_HOST}:9001, {$HOMELAB_IP}:9001 {
 	import lan_only
-	reverse_proxy portainer:9000
+	reverse_proxy 127.0.0.1:19001
 }
 
 # Uptime Kuma (monitoramento)
 {$HOMELAB_HOST}:9002, {$HOMELAB_IP}:9002 {
 	import lan_only
-	reverse_proxy uptime-kuma:3001
+	reverse_proxy 127.0.0.1:3001
 }
 
-# Cockpit (host) — escuta em :9091 no host, acessível só pelas redes Docker
+# Cockpit (host) — escuta só em 127.0.0.1:9091
 {$HOMELAB_HOST}:9090, {$HOMELAB_IP}:9090 {
 	import lan_only
-	reverse_proxy host.docker.internal:9091
+	reverse_proxy 127.0.0.1:9091
 }
 EOF
 
@@ -537,7 +553,7 @@ mkdir -p /etc/cockpit /etc/systemd/system/cockpit.socket.d
 cat > /etc/systemd/system/cockpit.socket.d/10-homelab.conf <<'EOF'
 [Socket]
 ListenStream=
-ListenStream=9091
+ListenStream=127.0.0.1:9091
 EOF
 cat > /etc/cockpit/cockpit.conf <<EOF
 # Gerado por homelab-setup.sh — Cockpit atrás do Caddy (HTTPS termina no Caddy)
@@ -550,7 +566,7 @@ EOF
 systemctl daemon-reload
 systemctl enable cockpit.socket >/dev/null 2>&1
 systemctl restart cockpit.socket
-ok "Cockpit configurado (host :9091 → Caddy https://${PANEL_HOST}:9090)"
+ok "Cockpit configurado (127.0.0.1:9091 → Caddy https://${PANEL_HOST}:9090)"
 
 # Portainer: senha do admin aplicada na 1ª inicialização (evita o bloqueio de 5 min do setup web)
 grep -m1 '^PORTAINER_ADMIN_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d '\n' > "$INFRA_DIR/portainer/admin_password"
@@ -777,21 +793,16 @@ services:
     environment:
       HOMELAB_HOST: ${HOMELAB_HOST}
       HOMELAB_IP: ${HOMELAB_IP}
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-      - "${CADDY_APP_PORTS}:${CADDY_APP_PORTS}"
-      - "9000-9002:9000-9002"   # painel: Homepage, Portainer, Uptime Kuma
-      - "9090:9090"             # painel: Cockpit
-    extra_hosts:
-      - "host.docker.internal:host-gateway"   # Cockpit roda no host (:9091)
+    # Rede do host: clientes que acessam pelo IP não enviam SNI, e o Caddy escolhe o
+    # certificado pelo IP local da conexão — atrás do NAT do Docker ele seria o IP do
+    # container e nenhum certificado casaria. Portas: 80, 443, CADDY_APP_PORTS, 9000-9002, 9090
+    # (liberadas só para a LAN no UFW). Upstreams: portas publicadas em 127.0.0.1.
+    network_mode: host
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/sites:/etc/caddy/sites:ro
       - caddy_data:/data        # CA interna e certificados — NÃO apague
       - caddy_config:/config
-    networks: [devnet]
 
   # ---- Painel de administração ------------------------------------------------
   dockerproxy:
@@ -813,6 +824,8 @@ services:
       TZ: ${TZ}
       HOMEPAGE_ALLOWED_HOSTS: ${HOMELAB_HOST}:9000,${HOMELAB_IP}:9000
       HOMEPAGE_VAR_HOST: ${HOMELAB_HOST}
+    ports:
+      - "127.0.0.1:19000:3000"  # acessado pelo Caddy (https :9000)
     volumes:
       - ./homepage:/app/config
       - type: bind              # discos para o widget de recursos (SSD montado depois aparece)
@@ -829,6 +842,8 @@ services:
     container_name: portainer
     restart: unless-stopped
     command: ["--admin-password-file", "/run/secrets/portainer_admin"]
+    ports:
+      - "127.0.0.1:19001:9000"  # acessado pelo Caddy (https :9001)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
@@ -842,7 +857,7 @@ services:
     environment:
       TZ: ${TZ}
     ports:
-      - "127.0.0.1:3001:3001"   # só local: recebe o aviso do backup.sh
+      - "127.0.0.1:3001:3001"   # Caddy (https :9002) e aviso do backup.sh
     volumes:
       - uptime_kuma_data:/app/data
     networks: [devnet]
@@ -1642,8 +1657,8 @@ set_env() {
   if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
 }
 
-# Regras "route" do UFW entram em ufw-user-forward, que a cadeia DOCKER-USER consulta primeiro
-RULES=("proto tcp from any to any port 80" "proto tcp from any to any port 443" "proto udp from any to any port 443")
+# O Caddy roda na rede do host: as portas 80/443 são liberadas no UFW como qualquer serviço do host
+RULES=("80/tcp" "443/tcp" "443/udp")
 
 public_ip() { curl -fsS -m 5 https://api.ipify.org 2>/dev/null || echo "?"; }
 lan_ip()    { hostname -I | awk '{print $1}'; }
@@ -1653,15 +1668,15 @@ show_status() {
   echo "Acesso público ..... ${state:-false}"
   echo "IP público ......... $(public_ip)"
   echo "IP na LAN .......... $(lan_ip)"
-  echo "Regras de encaminhamento (UFW):"
-  ufw status | grep -E 'ALLOW FWD' | sed 's/^/  /' || echo "  (nenhuma)"
+  echo "Regras públicas (UFW):"
+  ufw status | grep -E 'Caddy publico' | sed 's/^/  /' || echo "  (nenhuma)"
 }
 
 case "${1:-status}" in
   enable)
     for r in "${RULES[@]}"; do
       # shellcheck disable=SC2086
-      ufw route allow $r comment 'Caddy publico' >/dev/null
+      ufw allow $r comment 'Caddy publico' >/dev/null
     done
     set_env PUBLIC_ACCESS true
     ufw reload >/dev/null
@@ -1675,7 +1690,7 @@ case "${1:-status}" in
     echo "  2. No DNS do seu domínio: registro A  ex.: api.seudominio.com.br → $(public_ip)"
     echo "  3. Crie o site público em /opt/homelab/infra/caddy/sites/<projeto>.caddy:"
     echo "       api.seudominio.com.br {"
-    echo "           reverse_proxy api:8080"
+    echo "           reverse_proxy 127.0.0.1:18083"
     echo "       }"
     echo "     e rode /opt/homelab/scripts/caddy-reload.sh — o certificado Let's Encrypt é automático."
     echo "  4. Teste de FORA da sua rede (ex.: 4G do celular): https://api.seudominio.com.br"
@@ -1683,7 +1698,7 @@ case "${1:-status}" in
   disable)
     for r in "${RULES[@]}"; do
       # shellcheck disable=SC2086
-      ufw route delete allow $r >/dev/null 2>&1 || true
+      ufw delete allow $r >/dev/null 2>&1 || true
     done
     set_env PUBLIC_ACCESS false
     ufw reload >/dev/null
