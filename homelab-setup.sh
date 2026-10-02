@@ -90,7 +90,7 @@ apt-get upgrade -y -qq >/dev/null
 apt_install ca-certificates curl gnupg lsb-release git jq unzip zip htop btop tmux \
   net-tools dnsutils iputils-ping vim nano openssl software-properties-common \
   unattended-upgrades apt-transport-https bash-completion \
-  tcpdump netcat-openbsd avahi-daemon libnss-mdns rsync parted
+  tcpdump netcat-openbsd avahi-daemon libnss-mdns rsync parted iputils-arping
 ok "Pacotes base instalados (inclui tcpdump e netcat para diagnóstico)"
 
 # mDNS: o notebook responde como <hostname>.local na LAN, sem depender de IP fixo
@@ -408,6 +408,8 @@ grep -q '^PORTAINER_ADMIN_PASSWORD=' "$ENV_FILE" || \
   printf '\n# Painel de administração\nPORTAINER_ADMIN_PASSWORD=%s\n' "$(gen_secret)" >> "$ENV_FILE"
 # Token do monitor "Push" do Uptime Kuma (preenchido por você — veja o README)
 grep -q '^UPTIME_KUMA_PUSH_TOKEN=' "$ENV_FILE" || echo 'UPTIME_KUMA_PUSH_TOKEN=' >> "$ENV_FILE"
+# Acesso da internet ao Caddy (80/443) — controlado por public-access.sh
+grep -q '^PUBLIC_ACCESS=' "$ENV_FILE" || printf '\n# Acesso público (public-access.sh)\nPUBLIC_ACCESS=false\n' >> "$ENV_FILE"
 set_env HOMELAB_HOST "$(hostname).local"
 set_env HOMELAB_IP "$(hostname -I | awk '{print $1}')"
 chown "$HOMELAB_USER":docker "$ENV_FILE"
@@ -418,8 +420,9 @@ cat > "$INFRA_DIR/caddy/Caddyfile" <<'EOF'
 # Gerado por homelab-setup.sh — NÃO edite (é sobrescrito).
 # Sites dos projetos: /opt/homelab/infra/caddy/sites/<projeto>.caddy
 {
-	# CA interna do homelab: certificados para <host>.local e para o IP da LAN
-	local_certs
+	# Emissão automática por tipo de nome:
+	#   <host>.local e IPs da LAN → CA interna do homelab
+	#   domínios públicos (ex.: api.seudominio.com.br) → Let's Encrypt (exige public-access.sh enable)
 	skip_install_trust
 }
 
@@ -434,6 +437,12 @@ cat > "$INFRA_DIR/caddy/sites/00-snippets.caddy" <<'EOF'
 # SSE / streaming: repassa a resposta sem buffer
 (sse) {
 	flush_interval -1
+}
+
+# Restringe o site à rede local (LAN, Docker e Tailscale) — use em tudo que não for público
+(lan_only) {
+	@fora_da_lan not remote_ip private_ranges 100.64.0.0/10
+	abort @fora_da_lan
 }
 
 (security_headers) {
@@ -453,24 +462,36 @@ cat > "$INFRA_DIR/caddy/sites/_exemplo.caddy.txt" <<'EOF'
 # Upstreams = nome do container na rede devnet + porta INTERNA do container.
 # Portas publicadas pelo Caddy: 80, 443 e a faixa CADDY_APP_PORTS (padrão 8081-8089).
 
-# Site principal (443; a porta 80 redireciona para HTTPS)
+# Site principal na LAN (443; a porta 80 redireciona para HTTPS)
 {$HOMELAB_HOST}, {$HOMELAB_IP} {
+	import lan_only
 	import security_headers
 	reverse_proxy site:8080
 }
 
-# Sistema em porta própria
+# Sistema em porta própria (portas 8081-8089 nunca são expostas à internet)
 {$HOMELAB_HOST}:8081, {$HOMELAB_IP}:8081 {
+	import lan_only
 	import security_headers
 	reverse_proxy pdv:8080
 }
 
 # API com SSE (sem buffer)
 {$HOMELAB_HOST}:8083, {$HOMELAB_IP}:8083 {
+	import lan_only
 	reverse_proxy api:8080 {
 		import sse
 	}
 }
+
+# Site PÚBLICO (internet) — exige: public-access.sh enable, DNS apontando para o IP
+# público e encaminhamento 80/443 no roteador. Certificado Let's Encrypt automático.
+# api.seudominio.com.br {
+# 	import security_headers
+# 	reverse_proxy api:8080 {
+# 		import sse
+# 	}
+# }
 EOF
 chown -R "$HOMELAB_USER":docker "$INFRA_DIR/caddy"
 chmod 2775 "$INFRA_DIR/caddy/sites"   # deploys (gh-runner, grupo docker) podem gravar sites
@@ -486,22 +507,26 @@ cat > "$INFRA_DIR/caddy/sites/10-homelab-admin.caddy" <<'EOF'
 
 # Homepage (início)
 {$HOMELAB_HOST}:9000, {$HOMELAB_IP}:9000 {
+	import lan_only
 	import security_headers
 	reverse_proxy homepage:3000
 }
 
 # Portainer (containers)
 {$HOMELAB_HOST}:9001, {$HOMELAB_IP}:9001 {
+	import lan_only
 	reverse_proxy portainer:9000
 }
 
 # Uptime Kuma (monitoramento)
 {$HOMELAB_HOST}:9002, {$HOMELAB_IP}:9002 {
+	import lan_only
 	reverse_proxy uptime-kuma:3001
 }
 
 # Cockpit (host) — escuta em :9091 no host, acessível só pelas redes Docker
 {$HOMELAB_HOST}:9090, {$HOMELAB_IP}:9090 {
+	import lan_only
 	reverse_proxy host.docker.internal:9091
 }
 EOF
@@ -1440,6 +1465,235 @@ echo "  Retenção ...... $(grep '^BACKUP_EXTERNAL_KEEP_DAYS=' "$ENV_FILE" | cut
 echo "  O backup diário (03:00) copia para o SSD automaticamente."
 EOF
 
+# IP fixo na LAN (comando separado)
+cat > "$HOMELAB_DIR/scripts/network-static.sh" <<'EOF'
+#!/usr/bin/env bash
+# Fixa o IP do homelab na rede local (netplan), com reversão automática de segurança.
+#
+#   sudo network-static.sh                                   # mostra a rede atual e uma sugestão
+#   sudo network-static.sh 192.168.101.50/24                 # aplica (gateway e DNS detectados)
+#   sudo network-static.sh 192.168.101.50/24 --gateway 192.168.101.1 --dns "1.1.1.1 8.8.8.8"
+#   sudo network-static.sh --confirm                         # confirma (cancela a reversão)
+#   sudo network-static.sh --dhcp                            # volta para DHCP
+#
+# Após aplicar, você tem 5 minutos para conectar no IP novo e rodar --confirm.
+# Sem confirmação, a configuração anterior volta sozinha (não fica trancado para fora).
+set -Eeuo pipefail
+
+NETPLAN_FILE="/etc/netplan/90-homelab-static.yaml"
+BACKUP_FILE="/etc/netplan/.90-homelab-static.yaml.prev"
+REVERT_UNIT="homelab-net-revert"
+REVERT_SECONDS=300
+
+log() { echo "==> $*"; }
+die() { echo "✘ $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "Execute com sudo: sudo $0 $*"
+
+IFACE=""; ADDR=""; GW=""; DNS=""; MODE="apply"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --confirm) MODE="confirm" ;;
+    --dhcp)    MODE="dhcp" ;;
+    --gateway) GW="${2:?informe o gateway}"; shift ;;
+    --dns)     DNS="${2:?informe os DNS}"; shift ;;
+    --iface)   IFACE="${2:?informe a interface}"; shift ;;
+    */*)       ADDR="$1" ;;
+    *) die "Argumento inválido: $1 (use IP/prefixo, ex.: 192.168.101.50/24)" ;;
+  esac
+  shift
+done
+
+IFACE="${IFACE:-$(ip -4 route show default | awk '{print $5; exit}')}"
+[[ -n "$IFACE" ]] || die "Interface com rota padrão não encontrada — use --iface"
+CUR_ADDR="$(ip -4 -o addr show dev "$IFACE" | awk '{print $4; exit}')"
+CUR_GW="$(ip -4 route show default dev "$IFACE" | awk '{print $3; exit}')"
+CUR_DNS="$(resolvectl dns "$IFACE" 2>/dev/null | cut -d: -f2- | xargs || true)"
+KIND="ethernets"; [[ -d "/sys/class/net/$IFACE/wireless" ]] && KIND="wifis"
+
+restart_hint() {
+  echo "  Depois rode o setup para atualizar Caddy, Homepage e Cockpit com o IP:"
+  echo "    cd ~/homelab && sudo ./homelab-setup.sh"
+}
+
+case "$MODE" in
+  confirm)
+    if systemctl is-active --quiet "$REVERT_UNIT.timer" 2>/dev/null; then
+      systemctl stop "$REVERT_UNIT.timer" "$REVERT_UNIT.service" 2>/dev/null || true
+      rm -f "$BACKUP_FILE"
+      echo "✔ Configuração de rede confirmada: $CUR_ADDR em $IFACE"
+      restart_hint
+    else
+      echo "Nenhuma alteração pendente de confirmação."
+    fi
+    exit 0
+    ;;
+  dhcp)
+    [[ -f "$NETPLAN_FILE" ]] || { echo "O IP já é obtido por DHCP (nenhum $NETPLAN_FILE)."; exit 0; }
+    rm -f "$NETPLAN_FILE"
+    netplan apply
+    echo "✔ Voltou para DHCP em $IFACE. IP atual: $(ip -4 -o addr show dev "$IFACE" | awk '{print $4; exit}')"
+    restart_hint
+    exit 0
+    ;;
+esac
+
+if [[ -z "$ADDR" ]]; then
+  echo "Rede atual"
+  echo "  Interface ... $IFACE ($([[ $KIND == wifis ]] && echo Wi-Fi || echo cabo))"
+  echo "  Endereço .... ${CUR_ADDR:-?}"
+  echo "  Gateway ..... ${CUR_GW:-?}"
+  echo "  DNS ......... ${CUR_DNS:-?}"
+  echo "  Modo ........ $([[ -f $NETPLAN_FILE ]] && echo "fixo ($NETPLAN_FILE)" || echo DHCP)"
+  echo
+  echo "Para fixar, escolha um IP FORA da faixa de DHCP do roteador (ex.: final .200–.250)."
+  echo "Manter o IP atual só é seguro se o roteador nunca o entregar a outro aparelho."
+  echo
+  echo "  sudo $0 ${CUR_ADDR:-192.168.x.y/24}"
+  exit 0
+fi
+
+GW="${GW:-$CUR_GW}"
+[[ -n "$GW" ]] || die "Gateway não detectado — use --gateway"
+DNS="${DNS:-${CUR_DNS:-$GW 1.1.1.1}}"
+
+# Validação: formato, mesma sub-rede do gateway, não é rede/broadcast
+python3 - "$ADDR" "$GW" $DNS <<'PY' || die "Endereço inválido"
+import ipaddress, sys
+iface = ipaddress.ip_interface(sys.argv[1]); gw = ipaddress.ip_address(sys.argv[2])
+assert iface.version == 4, "somente IPv4"
+assert gw in iface.network, f"gateway {gw} fora da rede {iface.network}"
+assert iface.ip not in (iface.network.network_address, iface.network.broadcast_address), "endereço de rede/broadcast"
+for d in sys.argv[3:]: ipaddress.ip_address(d)
+PY
+
+NEW_IP="${ADDR%/*}"
+if [[ "$NEW_IP" != "${CUR_ADDR%/*}" ]]; then
+  log "Verificando se $NEW_IP já está em uso na rede..."
+  if ! arping -D -q -c 3 -w 4 -I "$IFACE" "$NEW_IP"; then
+    die "$NEW_IP já responde na rede (outro aparelho está usando). Escolha outro."
+  fi
+fi
+
+DNS_YAML="$(printf '%s, ' $DNS)"; DNS_YAML="[${DNS_YAML%, }]"
+
+log "Gerando $NETPLAN_FILE ($KIND/$IFACE → $ADDR, gw $GW, dns $DNS)"
+[[ -f "$NETPLAN_FILE" ]] && cp -a "$NETPLAN_FILE" "$BACKUP_FILE" || rm -f "$BACKUP_FILE"
+umask 077
+cat > "$NETPLAN_FILE" <<YAML
+# Gerado por network-static.sh — IP fixo do homelab (sobrepõe o DHCP dos outros arquivos)
+network:
+  version: 2
+  ${KIND}:
+    ${IFACE}:
+      dhcp4: false
+      addresses: [${ADDR}]
+      routes:
+        - to: default
+          via: ${GW}
+      nameservers:
+        addresses: ${DNS_YAML}
+YAML
+chmod 600 "$NETPLAN_FILE"
+
+if ! netplan generate 2>/tmp/netplan-err; then
+  cat /tmp/netplan-err >&2
+  if [[ -f "$BACKUP_FILE" ]]; then mv -f "$BACKUP_FILE" "$NETPLAN_FILE"; else rm -f "$NETPLAN_FILE"; fi
+  die "Configuração do netplan inválida — nada foi aplicado"
+fi
+
+# cloud-init (Ubuntu Server) regrava a rede no boot; desativa só essa parte
+if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+  echo 'network: {config: disabled}' > /etc/cloud/cloud.cfg.d/99-homelab-disable-network-config.cfg
+fi
+
+# Reversão automática: sem --confirm em 5 min, volta a configuração anterior
+REVERT_CMD="if [ -f $BACKUP_FILE ]; then mv -f $BACKUP_FILE $NETPLAN_FILE; else rm -f $NETPLAN_FILE; fi; netplan apply"
+systemctl stop "$REVERT_UNIT.timer" "$REVERT_UNIT.service" 2>/dev/null || true
+systemctl reset-failed "$REVERT_UNIT.service" 2>/dev/null || true
+systemd-run --quiet --unit "$REVERT_UNIT" --on-active="$REVERT_SECONDS" /bin/sh -c "$REVERT_CMD"
+
+log "Aplicando... (uma sessão SSH no IP antigo pode cair)"
+netplan apply
+
+echo
+echo "✔ IP $ADDR aplicado em $IFACE."
+echo "  ⚠️  Confirme em até $(( REVERT_SECONDS / 60 )) minutos, conectando no IP NOVO:"
+echo "      ssh $(logname 2>/dev/null || echo eduardo)@${NEW_IP}"
+echo "      sudo $0 --confirm"
+echo "  Sem confirmação, a rede volta sozinha para a configuração anterior."
+EOF
+
+# Acesso da internet ao Caddy (comando separado)
+printf '#!/usr/bin/env bash\nHOMELAB_DIR="%s"\n' "$HOMELAB_DIR" > "$HOMELAB_DIR/scripts/public-access.sh"
+cat >> "$HOMELAB_DIR/scripts/public-access.sh" <<'EOF'
+# Libera o acesso da INTERNET ao Caddy (80/443) para sites com domínio público.
+# Todo o resto (painel 9000-9002/9090, portas 8081-8089, bancos, SSH) continua só na LAN.
+#
+#   sudo public-access.sh status
+#   sudo public-access.sh enable
+#   sudo public-access.sh disable
+set -Eeuo pipefail
+
+ENV_FILE="$HOMELAB_DIR/infra/.env"
+die() { echo "✘ $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "Execute com sudo: sudo $0 $*"
+
+set_env() {
+  if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
+}
+
+# Regras "route" do UFW entram em ufw-user-forward, que a cadeia DOCKER-USER consulta primeiro
+RULES=("proto tcp from any to any port 80" "proto tcp from any to any port 443" "proto udp from any to any port 443")
+
+public_ip() { curl -fsS -m 5 https://api.ipify.org 2>/dev/null || echo "?"; }
+lan_ip()    { hostname -I | awk '{print $1}'; }
+
+show_status() {
+  local state; state="$(grep -m1 '^PUBLIC_ACCESS=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+  echo "Acesso público ..... ${state:-false}"
+  echo "IP público ......... $(public_ip)"
+  echo "IP na LAN .......... $(lan_ip)"
+  echo "Regras de encaminhamento (UFW):"
+  ufw status | grep -E 'ALLOW FWD' | sed 's/^/  /' || echo "  (nenhuma)"
+}
+
+case "${1:-status}" in
+  enable)
+    for r in "${RULES[@]}"; do
+      # shellcheck disable=SC2086
+      ufw route allow $r comment 'Caddy publico' >/dev/null
+    done
+    set_env PUBLIC_ACCESS true
+    ufw reload >/dev/null
+    echo "✔ Internet → Caddy liberado (80/tcp, 443/tcp, 443/udp)."
+    echo
+    show_status
+    echo
+    echo "Próximos passos:"
+    echo "  1. No roteador/ONT: encaminhe as portas 80/tcp, 443/tcp e 443/udp para $(lan_ip)"
+    echo "     (o L14 precisa de IP fixo na LAN — network-static.sh)."
+    echo "  2. No DNS do seu domínio: registro A  ex.: api.seudominio.com.br → $(public_ip)"
+    echo "  3. Crie o site público em /opt/homelab/infra/caddy/sites/<projeto>.caddy:"
+    echo "       api.seudominio.com.br {"
+    echo "           reverse_proxy api:8080"
+    echo "       }"
+    echo "     e rode /opt/homelab/scripts/caddy-reload.sh — o certificado Let's Encrypt é automático."
+    echo "  4. Teste de FORA da sua rede (ex.: 4G do celular): https://api.seudominio.com.br"
+    ;;
+  disable)
+    for r in "${RULES[@]}"; do
+      # shellcheck disable=SC2086
+      ufw route delete allow $r >/dev/null 2>&1 || true
+    done
+    set_env PUBLIC_ACCESS false
+    ufw reload >/dev/null
+    echo "✔ Acesso da internet bloqueado. Lembre de remover o encaminhamento no roteador."
+    ;;
+  status) show_status ;;
+  *) die "Uso: sudo $0 [status|enable|disable]" ;;
+esac
+EOF
+
 # Compatibilidade com a versão anterior
 cat > "$HOMELAB_DIR/scripts/backup-mysql.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -1553,6 +1807,9 @@ if [[ -n "$CADDY_CONFLICT" ]]; then
   UP_ARGS+=(--scale caddy=0)
 fi
 docker compose up "${UP_ARGS[@]}"
+if [[ -z "$CADDY_CONFLICT" ]] && docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+  ok "Caddy recarregado com a configuração atual"
+fi
 ok "Serviços no ar"
 docker compose ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}'
 
@@ -1626,6 +1883,8 @@ ${C_GREEN}=====================================================================
   CA do Caddy .... ${HOMELAB_DIR}/scripts/caddy-ca.sh  (instale nos dispositivos)
   Backup ......... diário 03:00 → ${HOMELAB_DIR}/backups  (manual: sudo ${HOMELAB_DIR}/scripts/backup.sh)
   SSD externo .... sudo ${HOMELAB_DIR}/scripts/backup-disk-setup.sh  (lista discos e prepara a cópia)
+  IP fixo (LAN) .. sudo ${HOMELAB_DIR}/scripts/network-static.sh     (mostra a rede e fixa o IP)
+  Internet ....... sudo ${HOMELAB_DIR}/scripts/public-access.sh status|enable|disable
 
   Use o nome ${HOST}: o IP pode mudar a cada reboot (DHCP).
 
