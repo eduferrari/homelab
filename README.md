@@ -368,21 +368,58 @@ Voltar para DHCP: `sudo /opt/homelab/scripts/network-static.sh --dhcp`.
 ### 9.4 Acesso pela internet — IP público fixo `177.101.139.43`
 
 ```text
-Internet ─► 177.101.139.43 (roteador/ONT) ─► 80/443 ─► IP fixo do L14 na LAN ─► Traefik (Coolify) ─► app
+Internet ─► mfapi.darkocode.com.br (DNS A) ─► 177.101.139.43 (roteador/ONT)
+         ─► 80/443 encaminhadas ─► 192.168.101.28 (L14) ─► Traefik (Coolify) ─► app
 ```
 
-1. **Confirme que não há CGNAT:** o IP da WAN no roteador/ONT deve ser `177.101.139.43`. Se aparecer `100.64.x.x`, o encaminhamento não funciona — fale com o provedor.
-2. **Roteador/ONT:** encaminhe `80/tcp`, `443/tcp` e `443/udp` para o IP fixo do L14 (seção 9.3). **Não** encaminhe 22, 8000, 8080, 3306, 6379, 5672 nem 15672.
+Exemplo usado abaixo: API do MesaFácil em `mfapi.darkocode.com.br`.
+
+1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `177.101.139.43` para `192.168.101.28` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, 8000, 8080, 3306, 6379, 5672 nem 15672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
+2. **DNS** (zona de `darkocode.com.br`, ex.: Registro.br):
+   ```text
+   mfapi   A   177.101.139.43   TTL 300
+   ```
 3. **Firewall do L14:**
    ```bash
-   sudo /opt/homelab/scripts/public-access.sh enable    # status | enable | disable
+   sudo /opt/homelab/scripts/public-access.sh enable    # status | enable | disable | check <dominio>
    ```
    Cria regras `ufw route` para 80/443 (o proxy é um container, por isso regras de *route*). O resto continua só na LAN.
-4. **DNS:** registro `A` — ex.: `api.seudominio.com.br → 177.101.139.43`.
-5. **Coolify:** na app, *Domains* = `https://api.seudominio.com.br` → Let's Encrypt automático.
-6. **Teste de fora** (4G do celular).
+4. **Coolify — app gerenciada pelo Coolify:** no serviço, *Domains* = `https://mfapi.darkocode.com.br:8080` (o `:8080` é a porta **interna** do container; não aparece na URL). O Traefik emite o Let's Encrypt sozinho (desafio HTTP-01 pela porta 80).
 
-> Para administrar de fora de casa, use **Tailscale** (já liberado: `100.64.0.0/10`) em vez de expor o painel do Coolify. Para expô-lo com domínio (necessário para o GitHub App), defina *Settings → Instance's Domain* e ative 2FA.
+   **App com labels próprias** (ex.: MesaFácil antes da etapa 2): acrescente uma rota pública ao lado da rota da LAN — sem `homelab-lan-only@file`:
+   ```yaml
+       - traefik.http.routers.mf-api-pub.entrypoints=https
+       - traefik.http.routers.mf-api-pub.rule=Host(`mfapi.darkocode.com.br`)
+       - traefik.http.routers.mf-api-pub.tls.certresolver=letsencrypt
+       - traefik.http.routers.mf-api-pub.service=mf-api
+       - traefik.http.routers.mf-api-pub-http.entrypoints=http
+       - traefik.http.routers.mf-api-pub-http.rule=Host(`mfapi.darkocode.com.br`)
+       - traefik.http.routers.mf-api-pub-http.middlewares=homelab-redirect-https@file
+       - traefik.http.routers.mf-api-pub-http.service=mf-api
+   ```
+5. **Diagnóstico:**
+   ```bash
+   sudo /opt/homelab/scripts/public-access.sh check mfapi.darkocode.com.br
+   ```
+   Confere DNS (via 1.1.1.1), firewall, proxy, rota no Traefik e se o certificado já é Let's Encrypt, e mostra como provar o encaminhamento do roteador com `tcpdump` + acesso pelo 4G.
+6. **Teste de fora** (4G do celular): `https://mfapi.darkocode.com.br/health`.
+
+**APIs .NET atrás do proxy** — o TLS termina no Traefik; sem isto a app enxerga `http` e o IP do proxy (redirects, URLs geradas, logs, rate limit por IP):
+
+```csharp
+builder.Services.Configure<ForwardedHeadersOptions>(o =>
+{
+    o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    o.KnownNetworks.Clear();   // proxy na rede Docker do Coolify
+    o.KnownProxies.Clear();
+});
+// ...
+app.UseForwardedHeaders();     // antes de UseHttpsRedirection / autenticação
+```
+
+> **NAT loopback:** muitos roteadores não deixam acessar o próprio IP público de dentro da LAN — o domínio pode abrir só de fora. Dispositivos da LAN (tablets) continuam pelas rotas locais (`https://192.168.101.28:8083` etc.).
+>
+> **Exposição:** confira autenticação em todos os endpoints e use rate limiting (`AddRateLimiter`) nos públicos. Para administrar de fora de casa, use **Tailscale** (já liberado: `100.64.0.0/10`) em vez de expor o painel do Coolify (porta 8000).
 
 ---
 
@@ -641,7 +678,7 @@ sudo tlp fullcharge BAT0
 | `404 page not found` (Traefik) | Nenhuma rota casou: confira entrypoint/rule das labels ou do arquivo em `dynamic/`; `docker logs coolify-proxy --tail 50` |
 | `502 Bad Gateway` (Traefik) | O container de destino não está numa rede do Coolify ou a porta está errada |
 | `403 Forbidden` na LAN | O middleware `homelab-lan-only` não reconhece a origem (ex.: rede fora das faixas privadas) |
-| Let's Encrypt não emite | DNS aponta para `177.101.139.43`? Portas 80/443 encaminhadas? `public-access.sh status`? Sem CGNAT? `docker logs coolify-proxy \| grep -i acme` |
+| Let's Encrypt não emite | `public-access.sh check <dominio>`. DNS aponta para `177.101.139.43`? Portas 80/443 encaminhadas? `public-access.sh status`? Sem CGNAT? `docker logs coolify-proxy \| grep -i acme` |
 | `network-static.sh`: a rede voltou sozinha | Não houve `--confirm` em 5 min. Confira IP/gateway e aplique de novo |
 | `permission denied ... docker.sock` | Faltou reiniciar (ou logout/login) após a instalação |
 | `Connection refused` no SSH | `sudo ss -tlnp \| grep :22` e `sudo fail2ban-client unban --all` |

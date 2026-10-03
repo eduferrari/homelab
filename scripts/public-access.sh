@@ -8,6 +8,7 @@ HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 #   sudo public-access.sh status
 #   sudo public-access.sh enable
 #   sudo public-access.sh disable
+#   sudo public-access.sh check mfapi.darkocode.com.br   # diagnóstico de um domínio
 set -Eeuo pipefail
 
 ENV_FILE="$HOMELAB_DIR/infra/.env"
@@ -32,6 +33,73 @@ show_status() {
   echo "IP na LAN .......... $(lan_ip)"
   echo "Regras públicas (UFW):"
   ufw status | grep -E 'Proxy publico' | sed 's/^/  /' || echo "  (nenhuma)"
+}
+
+# Diagnóstico de um domínio público: DNS, firewall, proxy, rota no Traefik e certificado.
+# De dentro da LAN não dá para provar o encaminhamento do roteador (NAT loopback) — o último
+# passo mostra como confirmar com um acesso de fora.
+check_domain() {
+  local domain="$1" pub dns ok=0 cert issuer subject end code
+  [[ -n "$domain" ]] || die "Uso: sudo $0 check <dominio>   ex.: mfapi.darkocode.com.br"
+  pass() { echo "  ✔ $*"; }
+  fail() { echo "  ✘ $*"; ok=1; }
+  warn() { echo "  ! $*"; }
+
+  echo "Verificando $domain"
+  pub="$(public_ip)"
+
+  echo "1. DNS (resolvedor público 1.1.1.1)"
+  dns="$(dig +short A "$domain" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)"
+  if [[ -z "$dns" ]]; then
+    fail "sem registro A — crie: ${domain%%.*}  A  $pub"
+  elif [[ "$dns" == "$pub" ]]; then
+    pass "$domain → $dns"
+  else
+    fail "$domain → $dns, mas o IP público do L14 é $pub"
+  fi
+
+  echo "2. Firewall do L14"
+  if ufw status | grep -q 'Proxy publico'; then pass "80/443 liberados (public-access.sh enable)"
+  else fail "80/443 fechados para a internet — rode: sudo $0 enable"; fi
+
+  echo "3. Proxy do Coolify"
+  if ss -Hltn 'sport = :80' | grep -q . && ss -Hltn 'sport = :443' | grep -q .; then
+    pass "escutando em 80 e 443"
+  else
+    fail "nada escutando em 80/443 — o coolify-proxy está rodando? (docker ps | grep coolify-proxy)"
+  fi
+
+  echo "4. Rota no Traefik (teste local, sem passar pelo roteador)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 -k --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null || true)"
+  code="${code:-000}"
+  case "$code" in
+    000) fail "sem resposta em https://$domain" ;;
+    404) warn "HTTP 404 — se a resposta for '404 page not found' do Traefik, falta o domínio na app (Coolify → Domains)" ;;
+    *)   pass "HTTP $code" ;;
+  esac
+
+  echo "5. Certificado"
+  cert="$(echo | openssl s_client -connect 127.0.0.1:443 -servername "$domain" 2>/dev/null | openssl x509 -noout -issuer -subject -enddate 2>/dev/null || true)"
+  issuer="$(grep -m1 '^issuer' <<<"$cert" | sed 's/^issuer=//' || true)"
+  subject="$(grep -m1 '^subject' <<<"$cert" | sed 's/^subject=//' || true)"
+  end="$(grep -m1 '^notAfter' <<<"$cert" | cut -d= -f2- || true)"
+  if [[ -z "$cert" ]]; then
+    fail "não foi possível ler o certificado"
+  elif grep -qi "let's encrypt" <<<"$issuer"; then
+    pass "Let's Encrypt — válido até $end"
+  else
+    fail "ainda não é Let's Encrypt (emissor: ${issuer:-?}; titular: ${subject:-?})"
+    echo "     O desafio HTTP-01 precisa que a internet alcance a porta 80. Veja o motivo:"
+    echo "     docker logs coolify-proxy 2>&1 | grep -i -E 'acme|$domain' | tail"
+  fi
+
+  echo "6. Encaminhamento no roteador (precisa de um acesso de FORA da rede)"
+  echo "     Deixe rodando:  sudo tcpdump -ni any 'tcp and (port 80 or port 443)' and not src net 192.168.0.0/16"
+  echo "     e abra https://$domain pelo 4G do celular."
+  echo "     Sem nenhuma linha → o roteador/provedor ainda não encaminha 80/443 para $(lan_ip)."
+  echo
+  if (( ok == 0 )); then echo "Tudo certo do lado do L14."; else echo "Há itens pendentes (✘) acima."; fi
+  return "$ok"
 }
 
 case "${1:-status}" in
@@ -63,6 +131,8 @@ case "${1:-status}" in
     ufw reload >/dev/null
     echo "✔ Acesso da internet bloqueado. Lembre de remover o encaminhamento no roteador."
     ;;
+  check)
+    check_domain "${2:-}" ;;
   status) show_status ;;
-  *) die "Uso: sudo $0 [status|enable|disable]" ;;
+  *) die "Uso: sudo $0 [status|enable|disable|check <dominio>]" ;;
 esac
