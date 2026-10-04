@@ -387,7 +387,7 @@ Nos exemplos, `api.seudominio.com.br` e `app.seudominio.com.br` são domínios d
    Cria regras `ufw route` para 80/443 (o proxy é um container, por isso regras de *route*). O resto continua só na LAN.
 4. **Rota pública para a app** — escolha **um** caminho por domínio (dois lugares declarando o mesmo domínio geram conflito):
 
-   - **App gerenciada pelo Coolify:** no serviço, *Domains* = `https://api.seudominio.com.br:8080` (o `:8080` é a porta **interna** do container; não aparece na URL). O Traefik emite o Let's Encrypt sozinho (desafio HTTP-01 pela porta 80).
+   - **App gerenciada pelo Coolify:** no serviço, *Domains* = `https://api.seudominio.com.br:8080` (o `:8080` é a porta **interna** do container; não aparece na URL). O Traefik emite o Let's Encrypt sozinho (desafio HTTP-01 pela porta 80; se a 80 não puder ser encaminhada, `public-access.sh acme-tls` troca para TLS-ALPN-01, só pela 443).
    - **App em Docker Compose próprio:** use o `public-route.sh` na pasta do projeto — ele lê as labels Traefik que o serviço já tem (nome do serviço Traefik, middlewares), gera as rotas públicas no `docker-compose.override.yml` e recria só os serviços afetados. O `docker-compose.yml` do projeto não é alterado e as rotas da LAN continuam iguais.
      ```bash
      cd /opt/homelab/apps/<projeto>
@@ -480,7 +480,7 @@ Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd,
 | `redis-dump.rdb.gz` | Snapshot do Redis | `BGSAVE` consistente, sem parar o serviço |
 | `rabbitmq-definitions.json` | vhosts, usuários, permissões, filas, exchanges, bindings, policies | `rabbitmqctl export_definitions` |
 | `coolify-db.dump`, `coolify-data.tar.gz` | Banco do Coolify (projetos, apps, variáveis, domínios) e `/data/coolify` (APP_KEY, chaves SSH, proxy) | `pg_dump` + `tar` — volumes de dados das apps **não** entram |
-| `config.tar.gz` | `.env`, compose, `my.cnf`, **CA do homelab** (`/opt/homelab/ca`), SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do systemd | `tar` |
+| `config.tar.gz` | `.env`, compose, `my.cnf`, **CA do homelab** (`/opt/homelab/ca`), SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do systemd, e de cada projeto em `/opt/homelab/apps/<projeto>`: compose, overrides, `.env` e `public-routes.conf` (sem código-fonte nem volumes) | `tar` |
 | `SHA256SUMS` | Checksums de todos os arquivos | conferidos antes de qualquer restauração |
 
 **Não entram no backup:** mensagens que estão nas filas do RabbitMQ (só as definições), código dos projetos (fica no Git), registro do runner do GitHub (registre de novo) e preferências do RedisInsight.
@@ -681,7 +681,7 @@ sudo tlp fullcharge BAT0
 | `404 page not found` (Traefik) | Nenhuma rota casou: confira entrypoint/rule das labels ou do arquivo em `dynamic/`; `docker logs coolify-proxy --tail 50` |
 | `502 Bad Gateway` (Traefik) | O container de destino não está numa rede do Coolify ou a porta está errada |
 | `403 Forbidden` na LAN | O middleware `homelab-lan-only` não reconhece a origem (ex.: rede fora das faixas privadas) |
-| Let's Encrypt não emite | `public-access.sh check <dominio>`. DNS aponta para `177.101.139.43`? Portas 80/443 encaminhadas? `public-access.sh status`? Sem CGNAT? `docker logs coolify-proxy \| grep -i acme` |
+| Let's Encrypt não emite | `public-access.sh check <dominio>`. Log com `reader size limit exceeded` = a porta 80 do IP público é do roteador → `sudo /opt/homelab/scripts/public-access.sh acme-tls` (valida só pela 443). DNS aponta para `177.101.139.43`? Portas 80/443 encaminhadas? `public-access.sh status`? Sem CGNAT? `docker logs coolify-proxy \| grep -i acme` |
 | `network-static.sh`: a rede voltou sozinha | Não houve `--confirm` em 5 min. Confira IP/gateway e aplique de novo |
 | `permission denied ... docker.sock` | Faltou reiniciar (ou logout/login) após a instalação |
 | `Connection refused` no SSH | `sudo ss -tlnp \| grep :22` e `sudo fail2ban-client unban --all` |
