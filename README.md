@@ -136,6 +136,7 @@ sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-set
     ├── backup-disk-setup.sh    # prepara o SSD externo
     ├── network-static.sh       # IP fixo na LAN
     ├── public-access.sh        # libera 80/443 para a internet
+    ├── public-route.sh         # publica serviços de um compose por domínio (labels Traefik)
     └── register-runner.sh      # registra o runner do GitHub
 
 /data/coolify/                  # Coolify (gerenciado por ele)
@@ -384,19 +385,22 @@ Exemplo usado abaixo: API do MesaFácil em `mfapi.darkocode.com.br`.
    sudo /opt/homelab/scripts/public-access.sh enable    # status | enable | disable | check <dominio>
    ```
    Cria regras `ufw route` para 80/443 (o proxy é um container, por isso regras de *route*). O resto continua só na LAN.
-4. **Coolify — app gerenciada pelo Coolify:** no serviço, *Domains* = `https://mfapi.darkocode.com.br:8080` (o `:8080` é a porta **interna** do container; não aparece na URL). O Traefik emite o Let's Encrypt sozinho (desafio HTTP-01 pela porta 80).
+4. **Rota pública para a app** — escolha **um** caminho por domínio (dois lugares declarando o mesmo domínio geram conflito):
 
-   **App com labels próprias** (ex.: MesaFácil antes da etapa 2): acrescente uma rota pública ao lado da rota da LAN — sem `homelab-lan-only@file`:
-   ```yaml
-       - traefik.http.routers.mf-api-pub.entrypoints=https
-       - traefik.http.routers.mf-api-pub.rule=Host(`mfapi.darkocode.com.br`)
-       - traefik.http.routers.mf-api-pub.tls.certresolver=letsencrypt
-       - traefik.http.routers.mf-api-pub.service=mf-api
-       - traefik.http.routers.mf-api-pub-http.entrypoints=http
-       - traefik.http.routers.mf-api-pub-http.rule=Host(`mfapi.darkocode.com.br`)
-       - traefik.http.routers.mf-api-pub-http.middlewares=homelab-redirect-https@file
-       - traefik.http.routers.mf-api-pub-http.service=mf-api
-   ```
+   - **App gerenciada pelo Coolify:** no serviço, *Domains* = `https://mfapi.darkocode.com.br:8080` (o `:8080` é a porta **interna** do container; não aparece na URL). O Traefik emite o Let's Encrypt sozinho (desafio HTTP-01 pela porta 80).
+   - **App em Docker Compose próprio** (ex.: MesaFácil): use o `public-route.sh` na pasta do projeto — ele lê as labels Traefik que o serviço já tem (nome do serviço Traefik, middlewares), gera as rotas públicas no `docker-compose.override.yml` e recria só os serviços afetados. O `docker-compose.yml` do projeto não é alterado e as rotas da LAN continuam iguais.
+     ```bash
+     cd /opt/homelab/apps/mesafacil
+     /opt/homelab/scripts/public-route.sh add api mfapi.darkocode.com.br
+     /opt/homelab/scripts/public-route.sh add pdv mf.pdv.darkocode.com.br
+     /opt/homelab/scripts/public-route.sh add crm mfcrm.darkocode.com.br
+     /opt/homelab/scripts/public-route.sh list            # o que está publicado (public-routes.conf)
+     /opt/homelab/scripts/public-route.sh check           # testa cada domínio e aponta conflitos
+     /opt/homelab/scripts/public-route.sh remove pdv      # despublica
+     ```
+     Requisitos do serviço: container rodando, na rede `coolify`, com `traefik.enable=true` e `traefik.http.services.<nome>.loadbalancer.server.port`. O middleware `homelab-lan-only` não vai para a rota pública; os demais (cabeçalhos, compressão) sim. Se já existir um `docker-compose.override.yml` feito à mão, o script para; revise-o e rode com `--force` (faz backup).
+
+     **Conflitos** que o `check` aponta: recursos do Coolify com o mesmo domínio (a regra deles, `Host(...) && PathPrefix(/)`, é mais longa e **vence** — se o container estiver parado/reiniciando, o resultado é `no available server`) e labels esquecidas no `coolify-proxy`.
 5. **Diagnóstico:**
    ```bash
    sudo /opt/homelab/scripts/public-access.sh check mfapi.darkocode.com.br

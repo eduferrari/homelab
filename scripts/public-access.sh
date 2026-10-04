@@ -70,7 +70,7 @@ check_domain() {
   fi
 
   echo "4. Rota no Traefik (teste local, sem passar pelo roteador)"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 -k --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null || true)"
+  code="$(curl --noproxy "*" -s -o /dev/null -w '%{http_code}' -m 10 -k --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null || true)"
   code="${code:-000}"
   case "$code" in
     000) fail "sem resposta em https://$domain" ;;
