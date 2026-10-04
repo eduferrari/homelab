@@ -96,12 +96,15 @@ inspect_service() {
 conf_entries() { [[ -f "$CONF" ]] && grep -vE '^\s*(#|$)' "$CONF" | awk 'NF>=2{print $1, $2}' || true; }
 conf_services() { conf_entries | awk '{print $1}' | sort -u; }
 
+OVERRIDE_OK=false
 ensure_override_owned() {
+  $OVERRIDE_OK && return 0
   [[ -f "$OVERRIDE" ]] || return 0
   head -1 "$OVERRIDE" | grep -qF "$MARKER" && return 0
   if $FORCE; then
     local bak; bak="$OVERRIDE.bak.$(date +%Y%m%d-%H%M%S)"
     cp "$OVERRIDE" "$bak"; log "Override anterior salvo em $bak"
+    OVERRIDE_OK=true
   else
     die "$OVERRIDE existe e não foi gerado por este script.
   Revise o conteúdo; se só tiver rotas públicas, rode de novo com --force (faz backup)."
@@ -158,7 +161,10 @@ find_conflicts() {
     [[ -n "$project" && "$cproj" == "$project" ]] && continue
     found=0
     warn "Conflito: ${cname#/} ($cstate) também declara $domain"
-    if [[ "$cname" == "/coolify-proxy" ]]; then
+    if [[ "$cstate" =~ ^(exited|created|dead)$ ]]; then
+      warn "  (parado: não atrapalha agora, mas volta a disputar o domínio se for religado)"
+      echo "     → remova o recurso no Coolify (ou apague o Domains dele), ou: docker rm ${cname#/}" >&2
+    elif [[ "$cname" == "/coolify-proxy" ]]; then
       echo "     → labels esquecidas no proxy: sudo sed -i '/$domain/d;/-pub/d' /data/coolify/proxy/docker-compose.yml (revise antes)"
     else
       echo "     → recurso do Coolify? Abra-o no Coolify, Stop e apague Domains (ou: docker update --restart=no ${cname#/} && docker stop ${cname#/})"
