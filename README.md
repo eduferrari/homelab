@@ -136,6 +136,7 @@ sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-set
     ├── backup-disk-setup.sh    # prepara o SSD externo
     ├── network-static.sh       # IP fixo na LAN
     ├── public-access.sh        # libera 80/443 para a internet
+    ├── public-route.sh         # publica serviços de um compose por domínio (labels Traefik)
     └── register-runner.sh      # registra o runner do GitHub
 
 /data/coolify/                  # Coolify (gerenciado por ele)
@@ -149,7 +150,6 @@ Repositório:
 ```text
 homelab-setup.sh                # provisionamento
 scripts/                        # utilitários instalados em /opt/homelab/scripts
-docs/exemplos/                  # configurações de exemplo (ex.: MesaFácil no Traefik)
 ```
 
 ---
@@ -253,9 +253,9 @@ traefik.http.services.pdv.loadbalancer.server.port=80
 
 `homelab-lan-only@file` e o certificado padrão vêm de `/data/coolify/proxy/dynamic/homelab-lan.yaml`, gerado pelo `homelab-ca.sh` (seção 8).
 
-**Exemplo — sistema com várias portas na LAN (MesaFácil):** site na 443, PDV 8081, CRM 8082 e API 8083 (SSE), acessados por nome e por IP pelos tablets. Um router por serviço, como acima (`p8081`, `p8082`, `p8083`; o site usa `entrypoints=https` e ``rule=Host(`homelab-eduardo.local`) || Host(`192.168.101.28`)``). Na API, **não** use compressão — o SSE precisa sair sem buffer.
+Para acessar pelo **IP** além do nome, use ``rule=Host(`homelab-eduardo.local`) || Host(`192.168.101.28`)`` no entrypoint `https`, ou ``PathPrefix(`/`)`` numa porta extra. Em APIs com SSE, **não** use o middleware de compressão (o stream precisa sair sem buffer).
 
-Para containers que **não** são gerenciados pelo Coolify, as mesmas rotas podem ser declaradas em arquivo: veja [`docs/exemplos/mesafacil-traefik.yaml`](docs/exemplos/mesafacil-traefik.yaml) (copie para `/data/coolify/proxy/dynamic/` e coloque os containers na rede `coolify`). Validado com Traefik v3: acesso por IP sem SNI, `.local`, lan-only (403 de fora), redirect 80→443, headers e SSE.
+Containers que **não** são gerenciados pelo Coolify (compose próprio) usam as mesmas labels: basta estarem na rede `coolify` (`networks: [default, coolify]` + `coolify: external: true`) com `traefik.docker.network=coolify`. Para publicá-los na internet, veja `public-route.sh` (seção 9.4).
 
 ### 7.6 Deploy automático a partir do GitHub
 
@@ -368,41 +368,44 @@ Voltar para DHCP: `sudo /opt/homelab/scripts/network-static.sh --dhcp`.
 ### 9.4 Acesso pela internet — IP público fixo `177.101.139.43`
 
 ```text
-Internet ─► mfapi.darkocode.com.br (DNS A) ─► 177.101.139.43 (roteador/ONT)
+Internet ─► api.seudominio.com.br (DNS A) ─► 177.101.139.43 (roteador/ONT)
          ─► 80/443 encaminhadas ─► 192.168.101.28 (L14) ─► Traefik (Coolify) ─► app
 ```
 
-Exemplo usado abaixo: API do MesaFácil em `mfapi.darkocode.com.br`.
+Nos exemplos, `api.seudominio.com.br` e `app.seudominio.com.br` são domínios do seu projeto.
 
 1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `177.101.139.43` para `192.168.101.28` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, 8000, 8080, 3306, 6379, 5672 nem 15672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
-2. **DNS** (zona de `darkocode.com.br`, ex.: Registro.br):
+2. **DNS** (zona do seu domínio, ex.: Registro.br) — um registro por subdomínio:
    ```text
-   mfapi   A   177.101.139.43   TTL 300
+   api   A   177.101.139.43   TTL 300
+   app   A   177.101.139.43   TTL 300
    ```
 3. **Firewall do L14:**
    ```bash
    sudo /opt/homelab/scripts/public-access.sh enable    # status | enable | disable | check <dominio>
    ```
    Cria regras `ufw route` para 80/443 (o proxy é um container, por isso regras de *route*). O resto continua só na LAN.
-4. **Coolify — app gerenciada pelo Coolify:** no serviço, *Domains* = `https://mfapi.darkocode.com.br:8080` (o `:8080` é a porta **interna** do container; não aparece na URL). O Traefik emite o Let's Encrypt sozinho (desafio HTTP-01 pela porta 80).
+4. **Rota pública para a app** — escolha **um** caminho por domínio (dois lugares declarando o mesmo domínio geram conflito):
 
-   **App com labels próprias** (ex.: MesaFácil antes da etapa 2): acrescente uma rota pública ao lado da rota da LAN — sem `homelab-lan-only@file`:
-   ```yaml
-       - traefik.http.routers.mf-api-pub.entrypoints=https
-       - traefik.http.routers.mf-api-pub.rule=Host(`mfapi.darkocode.com.br`)
-       - traefik.http.routers.mf-api-pub.tls.certresolver=letsencrypt
-       - traefik.http.routers.mf-api-pub.service=mf-api
-       - traefik.http.routers.mf-api-pub-http.entrypoints=http
-       - traefik.http.routers.mf-api-pub-http.rule=Host(`mfapi.darkocode.com.br`)
-       - traefik.http.routers.mf-api-pub-http.middlewares=homelab-redirect-https@file
-       - traefik.http.routers.mf-api-pub-http.service=mf-api
-   ```
+   - **App gerenciada pelo Coolify:** no serviço, *Domains* = `https://api.seudominio.com.br:8080` (o `:8080` é a porta **interna** do container; não aparece na URL). O Traefik emite o Let's Encrypt sozinho (desafio HTTP-01 pela porta 80).
+   - **App em Docker Compose próprio:** use o `public-route.sh` na pasta do projeto — ele lê as labels Traefik que o serviço já tem (nome do serviço Traefik, middlewares), gera as rotas públicas no `docker-compose.override.yml` e recria só os serviços afetados. O `docker-compose.yml` do projeto não é alterado e as rotas da LAN continuam iguais.
+     ```bash
+     cd /opt/homelab/apps/<projeto>
+     /opt/homelab/scripts/public-route.sh add api api.seudominio.com.br    # <serviço do compose> <domínio>
+     /opt/homelab/scripts/public-route.sh add web app.seudominio.com.br
+     /opt/homelab/scripts/public-route.sh list            # o que está publicado (public-routes.conf)
+     /opt/homelab/scripts/public-route.sh check           # testa cada domínio e aponta conflitos
+     /opt/homelab/scripts/public-route.sh remove web      # despublica
+     ```
+     Requisitos do serviço: container rodando, na rede `coolify`, com `traefik.enable=true` e `traefik.http.services.<nome>.loadbalancer.server.port`. O middleware `homelab-lan-only` não vai para a rota pública; os demais (cabeçalhos, compressão) sim. Se já existir um `docker-compose.override.yml` feito à mão, o script para; revise-o e rode com `--force` (faz backup).
+
+     **Conflitos** que o `check` aponta: recursos do Coolify com o mesmo domínio (a regra deles, `Host(...) && PathPrefix(/)`, é mais longa e **vence** — se o container estiver parado/reiniciando, o resultado é `no available server`) e labels esquecidas no `coolify-proxy`.
 5. **Diagnóstico:**
    ```bash
-   sudo /opt/homelab/scripts/public-access.sh check mfapi.darkocode.com.br
+   sudo /opt/homelab/scripts/public-access.sh check api.seudominio.com.br
    ```
    Confere DNS (via 1.1.1.1), firewall, proxy, rota no Traefik e se o certificado já é Let's Encrypt, e mostra como provar o encaminhamento do roteador com `tcpdump` + acesso pelo 4G.
-6. **Teste de fora** (4G do celular): `https://mfapi.darkocode.com.br/health`.
+6. **Teste de fora** (4G do celular): `https://api.seudominio.com.br/health`.
 
 **APIs .NET atrás do proxy** — o TLS termina no Traefik; sem isto a app enxerga `http` e o IP do proxy (redirects, URLs geradas, logs, rate limit por IP):
 
@@ -417,7 +420,7 @@ builder.Services.Configure<ForwardedHeadersOptions>(o =>
 app.UseForwardedHeaders();     // antes de UseHttpsRedirection / autenticação
 ```
 
-> **NAT loopback:** muitos roteadores não deixam acessar o próprio IP público de dentro da LAN — o domínio pode abrir só de fora. Dispositivos da LAN (tablets) continuam pelas rotas locais (`https://192.168.101.28:8083` etc.).
+> **NAT loopback:** muitos roteadores não deixam acessar o próprio IP público de dentro da LAN — o domínio pode abrir só de fora. Dispositivos da LAN continuam pelas rotas locais (nome `.local` ou IP e porta da LAN).
 >
 > **Exposição:** confira autenticação em todos os endpoints e use rate limiting (`AddRateLimiter`) nos públicos. Para administrar de fora de casa, use **Tailscale** (já liberado: `100.64.0.0/10`) em vez de expor o painel do Coolify (porta 8000).
 
