@@ -9,6 +9,7 @@ HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 #   sudo public-access.sh enable
 #   sudo public-access.sh disable
 #   sudo public-access.sh check api.seudominio.com.br    # diagnóstico de um domínio
+#   sudo public-access.sh acme-tls                       # Let's Encrypt só pela 443 (porta 80 bloqueada)
 set -Eeuo pipefail
 
 ENV_FILE="$HOMELAB_DIR/infra/.env"
@@ -89,11 +90,15 @@ check_domain() {
     pass "Let's Encrypt — válido até $end"
   elif [[ -s "$HOMELAB_DIR/ca/lan.crt" ]] && [[ "$(echo | openssl s_client -connect 127.0.0.1:443 -servername "$domain" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null)" == "$(openssl x509 -in "$HOMELAB_DIR/ca/lan.crt" -noout -fingerprint -sha256)" ]]; then
     fail "Let's Encrypt ainda não emitido — o Traefik entrega o certificado padrão da LAN (CA do homelab)"
-    echo "     O desafio HTTP-01 precisa que a internet alcance a porta 80. Veja o motivo:"
+    echo "     O desafio HTTP-01 precisa que a internet alcance a porta 80. Se o log disser"
+    echo "     'reader size limit exceeded', a 80 é do roteador: use  sudo $0 acme-tls  (valida pela 443)."
+    echo "     Veja o motivo:"
     echo "     docker logs coolify-proxy 2>&1 | grep -i -E 'acme|$domain' | tail"
   else
     fail "ainda não é Let's Encrypt (emissor: ${issuer:-?}; titular: ${subject:-?})"
-    echo "     O desafio HTTP-01 precisa que a internet alcance a porta 80. Veja o motivo:"
+    echo "     O desafio HTTP-01 precisa que a internet alcance a porta 80. Se o log disser"
+    echo "     'reader size limit exceeded', a 80 é do roteador: use  sudo $0 acme-tls  (valida pela 443)."
+    echo "     Veja o motivo:"
     echo "     docker logs coolify-proxy 2>&1 | grep -i -E 'acme|$domain' | tail"
   fi
 
@@ -104,6 +109,38 @@ check_domain() {
   echo
   if (( ok == 0 )); then echo "Tudo certo do lado do L14."; else echo "Há itens pendentes (✘) acima."; fi
   return "$ok"
+}
+
+# Let's Encrypt pelo desafio TLS-ALPN-01 (só porta 443) em vez do HTTP-01 (porta 80).
+# Útil quando a porta 80 do IP público é do roteador/provedor ("reader size limit exceeded").
+PROXY_COMPOSE="${COOLIFY_PROXY_DIR:-/data/coolify/proxy}/docker-compose.yml"
+acme_tls() {
+  local f="$PROXY_COMPOSE" bak
+  [[ -f "$f" ]] || die "Não encontrei $f (Coolify instalado?)"
+  if grep -q 'certificatesresolvers.letsencrypt.acme.tlschallenge=true' "$f"; then
+    echo "✔ O resolver letsencrypt já usa TLS-ALPN-01 (porta 443)"; return 0
+  fi
+  grep -q 'certificatesresolvers.letsencrypt.acme.httpchallenge' "$f" \
+    || die "Resolver letsencrypt com httpchallenge não encontrado em $f — ajuste manualmente"
+  bak="$f.bak.$(date +%Y%m%d-%H%M%S)"; cp "$f" "$bak"
+  sed -i -E \
+    -e '/certificatesresolvers\.letsencrypt\.acme\.httpchallenge=true/d' \
+    -e 's#certificatesresolvers\.letsencrypt\.acme\.httpchallenge\.entrypoint=[a-z0-9-]+#certificatesresolvers.letsencrypt.acme.tlschallenge=true#' \
+    "$f"
+  grep -q 'certificatesresolvers.letsencrypt.acme.tlschallenge=true' "$f" || { cp "$bak" "$f"; die "Edição falhou — arquivo restaurado"; }
+  if ! docker compose -f "$f" config --quiet; then cp "$bak" "$f"; die "Compose inválido — arquivo restaurado ($bak)"; fi
+  echo "==> Recriando o proxy (alguns segundos fora do ar)"
+  if ! docker compose -f "$f" up -d; then
+    cp "$bak" "$f"; docker compose -f "$f" up -d || true
+    die "Proxy não subiu com a nova configuração — arquivo restaurado ($bak)"
+  fi
+  echo "✔ Let's Encrypt agora valida pela porta 443 (backup: $bak)"
+  echo
+  echo "IMPORTANTE: no Coolify, Servers → localhost → Proxy: confira que o editor mostra"
+  echo "  --certificatesresolvers.letsencrypt.acme.tlschallenge=true  (e nenhum httpchallenge)"
+  echo "e clique em Save — senão o próximo \"Restart Proxy\" volta ao HTTP-01."
+  echo
+  echo "Acompanhe a emissão:  docker logs -f coolify-proxy 2>&1 | grep -i acme"
 }
 
 case "${1:-status}" in
@@ -137,6 +174,7 @@ case "${1:-status}" in
     ;;
   check)
     check_domain "${2:-}" ;;
+  acme-tls) acme_tls ;;
   status) show_status ;;
-  *) die "Uso: sudo $0 [status|enable|disable|check <dominio>]" ;;
+  *) die "Uso: sudo $0 [status|enable|disable|check <dominio>|acme-tls]" ;;
 esac
