@@ -745,7 +745,8 @@ ${C_GREEN}=====================================================================
   Backup ......... diário 03:00 → ${HOMELAB_DIR}/backups  (manual: sudo ${HOMELAB_DIR}/scripts/backup.sh)
   SSD externo .... sudo ${HOMELAB_DIR}/scripts/backup-disk-setup.sh
   IP fixo (LAN) .. sudo ${HOMELAB_DIR}/scripts/network-static.sh
-  Internet ....... sudo ${HOMELAB_DIR}/scripts/public-access.sh status|enable|disable
+  Internet ....... sudo ${HOMELAB_DIR}/scripts/public-access.sh status|enable|disable|check <dominio>
+  Domínios ....... ${HOMELAB_DIR}/scripts/public-route.sh add <serviço> <dominio>   (na pasta do compose)
   Log ............ ${LOG_FILE}
 
 ${C_YELLOW}  ► Na primeira instalação, reinicie:  sudo reboot${C_RESET}

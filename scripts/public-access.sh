@@ -8,7 +8,7 @@ HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 #   sudo public-access.sh status
 #   sudo public-access.sh enable
 #   sudo public-access.sh disable
-#   sudo public-access.sh check mfapi.darkocode.com.br   # diagnóstico de um domínio
+#   sudo public-access.sh check api.seudominio.com.br    # diagnóstico de um domínio
 set -Eeuo pipefail
 
 ENV_FILE="$HOMELAB_DIR/infra/.env"
@@ -40,7 +40,7 @@ show_status() {
 # passo mostra como confirmar com um acesso de fora.
 check_domain() {
   local domain="$1" pub dns ok=0 cert issuer subject end code
-  [[ -n "$domain" ]] || die "Uso: sudo $0 check <dominio>   ex.: mfapi.darkocode.com.br"
+  [[ -n "$domain" ]] || die "Uso: sudo $0 check <dominio>   ex.: api.seudominio.com.br"
   pass() { echo "  ✔ $*"; }
   fail() { echo "  ✘ $*"; ok=1; }
   warn() { echo "  ! $*"; }
@@ -51,7 +51,7 @@ check_domain() {
   echo "1. DNS (resolvedor público 1.1.1.1)"
   dns="$(dig +short A "$domain" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)"
   if [[ -z "$dns" ]]; then
-    fail "sem registro A — crie: ${domain%%.*}  A  $pub"
+    fail "sem registro A — crie na zona do domínio: $domain  A  $pub  (no Registro.br, o nome é o que vem antes do domínio, ex.: api ou app.loja)"
   elif [[ "$dns" == "$pub" ]]; then
     pass "$domain → $dns"
   else
@@ -70,11 +70,11 @@ check_domain() {
   fi
 
   echo "4. Rota no Traefik (teste local, sem passar pelo roteador)"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 -k --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null || true)"
+  code="$(curl --noproxy "*" -s -o /dev/null -w '%{http_code}' -m 10 -k --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null || true)"
   code="${code:-000}"
   case "$code" in
     000) fail "sem resposta em https://$domain" ;;
-    404) warn "HTTP 404 — se a resposta for '404 page not found' do Traefik, falta o domínio na app (Coolify → Domains)" ;;
+    404) warn "HTTP 404 — normal se a raiz da app não tem rota; se o corpo for '404 page not found' (Traefik), falta a rota: Domains no Coolify ou labels Host(\`$domain\`)" ;;
     *)   pass "HTTP $code" ;;
   esac
 
@@ -87,6 +87,10 @@ check_domain() {
     fail "não foi possível ler o certificado"
   elif grep -qi "let's encrypt" <<<"$issuer"; then
     pass "Let's Encrypt — válido até $end"
+  elif [[ -s "$HOMELAB_DIR/ca/lan.crt" ]] && [[ "$(echo | openssl s_client -connect 127.0.0.1:443 -servername "$domain" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null)" == "$(openssl x509 -in "$HOMELAB_DIR/ca/lan.crt" -noout -fingerprint -sha256)" ]]; then
+    fail "Let's Encrypt ainda não emitido — o Traefik entrega o certificado padrão da LAN (CA do homelab)"
+    echo "     O desafio HTTP-01 precisa que a internet alcance a porta 80. Veja o motivo:"
+    echo "     docker logs coolify-proxy 2>&1 | grep -i -E 'acme|$domain' | tail"
   else
     fail "ainda não é Let's Encrypt (emissor: ${issuer:-?}; titular: ${subject:-?})"
     echo "     O desafio HTTP-01 precisa que a internet alcance a porta 80. Veja o motivo:"
