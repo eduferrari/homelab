@@ -8,7 +8,7 @@ HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 #   sudo public-access.sh status
 #   sudo public-access.sh enable
 #   sudo public-access.sh disable
-#   sudo public-access.sh check mfapi.darkocode.com.br   # diagnóstico de um domínio
+#   sudo public-access.sh check api.seudominio.com.br    # diagnóstico de um domínio
 set -Eeuo pipefail
 
 ENV_FILE="$HOMELAB_DIR/infra/.env"
@@ -40,7 +40,7 @@ show_status() {
 # passo mostra como confirmar com um acesso de fora.
 check_domain() {
   local domain="$1" pub dns ok=0 cert issuer subject end code
-  [[ -n "$domain" ]] || die "Uso: sudo $0 check <dominio>   ex.: mfapi.darkocode.com.br"
+  [[ -n "$domain" ]] || die "Uso: sudo $0 check <dominio>   ex.: api.seudominio.com.br"
   pass() { echo "  ✔ $*"; }
   fail() { echo "  ✘ $*"; ok=1; }
   warn() { echo "  ! $*"; }
@@ -51,7 +51,7 @@ check_domain() {
   echo "1. DNS (resolvedor público 1.1.1.1)"
   dns="$(dig +short A "$domain" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)"
   if [[ -z "$dns" ]]; then
-    fail "sem registro A — crie na zona do domínio: $domain  A  $pub  (no Registro.br, o nome é o que vem antes do domínio, ex.: mf.pdv)"
+    fail "sem registro A — crie na zona do domínio: $domain  A  $pub  (no Registro.br, o nome é o que vem antes do domínio, ex.: api ou app.loja)"
   elif [[ "$dns" == "$pub" ]]; then
     pass "$domain → $dns"
   else

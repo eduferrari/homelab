@@ -12,11 +12,10 @@
 #   public-route.sh [-C DIR] apply                        # regenera o override e recria os serviços
 #   public-route.sh [-C DIR] check                        # testa as rotas e procura conflitos
 #
-# Exemplo (MesaFácil):
-#   cd /opt/homelab/apps/mesafacil
-#   public-route.sh add api mfapi.darkocode.com.br
-#   public-route.sh add pdv mf.pdv.darkocode.com.br
-#   public-route.sh add crm mfcrm.darkocode.com.br
+# Exemplo:
+#   cd /opt/homelab/apps/<projeto>
+#   public-route.sh add api api.seudominio.com.br
+#   public-route.sh add web app.seudominio.com.br
 #
 # Requisitos de cada serviço: container rodando, rede do Coolify e uma label
 # traefik.http.services.<nome>.loadbalancer.server.port (o script usa esse <nome>).
