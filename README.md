@@ -480,7 +480,7 @@ Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd,
 | `redis-dump.rdb.gz` | Snapshot do Redis | `BGSAVE` consistente, sem parar o serviço |
 | `rabbitmq-definitions.json` | vhosts, usuários, permissões, filas, exchanges, bindings, policies | `rabbitmqctl export_definitions` |
 | `coolify-db.dump`, `coolify-data.tar.gz` | Banco do Coolify (projetos, apps, variáveis, domínios) e `/data/coolify` (APP_KEY, chaves SSH, proxy) | `pg_dump` + `tar` — volumes de dados das apps **não** entram |
-| `config.tar.gz` | `.env`, compose, `my.cnf`, **CA do homelab** (`/opt/homelab/ca`), SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do systemd | `tar` |
+| `config.tar.gz` | `.env`, compose, `my.cnf`, **CA do homelab** (`/opt/homelab/ca`), SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do systemd, e de cada projeto em `/opt/homelab/apps/<projeto>`: compose, overrides, `.env` e `public-routes.conf` (sem código-fonte nem volumes) | `tar` |
 | `SHA256SUMS` | Checksums de todos os arquivos | conferidos antes de qualquer restauração |
 
 **Não entram no backup:** mensagens que estão nas filas do RabbitMQ (só as definições), código dos projetos (fica no Git), registro do runner do GitHub (registre de novo) e preferências do RedisInsight.

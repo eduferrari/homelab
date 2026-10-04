@@ -194,6 +194,13 @@ backup_config() {
   for p in "${candidates[@]}"; do
     [[ -e "$p" ]] && rel+=("${p#/}")
   done
+  # Projetos em compose próprio ($HOMELAB_DIR/apps/<projeto>): compose, overrides, .env e
+  # rotas públicas (public-routes.conf). Código-fonte e volumes de dados não entram.
+  if [[ -d "$HOMELAB_DIR/apps" ]]; then
+    while IFS= read -r -d '' p; do rel+=("${p#/}"); done < <(
+      find "$HOMELAB_DIR/apps" -mindepth 2 -maxdepth 2 -type f \( -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
+        -o -name 'compose*.yml' -o -name 'compose*.yaml' -o -name '.env' -o -name '.env.*' -o -name 'public-routes.conf' \) -print0)
+  fi
   tar czf "$DEST/config.tar.gz" -C / "${rel[@]}" || return 1
   gzip -t "$DEST/config.tar.gz" || return 1
 }
