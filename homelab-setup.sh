@@ -442,6 +442,8 @@ RABBITMQ_DEFAULT_PASS=$(gen_secret)
 
 # Backup (dias de retenção local)
 BACKUP_KEEP_DAYS=7
+# Alerta do backup: URL de um monitor "Push" do Uptime Kuma (README 7.6). Vazio = sem alerta.
+BACKUP_PUSH_URL=
 
 # Nomes extras no certificado da LAN (separados por espaço) — homelab-ca.sh
 HOMELAB_CA_EXTRA_NAMES=
@@ -650,6 +652,21 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+# Logs dos scripts do homelab (backup.log — também visível no painel de logs).
+# Rotação por renomeação (create), não copytruncate: o "tail -F" do container backup-log
+# segue o arquivo novo; truncar o mesmo arquivo confunde o tail do busybox.
+install -d -m 755 /var/log/homelab
+cat > /etc/logrotate.d/homelab <<'EOF'
+/var/log/homelab/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+}
+EOF
 systemctl daemon-reload
 systemctl enable --now homelab-backup.timer homelab-ca-renew.timer >/dev/null 2>&1
 ok "Agendado: backup diário (03:00) e renovação semanal do certificado da LAN"
@@ -743,8 +760,9 @@ ${C_GREEN}=====================================================================
 =====================================================================${C_RESET}
   SSH ............ ssh ${HOMELAB_USER}@${HOST} -p ${SSH_PORT}
   Proxy .......... Traefik nas portas 80/443   [${PROXY_STATE}]   (sudo ${HOMELAB_DIR}/scripts/proxy.sh)
+  Painel geral ... https://${HOST}:9440   (alertas, containers, domínios, tráfego, backup e atalhos)
   Painéis ........ logs :9443 | tráfego :9444 | status :9445 | Seq :9446   [${MONITOR_STATE}]
-                   https://${HOST}:<porta>  — senha: sudo ${HOMELAB_DIR}/scripts/monitor.sh credenciais
+                   senha: sudo ${HOMELAB_DIR}/scripts/monitor.sh credenciais
   Projetos ....... ${HOMELAB_DIR}/apps/<projeto>  (compose na rede "proxy"; deploy: GitHub Actions + runner)
   Adminer ........ http://${HOST}:$(grep -m1 '^ADMINER_PORT=' "$ENV_FILE" | cut -d= -f2)   (servidor: mysql)
   RedisInsight ... http://${HOST}:5540
@@ -755,6 +773,7 @@ ${C_GREEN}=====================================================================
   Status ......... ${HOMELAB_DIR}/scripts/status.sh
   HTTPS na LAN ... sudo ${HOMELAB_DIR}/scripts/homelab-ca.sh  (CA, certificado, exportar raiz)
   Backup ......... diário 03:00 → ${HOMELAB_DIR}/backups  (manual: sudo ${HOMELAB_DIR}/scripts/backup.sh)
+                   log: /var/log/homelab/backup.log | alerta: BACKUP_PUSH_URL no .env (Uptime Kuma)
   SSD externo .... sudo ${HOMELAB_DIR}/scripts/backup-disk-setup.sh
   IP fixo (LAN) .. sudo ${HOMELAB_DIR}/scripts/network-static.sh
   Internet ....... sudo ${HOMELAB_DIR}/scripts/public-access.sh status|enable|disable|check <dominio>

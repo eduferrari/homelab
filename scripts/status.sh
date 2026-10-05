@@ -23,7 +23,7 @@ else
 fi
 echo
 echo "== Painéis (só LAN) =="
-for c in dozzle:9443 goaccess-web:9444 uptime-kuma:9445 seq:9446; do
+for c in painel:9440 dozzle:9443 goaccess-web:9444 uptime-kuma:9445 seq:9446; do
   n="${c%%:*}"; s="$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo '-')"
   [[ "$s" == "-" ]] || printf '%-14s %-10s https://%s:%s\n' "$n" "$s" "$HOST" "${c##*:}"
 done
@@ -45,6 +45,9 @@ else
 fi
 echo; echo "== Backup =="
 echo "Último backup completo: $(readlink "$HOMELAB_DIR/backups/latest" 2>/dev/null || echo 'nenhum')"
+if [[ -r "$HOMELAB_DIR/backups/last-status.json" ]]; then
+  jq -r '"Última execução: \(.time) | \(if .ok then "OK" else "FALHOU" end) | \(.message)"' "$HOMELAB_DIR/backups/last-status.json" 2>/dev/null || true
+fi
 systemctl list-timers homelab-backup.timer --no-pager 2>/dev/null | sed -n 2p
 EXT_MNT="$(envget BACKUP_EXTERNAL_MOUNT)"; EXT_DIR="$(envget BACKUP_EXTERNAL_DIR)"
 if [[ -z "$EXT_MNT" ]]; then
