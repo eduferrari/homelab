@@ -3,7 +3,7 @@
 [[ -r "${HOMELAB_CONF:-/etc/homelab.conf}" ]] && . "${HOMELAB_CONF:-/etc/homelab.conf}"
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 # Restaura um componente a partir de um backup do homelab.
-# Uso: sudo restore.sh <pasta-do-backup|latest> <mysql|redis|rabbitmq|coolify|config> [--yes]
+# Uso: sudo restore.sh <pasta-do-backup|latest> <mysql|redis|rabbitmq|config> [--yes]
 set -Eeuo pipefail
 
 INFRA="$HOMELAB_DIR/infra"
@@ -13,7 +13,7 @@ ROOT="$HOMELAB_DIR/backups"
 [[ $EUID -eq 0 ]] || { echo "Execute com sudo: sudo $0 $*" >&2; exit 1; }
 
 usage() {
-  echo "Uso: sudo $0 <pasta-do-backup|latest> <mysql|redis|rabbitmq|coolify|config> [--yes]"
+  echo "Uso: sudo $0 <pasta-do-backup|latest> <mysql|redis|rabbitmq|config> [--yes]"
   echo "Backups disponíveis:"
   local d
   for d in "$ROOT"/20* "$ROOT"/latest; do [[ -e "$d" ]] && echo "  $(basename "$d")"; done
@@ -110,28 +110,6 @@ case "$COMP" in
     log "Definições do RabbitMQ importadas."
     ;;
 
-  coolify)
-    need coolify-db.dump
-    need coolify-data.tar.gz
-    OUT="/tmp/homelab-coolify-$(basename "$SRC")"
-    rm -rf "$OUT"; mkdir -p "$OUT"; chmod 700 "$OUT"
-    tar xzf "$SRC/coolify-data.tar.gz" -C "$OUT"
-    cp "$SRC/coolify-db.dump" "$OUT/"
-    log "Backup do Coolify extraído em $OUT (nada foi sobrescrito)."
-    cat <<MSG
-Restauração do Coolify (manual — procedimento oficial de migração/backup):
-  1. Instale o Coolify (homelab-setup.sh) e pare-o:   docker stop coolify
-  2. Restaure o banco:
-       docker cp $OUT/coolify-db.dump coolify-db:/tmp/coolify.dump
-       docker exec coolify-db pg_restore --clean --if-exists --no-acl --no-owner -U coolify -d coolify /tmp/coolify.dump
-  3. Copie a APP_KEY antiga ($OUT/data/coolify/source/.env) para APP_PREVIOUS_KEYS
-     em /data/coolify/source/.env (sem ela os segredos do banco não abrem)
-  4. Copie chaves SSH e proxy:  $OUT/data/coolify/{ssh,proxy}  →  /data/coolify/
-  5. Suba de novo:  cd /data/coolify/source && docker compose up -d
-Documentação: https://coolify.io/docs/knowledge-base/how-to/backup-restore-coolify
-MSG
-    ;;
-
   config)
     need config.tar.gz
     OUT="/tmp/homelab-config-$(basename "$SRC")"
@@ -141,6 +119,7 @@ MSG
     echo "Compare e copie o que precisar, por exemplo:"
     echo "  sudo diff -ru $OUT/etc/ufw /etc/ufw"
     echo "  sudo cp $OUT/opt/homelab/infra/.env $INFRA/.env"
+    echo "  sudo cp -a $OUT/opt/homelab/proxy/{proxy.conf,acme,dynamic} /opt/homelab/proxy/ && sudo /opt/homelab/scripts/proxy.sh apply"
     ;;
 
   *) usage ;;

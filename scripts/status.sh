@@ -14,13 +14,19 @@ echo
 echo "== Stack (MySQL, Redis, RabbitMQ) =="
 docker compose -f "$HOMELAB_DIR/infra/docker-compose.yml" ps --format 'table {{.Name}}\t{{.Status}}'
 echo
-echo "== Coolify =="
-if docker inspect coolify >/dev/null 2>&1; then
-  docker ps --filter name=coolify --format 'table {{.Names}}\t{{.Status}}'
-  echo "Painel: http://$HOST:8000"
+echo "== Proxy (Traefik) =="
+if docker inspect traefik >/dev/null 2>&1; then
+  docker inspect -f '{{.Config.Image}} | {{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' traefik
+  echo "Detalhes: sudo $HOMELAB_DIR/scripts/proxy.sh status"
 else
-  echo "não instalado"
+  echo "não instalado (sudo $HOMELAB_DIR/scripts/proxy.sh apply)"
 fi
+echo
+echo "== Projetos ($HOMELAB_DIR/apps) =="
+for d in "$HOMELAB_DIR"/apps/*/; do
+  [[ -f "$d/docker-compose.yml" || -f "$d/compose.yml" ]] || continue
+  printf '%-14s %s\n' "$(basename "$d")" "$(docker compose --project-directory "$d" ps --format '{{.Service}}:{{.State}}' 2>/dev/null | xargs || echo '?')"
+done
 echo
 echo "== Firewall =="; sudo ufw status | head -12
 echo; echo "== Disco =="; df -h / | tail -1

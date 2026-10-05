@@ -3,8 +3,8 @@
 [[ -r "${HOMELAB_CONF:-/etc/homelab.conf}" ]] && . "${HOMELAB_CONF:-/etc/homelab.conf}"
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 BACKUP_GROUP="${BACKUP_GROUP:-root}"
-# Backup do homelab: MySQL, Redis, RabbitMQ (definições), Coolify e configurações (inclui a CA).
-# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|coolify|config ...]
+# Backup do homelab: MySQL, Redis, RabbitMQ (definições) e configurações (CA, proxy, projetos).
+# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|config ...]
 #      sudo backup.sh --sync-external      # só copia para o SSD externo
 # Agendado diariamente pelo homelab-backup.timer (systemd).
 # Backup completo: grava em $HOMELAB_DIR/backups e copia para o SSD externo
@@ -33,7 +33,7 @@ if [[ "${1:-}" == "--sync-external" ]]; then SYNC_ONLY=1; shift; fi
 
 COMPONENTS=("$@")
 if [[ ${#COMPONENTS[@]} -eq 0 || "${COMPONENTS[0]}" == "all" ]]; then
-  COMPONENTS=(mysql redis rabbitmq coolify config)
+  COMPONENTS=(mysql redis rabbitmq config)
   FULL_RUN=1
 else
   FULL_RUN=0
@@ -156,25 +156,13 @@ backup_rabbitmq() {
   jq -e '.vhosts and .users' "$out" >/dev/null || { log "  JSON de definições inválido"; return 1; }
 }
 
-# ----------------------------------------------------------------- Coolify
-# Banco do Coolify (pg_dump) + /data/coolify: chave APP_KEY (source/.env — sem ela os
-# segredos salvos no banco não podem ser lidos), chaves SSH, proxy (acme.json, dynamic,
-# certs) e configurações das aplicações. Os volumes de dados das apps não entram aqui.
-backup_coolify() {
-  if [[ ! -d /data/coolify ]]; then log "  Coolify não instalado — pulando"; return 0; fi
-  container_up coolify-db || { log "  container coolify-db não está rodando"; return 1; }
-  docker exec coolify-db pg_dump -U coolify -d coolify -Fc > "$DEST/coolify-db.dump" || return 1
-  [[ -s "$DEST/coolify-db.dump" ]] || { log "  dump do Coolify vazio"; return 1; }
-  tar czf "$DEST/coolify-data.tar.gz" -C / --exclude=data/coolify/backups \
-    --exclude='data/coolify/applications/*/.git' data/coolify || return 1
-  gzip -t "$DEST/coolify-data.tar.gz" || return 1
-}
-
 # ----------------------------------------------------------- Configurações
 backup_config() {
   local candidates=(
     "$INFRA/docker-compose.yml" "$INFRA/.env" "$INFRA/mysql"
     "$HOMELAB_DIR/ca"
+    "$HOMELAB_DIR/proxy/proxy.conf" "$HOMELAB_DIR/proxy/docker-compose.yml"
+    "$HOMELAB_DIR/proxy/dynamic" "$HOMELAB_DIR/proxy/acme"
     /etc/homelab.conf
     /etc/ssh/sshd_config.d/00-homelab.conf
     /etc/fail2ban/jail.d/homelab.local

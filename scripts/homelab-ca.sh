@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# CA local do homelab — HTTPS na LAN (nome .local e IP) pelo proxy do Coolify (Traefik).
+# CA local do homelab — HTTPS na LAN (nome .local e IP) pelo proxy do homelab (Traefik, proxy.sh).
 #
-#   sudo homelab-ca.sh                       # status (CA, certificado, integração com o Coolify)
+#   sudo homelab-ca.sh                       # status (CA, certificado, integração com o proxy)
 #   sudo homelab-ca.sh init                  # cria uma CA nova (só se não houver nenhuma)
 #   sudo homelab-ca.sh import CRT KEY        # usa uma CA existente (dispositivos que já confiam nela)
-#   sudo homelab-ca.sh issue [nome ...]      # emite o certificado da LAN e instala no Traefik do Coolify
+#   sudo homelab-ca.sh issue [nome ...]      # emite o certificado da LAN e instala no proxy
 #   sudo homelab-ca.sh renew                 # reemite se faltar menos de 30 dias (usado pelo timer semanal)
 #   sudo homelab-ca.sh export [ARQUIVO]      # exporta o certificado raiz para instalar em dispositivos
 #
@@ -16,7 +16,7 @@ set -Eeuo pipefail
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 ENV_FILE="$HOMELAB_DIR/infra/.env"
 CA_DIR="$HOMELAB_DIR/ca"
-COOLIFY_PROXY="${COOLIFY_PROXY_DIR:-/data/coolify/proxy}"
+PROXY_DIR="${PROXY_DIR:-$HOMELAB_DIR/proxy}"
 LEAF_DAYS="${LEAF_DAYS:-365}"         # dispositivos Apple aceitam no máximo 825 dias para CAs privadas
 RENEW_BEFORE_DAYS=30
 
@@ -103,26 +103,26 @@ EXT
 }
 
 install_traefik() {
-  if [[ ! -d "$COOLIFY_PROXY" ]]; then
-    echo "  Coolify não encontrado em $COOLIFY_PROXY — certificado salvo em $CA_DIR/lan.{crt,key}."
-    echo "  Depois de instalar o Coolify, rode: sudo $0 issue"
+  if [[ ! -d "$PROXY_DIR" ]]; then
+    echo "  Proxy não encontrado em $PROXY_DIR — certificado salvo em $CA_DIR/lan.{crt,key}."
+    echo "  Depois de instalar o proxy (sudo proxy.sh apply), rode: sudo $0 issue"
     return 0
   fi
-  install -d -m 755 "$COOLIFY_PROXY/certs" "$COOLIFY_PROXY/dynamic"
-  install -m 644 "$CA_DIR/lan.crt" "$COOLIFY_PROXY/certs/homelab-lan.crt"
-  install -m 600 "$CA_DIR/lan.key" "$COOLIFY_PROXY/certs/homelab-lan.key"
-  cat > "$COOLIFY_PROXY/dynamic/homelab-lan.yaml" <<'YAML'
+  install -d -m 755 "$PROXY_DIR/certs" "$PROXY_DIR/dynamic"
+  install -m 644 "$CA_DIR/lan.crt" "$PROXY_DIR/certs/homelab-lan.crt"
+  install -m 600 "$CA_DIR/lan.key" "$PROXY_DIR/certs/homelab-lan.key"
+  cat > "$PROXY_DIR/dynamic/homelab-lan.yaml" <<'YAML'
 # Gerado por homelab-ca.sh — certificado da LAN (CA do homelab). Não editar.
 # Também é o certificado PADRÃO: acessos pelo IP não enviam SNI e recebem este.
 tls:
   certificates:
-    - certFile: /traefik/certs/homelab-lan.crt
-      keyFile: /traefik/certs/homelab-lan.key
+    - certFile: /certs/homelab-lan.crt
+      keyFile: /certs/homelab-lan.key
   stores:
     default:
       defaultCertificate:
-        certFile: /traefik/certs/homelab-lan.crt
-        keyFile: /traefik/certs/homelab-lan.key
+        certFile: /certs/homelab-lan.crt
+        keyFile: /certs/homelab-lan.key
 
 http:
   middlewares:
@@ -141,7 +141,7 @@ http:
           - 192.168.0.0/16
           - 100.64.0.0/10
 YAML
-  log "Instalado no Traefik do Coolify (recarrega sozinho): $COOLIFY_PROXY/dynamic/homelab-lan.yaml"
+  log "Instalado no proxy (recarrega sozinho): $PROXY_DIR/dynamic/homelab-lan.yaml"
 }
 
 days_left() {
@@ -159,7 +159,7 @@ cmd_renew() {
     log "IP da LAN mudou para $ip — reemitindo"; cmd_issue
   else
     echo "Certificado válido por mais $left dias — nada a fazer"
-    [[ -d "$COOLIFY_PROXY" && ! -f "$COOLIFY_PROXY/dynamic/homelab-lan.yaml" ]] && install_traefik
+    [[ -d "$PROXY_DIR" && ! -f "$PROXY_DIR/dynamic/homelab-lan.yaml" ]] && install_traefik
   fi
   return 0
 }
@@ -188,8 +188,8 @@ cmd_status() {
   else
     echo "Certificado ... não emitido (issue)"
   fi
-  if [[ -f "$COOLIFY_PROXY/dynamic/homelab-lan.yaml" ]]; then
-    echo "Traefik ....... configurado ($COOLIFY_PROXY/dynamic/homelab-lan.yaml)"
+  if [[ -f "$PROXY_DIR/dynamic/homelab-lan.yaml" ]]; then
+    echo "Traefik ....... configurado ($PROXY_DIR/dynamic/homelab-lan.yaml)"
   else
     echo "Traefik ....... não configurado"
   fi
