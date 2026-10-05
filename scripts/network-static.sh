@@ -2,8 +2,8 @@
 # Fixa o IP do homelab na rede local (netplan), com reversão automática de segurança.
 #
 #   sudo network-static.sh                                   # mostra a rede atual e uma sugestão
-#   sudo network-static.sh 192.168.101.50/24                 # aplica (gateway e DNS detectados)
-#   sudo network-static.sh 192.168.101.50/24 --gateway 192.168.101.1 --dns "1.1.1.1 8.8.8.8"
+#   sudo network-static.sh 192.168.1.10/24                 # aplica (gateway e DNS detectados)
+#   sudo network-static.sh 192.168.1.10/24 --gateway 192.168.1.1 --dns "1.1.1.1 8.8.8.8"
 #   sudo network-static.sh --confirm                         # confirma (cancela a reversão)
 #   sudo network-static.sh --dhcp                            # volta para DHCP
 #
@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
     --dns)     DNS="${2:?informe os DNS}"; shift ;;
     --iface)   IFACE="${2:?informe a interface}"; shift ;;
     */*)       ADDR="$1" ;;
-    *) die "Argumento inválido: $1 (use IP/prefixo, ex.: 192.168.101.50/24)" ;;
+    *) die "Argumento inválido: $1 (use IP/prefixo, ex.: 192.168.1.10/24)" ;;
   esac
   shift
 done
@@ -150,6 +150,6 @@ netplan apply
 echo
 echo "✔ IP $ADDR aplicado em $IFACE."
 echo "  ⚠️  Confirme em até $(( REVERT_SECONDS / 60 )) minutos, conectando no IP NOVO:"
-echo "      ssh $(logname 2>/dev/null || echo eduardo)@${NEW_IP}"
+echo "      ssh $(logname 2>/dev/null || echo usuario)@${NEW_IP}"
 echo "      sudo $0 --confirm"
 echo "  Sem confirmação, a rede volta sozinha para a configuração anterior."

@@ -5,7 +5,8 @@
 #  Base:     Ubuntu servidor | SSH + fail2ban | UFW (+Docker) | mDNS | tampa fechada/TLP
 #  Dados:    Docker Engine + Compose | rede "devnet" | MySQL 8.4 + Adminer
 #            Redis 7 + RedisInsight | RabbitMQ 4 + Management | volumes persistentes
-#  Projetos: Coolify (PaaS self-hosted: deploy do GitHub, domínios, HTTPS, logs)
+#  Projetos: proxy Traefik do homelab (HTTPS na LAN + domínios com Let's Encrypt) e projetos
+#            em Docker Compose (/opt/homelab/apps) com deploy via GitHub Actions (runner)
 #  Extras:   CA local p/ HTTPS na LAN | backup diário + SSD externo | IP fixo
 #            preparação GitHub Actions (self-hosted)
 #
@@ -18,7 +19,7 @@ set -Eeuo pipefail
 
 # ------------------------------- Configuração --------------------------------
 # Todas as variáveis podem ser sobrescritas via ambiente:
-#   sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
+#   sudo HOMELAB_USER=usuario INSTALL_TLP=false ./homelab-setup.sh
 HOMELAB_USER="${HOMELAB_USER:-${SUDO_USER:-}}"
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 TIMEZONE="${TIMEZONE:-America/Sao_Paulo}"
@@ -44,10 +45,8 @@ PREPARE_GH_RUNNER="${PREPARE_GH_RUNNER:-true}"
 GH_RUNNER_USER="${GH_RUNNER_USER:-gh-runner}"
 GH_RUNNER_DIR="${GH_RUNNER_DIR:-/opt/actions-runner}"
 
-# Coolify (gerenciador de projetos). Instala só se as portas 80, 443, 8000 e 8080 estiverem livres.
-INSTALL_COOLIFY="${INSTALL_COOLIFY:-true}"
-COOLIFY_ADMIN_EMAIL="${COOLIFY_ADMIN_EMAIL:-admin@homelab.local}"
-COOLIFY_AUTOUPDATE="${COOLIFY_AUTOUPDATE:-false}"   # atualizações manuais (mais previsível)
+# Proxy reverso (Traefik) do homelab — portas 80/443. Ajustes finos em /opt/homelab/proxy/proxy.conf
+INSTALL_PROXY="${INSTALL_PROXY:-true}"
 
 # IP público fixo do provedor (informativo: status e README)
 PUBLIC_IP="${PUBLIC_IP:-}"
@@ -70,8 +69,6 @@ die()  { echo -e "${C_RED}  ✘ $*${C_RESET}" >&2; exit 1; }
 trap 'die "Falha na linha $LINENO (comando: $BASH_COMMAND). Veja $LOG_FILE"' ERR
 
 gen_secret() { openssl rand -hex 16; }
-# Senha aceita pelas regras do Coolify (maiúscula, minúscula, número e símbolo)
-gen_password() { echo "$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)Aa1-"; }
 
 apt_install() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$@" >/dev/null
@@ -211,10 +208,11 @@ SSHD_DROPIN="/etc/ssh/sshd_config.d/00-homelab.conf"
 # o serviço sobe, e sem ele o "sshd -t" falha com "Missing privilege separation directory".
 install -d -m 0755 /run/sshd
 
-# O Coolify gerencia o próprio host por SSH como root (chave gerada por ele), a partir dos
-# seus containers. Root: só com chave e só das redes Docker/loopback — nunca da LAN.
+# Root nunca entra por SSH. Exceção temporária: Coolify ainda instalado (versões antigas deste
+# homelab) — ele administra o host por SSH como root a partir dos containers. Some ao removê-lo
+# (proxy.sh remove-coolify) e rodar o setup de novo.
 ROOT_LOGIN="no"; ALLOW_USERS="${HOMELAB_USER}"
-if [[ "$INSTALL_COOLIFY" == "true" ]]; then
+if [[ -d /data/coolify/source ]]; then
   ROOT_LOGIN="prohibit-password"
   ALLOW_USERS="${HOMELAB_USER} root@10.0.0.0/8 root@172.16.0.0/12 root@127.0.0.1"
 fi
@@ -254,7 +252,7 @@ if ! systemctl restart ssh.service; then
 fi
 sleep 1
 ss -tln | grep -q ":${SSH_PORT} " || die "sshd não está escutando na porta ${SSH_PORT} — veja: journalctl -u ssh -n 30"
-ok "SSH na porta ${SSH_PORT} | usuário: ${HOMELAB_USER} | root: $([[ $ROOT_LOGIN == no ]] && echo bloqueado || echo 'só chave, só redes Docker (Coolify)') | senha: ${PASSWORD_AUTH}"
+ok "SSH na porta ${SSH_PORT} | usuário: ${HOMELAB_USER} | root: $([[ $ROOT_LOGIN == no ]] && echo bloqueado || echo 'só chave, só redes Docker (Coolify ainda instalado)') | senha: ${PASSWORD_AUTH}"
 if [[ "$PASSWORD_AUTH" == "yes" ]]; then
   warn "Login por senha ainda ativo. Copie sua chave (ssh-copy-id) e rode novamente com DISABLE_SSH_PASSWORD=true"
 fi
@@ -292,8 +290,7 @@ if ! command -v docker &>/dev/null || ! docker compose version &>/dev/null; then
 fi
 
 mkdir -p /etc/docker
-# default-address-pools igual ao padrão do Coolify: com o pool já definido, o instalador
-# dele mantém este arquivo (e o live-restore) em vez de reescrevê-lo.
+# default-address-pools: redes /24 em 10.0.0.0/8 (muitas redes pequenas, sem colidir com a LAN 192.168.x)
 cat > /etc/docker/daemon.json <<'EOF'
 {
   "log-driver": "json-file",
@@ -315,9 +312,13 @@ apt_install ufw
 ufw default deny incoming  >/dev/null
 ufw default allow outgoing >/dev/null
 ufw limit "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
-# SSH vindo dos containers do Coolify: sem rate-limit (ele abre várias conexões seguidas)
+# Regras de SSH que existiam só para o Coolify: mantidas enquanto ele estiver instalado
 for net in 10.0.0.0/8 172.16.0.0/12; do
-  ufw insert 1 allow proto tcp from "$net" to any port "${SSH_PORT}" comment 'SSH (Coolify)' >/dev/null 2>&1 || true
+  if [[ -d /data/coolify/source ]]; then
+    ufw insert 1 allow proto tcp from "$net" to any port "${SSH_PORT}" comment 'SSH (Coolify)' >/dev/null 2>&1 || true
+  else
+    ufw delete allow proto tcp from "$net" to any port "${SSH_PORT}" >/dev/null 2>&1 || true
+  fi
 done
 # mDNS (resolução de <hostname>.local) — apenas redes privadas
 for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12; do
@@ -443,9 +444,6 @@ BACKUP_KEEP_DAYS=7
 # Nomes extras no certificado da LAN (separados por espaço) — homelab-ca.sh
 HOMELAB_CA_EXTRA_NAMES=
 
-# Coolify — admin criado na instalação (usuário: admin)
-COOLIFY_ADMIN_EMAIL=${COOLIFY_ADMIN_EMAIL}
-COOLIFY_ADMIN_PASSWORD=$(gen_password)
 EOF
   ok "Credenciais geradas em $ENV_FILE"
 else
@@ -606,7 +604,7 @@ ok "Scripts em $HOMELAB_DIR/scripts: $(cd "$HOMELAB_DIR/scripts" && ls | tr '\n'
 # Backup diário às 03:00 (roda como root, log no journal, recupera execuções perdidas)
 cat > /etc/systemd/system/homelab-backup.service <<EOF
 [Unit]
-Description=Backup do homelab (MySQL, Redis, RabbitMQ, Coolify, configurações) + cópia para SSD externo
+Description=Backup do homelab (MySQL, Redis, RabbitMQ, configurações) + cópia para SSD externo
 Wants=docker.service
 After=docker.service
 
@@ -654,35 +652,31 @@ systemctl daemon-reload
 systemctl enable --now homelab-backup.timer homelab-ca-renew.timer >/dev/null 2>&1
 ok "Agendado: backup diário (03:00) e renovação semanal do certificado da LAN"
 
-# ============================== 12. Coolify ==================================
-step "12/13 Coolify (gerenciador de projetos)"
-COOLIFY_STATE="não instalado"
-if [[ "$INSTALL_COOLIFY" != "true" ]]; then
-  warn "Instalação do Coolify ignorada (INSTALL_COOLIFY=false)"
-elif [[ -f /data/coolify/source/.env ]]; then
-  COOLIFY_STATE="instalado"
-  ok "Coolify já instalado (atualize pelo painel ou: curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sudo bash)"
+# ======================= 12. Proxy (Traefik) + HTTPS na LAN =====================
+step "12/13 Proxy reverso (Traefik) e HTTPS na LAN"
+PROXY_STATE="não instalado"
+PROXY="$HOMELAB_DIR/scripts/proxy.sh"
+if [[ "$INSTALL_PROXY" != "true" ]]; then
+  warn "Proxy ignorado (INSTALL_PROXY=false)"
+elif docker ps --format '{{.Names}}' | grep -qx coolify-proxy; then
+  PROXY_STATE="pendente (Coolify ainda ocupa 80/443)"
+  warn "O Coolify ainda está ativo. Migre para o proxy do homelab:  sudo $PROXY migrate-coolify"
 else
   BUSY=()
-  for p in 80 443 8000 8080; do ss -tlnH "sport = :$p" | grep -q . && BUSY+=("$p"); done
+  for p in 80 443; do
+    ss -tlnH "sport = :$p" | grep -q . || continue
+    docker ps --filter "publish=$p" --format '{{.Names}}' | grep -qx traefik || BUSY+=("$p")
+  done
   if (( ${#BUSY[@]} )); then
-    COOLIFY_STATE="pendente (portas ${BUSY[*]} em uso)"
-    warn "Coolify NÃO instalado: portas em uso: ${BUSY[*]}"
+    PROXY_STATE="pendente (portas ${BUSY[*]} em uso)"
+    warn "Proxy NÃO instalado: portas em uso: ${BUSY[*]}"
     ss -tlnpH | grep -E ":($(IFS='|'; echo "${BUSY[*]}")) " | sed 's/^/    /' || true
-    warn "Libere as portas e rode o setup de novo (o Coolify precisa de 80, 443, 8000 e 8080)."
   else
-    curl -fsSL https://cdn.coollabs.io/coolify/install.sh -o /tmp/coolify-install.sh
-    ROOT_USERNAME=admin \
-    ROOT_USER_EMAIL="$(grep -m1 '^COOLIFY_ADMIN_EMAIL=' "$ENV_FILE" | cut -d= -f2-)" \
-    ROOT_USER_PASSWORD="$(grep -m1 '^COOLIFY_ADMIN_PASSWORD=' "$ENV_FILE" | cut -d= -f2-)" \
-    AUTOUPDATE="$COOLIFY_AUTOUPDATE" \
-      bash /tmp/coolify-install.sh
-    rm -f /tmp/coolify-install.sh
-    COOLIFY_STATE="instalado"
-    ok "Coolify instalado"
+    "$PROXY" apply
+    PROXY_STATE="no ar"
   fi
 fi
-# HTTPS na LAN: CA do homelab (nova ou importada) + certificado instalado no Traefik do Coolify
+# HTTPS na LAN: CA do homelab (nova ou importada) + certificado instalado no proxy
 CA="$HOMELAB_DIR/scripts/homelab-ca.sh"
 if [[ ! -s "$HOMELAB_DIR/ca/root.key" ]]; then
   if [[ -n "$CA_IMPORT_DIR" ]]; then
@@ -732,8 +726,8 @@ ${C_GREEN}=====================================================================
   Homelab pronto!  ${HOST}  (IP na LAN: ${IP})
 =====================================================================${C_RESET}
   SSH ............ ssh ${HOMELAB_USER}@${HOST} -p ${SSH_PORT}
-  Coolify ........ http://${HOST}:8000   [${COOLIFY_STATE}]
-                   admin: COOLIFY_ADMIN_EMAIL / COOLIFY_ADMIN_PASSWORD no .env
+  Proxy .......... Traefik nas portas 80/443   [${PROXY_STATE}]   (sudo ${HOMELAB_DIR}/scripts/proxy.sh)
+  Projetos ....... ${HOMELAB_DIR}/apps/<projeto>  (compose na rede "proxy"; deploy: GitHub Actions + runner)
   Adminer ........ http://${HOST}:$(grep -m1 '^ADMINER_PORT=' "$ENV_FILE" | cut -d= -f2)   (servidor: mysql)
   RedisInsight ... http://${HOST}:5540
   RabbitMQ UI .... http://${HOST}:15672

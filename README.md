@@ -1,6 +1,6 @@
 # Homelab — ThinkPad L14
 
-Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação limpa do Ubuntu Server**: Ubuntu endurecido, **stack de dados** (MySQL, Redis, RabbitMQ) em Docker e **Coolify** para hospedar e gerenciar os projetos (deploy do GitHub, domínios, HTTPS, logs, variáveis).
+Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação limpa do Ubuntu Server**: Ubuntu endurecido, **stack de dados** (MySQL, Redis, RabbitMQ) em Docker, **proxy Traefik** com HTTPS na LAN (CA própria) e domínios públicos (Let's Encrypt), e projetos em Docker Compose com **deploy pelo GitHub Actions**.
 
 ---
 
@@ -8,8 +8,8 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 
 | Camada | Componente | Porta | Acesso |
 |---|---|---|---|
-| Projetos | **Coolify** (PaaS self-hosted) | 8000 | `http://<host>:8000` |
-| Projetos | Proxy do Coolify (Traefik v3) | 80, 443 (+ 8080 painel do Traefik) | apps e domínios |
+| Projetos | **Proxy do homelab** (Traefik v3, `proxy.sh`) | 80, 443 (+ portas extras da LAN) | apps e domínios |
+| Projetos | Projetos em Docker Compose | — | `/opt/homelab/apps/<projeto>` |
 | Dados | MySQL 8.4 | 3306 | clientes MySQL / apps |
 | Dados | Adminer | **8088** | `http://<host>:8088` |
 | Dados | Redis 7 | 6379 | clientes Redis / apps |
@@ -17,10 +17,10 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 | Dados | RabbitMQ 4 (AMQP / Management) | 5672 / 15672 | `http://<host>:15672` |
 | Host | SSH | 22 | `ssh <usuario>@<host>` |
 
-`<host>` é o nome mDNS do L14 — `homelab-eduardo.local` — ou o IP fixo da LAN.
+`<host>` é o nome mDNS do L14 — `homelab.local` — ou o IP fixo da LAN.
 
 - A stack de dados fica em `/opt/homelab/infra` (compose `homelab`, rede `devnet`, volumes persistentes).
-- Tudo que roda em container é acessível **somente pela LAN** (seção 9.2). Para a internet, apenas 80/443 do proxy do Coolify, quando você ativar (seção 9.4).
+- Tudo que roda em container é acessível **somente pela LAN** (seção 9.2). Para a internet, apenas 80/443 do proxy, quando você ativar (seção 9.4).
 - HTTPS na LAN (nome `.local` **e** IP — inclusive tablets que acessam pelo IP) usa a **CA do homelab** (seção 8).
 
 ---
@@ -30,7 +30,7 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 1. **Ubuntu Server 24.04 LTS** instalado no L14 (22.04 também funciona; Ubuntu Desktop funciona, mas o script muda o boot para modo texto).
    - Na instalação, marque **"Install OpenSSH server"**.
 2. Um usuário comum com `sudo` (o que você criou na instalação).
-3. Hardware para o Coolify: **2 núcleos, 2 GB de RAM livres e 30 GB de disco** (além da stack de dados).
+3. Hardware: **2 núcleos e 4 GB de RAM** (stack de dados + projetos), **30 GB de disco** livres.
 4. **Conexão por cabo de rede** (recomendado; Wi-Fi funciona, mas é menos estável). O script ativa mDNS (`<hostname>.local`); para IP fixo na LAN use `network-static.sh` depois da instalação (seção 9.3).
 5. Notebook ligado na tomada.
 
@@ -51,7 +51,7 @@ Pressione **F1** no boot:
 No seu computador principal (macOS/Linux):
 
 ```bash
-ssh-keygen -t ed25519 -C "eduardo@homelab"   # se ainda não tiver chave
+ssh-keygen -t ed25519 -C "usuario@homelab"   # se ainda não tiver chave
 ssh-copy-id <usuario>@<IP-do-L14>
 ```
 
@@ -76,7 +76,7 @@ sudo reboot        # na primeira instalação
 ### Opções (variáveis de ambiente)
 
 ```bash
-sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-setup.sh
+sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 ```
 
 | Variável | Padrão | Descrição |
@@ -86,9 +86,7 @@ sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-set
 | `TIMEZONE` | `America/Sao_Paulo` | Fuso do sistema e containers |
 | `DOCKER_NETWORK` | `devnet` | Rede Docker da stack de dados |
 | `SSH_PORT` / `DISABLE_SSH_PASSWORD` | `22` / `auto` | SSH; `auto` desliga senha se já houver chave |
-| `INSTALL_COOLIFY` | `true` | Instala o Coolify (se 80, 443, 8000 e 8080 estiverem livres) |
-| `COOLIFY_ADMIN_EMAIL` | `admin@homelab.local` | E-mail do admin do Coolify (senha gerada no `.env`) |
-| `COOLIFY_AUTOUPDATE` | `false` | Atualizações automáticas do Coolify |
+| `INSTALL_PROXY` | `true` | Sobe o proxy Traefik do homelab (se 80 e 443 estiverem livres) |
 | `PUBLIC_IP` | — | IP público fixo do provedor (registrado no `.env`, informativo) |
 | `CA_IMPORT_DIR` | — | Pasta com `root.crt` e `root.key` de uma CA existente; sem ela, uma CA nova é criada |
 | `HEADLESS` | `true` | Desativa o boot gráfico |
@@ -105,15 +103,15 @@ sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-set
 | 1 | Sistema base | Atualizações, pacotes (git, jq, htop, tcpdump, netcat, rsync…), mDNS (`avahi`, só IPv4), timezone, atualizações de segurança automáticas, `sysctl` |
 | 2 | Modo servidor | Boot em modo texto |
 | 3 | Tampa / energia | Tampa ignorada, suspensão bloqueada, TLP (bateria 75–80%) |
-| 4 | SSH | Senha desligada se houver chave, fail2ban (LAN nunca é banida). **Root só por chave e só das redes Docker** — necessário para o Coolify gerenciar o próprio host |
-| 5 | Docker | Docker CE + Compose; `daemon.json` com logs rotativos, `live-restore` e pool `10.0.0.0/8` (o mesmo do Coolify, que assim não reescreve o arquivo) |
-| 6 | Firewall | UFW: entrada negada, SSH com rate-limit (exceto vindo do Coolify), mDNS na LAN; containers **só para redes privadas** |
+| 4 | SSH | Senha desligada se houver chave, fail2ban (LAN nunca é banida), **root bloqueado** |
+| 5 | Docker | Docker CE + Compose; `daemon.json` com logs rotativos, `live-restore` e pool `10.0.0.0/8` (redes /24) |
+| 6 | Firewall | UFW: entrada negada, SSH com rate-limit, mDNS na LAN; containers **só para redes privadas** |
 | 7 | Estrutura | Diretórios e `/etc/homelab.conf` (lido pelos scripts) |
 | 8 | Rede | `docker network create devnet` |
 | 9 | Stack de dados | `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf` |
 | 10 | Subida | `docker compose up --wait` |
 | 11 | Utilitários | `scripts/*.sh` → `/opt/homelab/scripts`; timers de backup (diário) e de renovação do certificado da LAN (semanal) |
-| 12 | Coolify + CA | Instalador oficial com admin já criado (sem cadastro aberto); CA do homelab criada (ou importada) e certificado da LAN instalado no Traefik |
+| 12 | Proxy + CA | Traefik do homelab (`proxy.sh apply`); CA do homelab criada (ou importada) e certificado da LAN instalado no proxy |
 | 13 | GitHub Actions | Usuário `gh-runner` e runner baixado (registro manual com token) |
 
 ---
@@ -127,10 +125,12 @@ sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-set
 │   ├── .env                    # credenciais (640 — NÃO versionar)
 │   └── mysql/{conf.d,init}/
 ├── ca/                         # CA do homelab + certificado da LAN (700, root)
-├── apps/                       # área livre para arquivos de projetos
+├── apps/<projeto>/             # compose, .env e rotas públicas de cada projeto
+├── proxy/                      # Traefik: proxy.conf, compose gerado, dynamic/, certs/, acme/
 ├── backups/                    # backups diários (750 root:<seu grupo>)
 └── scripts/
     ├── status.sh               # visão geral
+    ├── proxy.sh                # proxy Traefik (portas, Let's Encrypt, versão, migração do Coolify)
     ├── homelab-ca.sh           # CA e HTTPS na LAN
     ├── backup.sh / restore.sh  # backup e restauração
     ├── backup-disk-setup.sh    # prepara o SSD externo
@@ -139,8 +139,6 @@ sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-set
     ├── public-route.sh         # publica serviços de um compose por domínio (labels Traefik)
     └── register-runner.sh      # registra o runner do GitHub
 
-/data/coolify/                  # Coolify (gerenciado por ele)
-└── proxy/{dynamic,certs}/      # Traefik: config dinâmica e certificados
 /etc/homelab.conf               # configuração lida pelos scripts
 /var/log/homelab-setup.log
 ```
@@ -154,42 +152,81 @@ scripts/                        # utilitários instalados em /opt/homelab/script
 
 ---
 
-## 7. Coolify — hospedando os projetos
+## 7. Projetos — proxy, rotas e deploy
 
-### 7.1 Primeiro acesso
-
-1. Abra `http://homelab-eduardo.local:8000`.
-2. Se o proxy aparecer parado em **Servers → localhost → Proxy**, clique em **Start Proxy**.
-3. Login: **e-mail** `COOLIFY_ADMIN_EMAIL` e **senha** `COOLIFY_ADMIN_PASSWORD` — `sudo grep COOLIFY /opt/homelab/infra/.env`. O admin é criado na instalação; não há tela de cadastro aberta na LAN.
-4. Em **Servers → localhost**, clique em **Validate Server** — o Coolify conecta no próprio host por SSH como root (chave dele, só a partir das redes Docker).
-5. Ative **2FA** no seu perfil.
-
-> Atualizações automáticas do Coolify vêm desligadas (`COOLIFY_AUTOUPDATE=false`): atualize pelo painel quando quiser, de preferência após um backup.
-
-### 7.2 Deploy de uma API ASP.NET Core
-
-No Coolify: **Projects → New → Application → Public/Private Repository (GitHub)**.
-
-| Configuração | Valor | Por quê |
-|---|---|---|
-| **Build Pack** | **Dockerfile** | Evite o Nixpacks automático: o .NET se comporta muito melhor com o Dockerfile oficial da Microsoft |
-| **Ports Exposes** | **8080** | Imagens .NET 8+ escutam na 8080 por padrão (`ASPNETCORE_HTTP_PORTS`); a porta tem que bater com o `EXPOSE` do Dockerfile |
-| **Health Check** | `/health` | Com `app.MapHealthChecks("/health")` |
-| **Environment Variables** | ver abaixo | Configuração por ambiente, fora do repositório |
-
-Variáveis recomendadas:
+Cada projeto roda em **Docker Compose próprio** em `/opt/homelab/apps/<projeto>`. O código fica no GitHub; no servidor ficam só o `docker-compose.yml`, o `.env` (segredos) e as rotas públicas geradas pelo `public-route.sh`. O **proxy do homelab** (Traefik v3) recebe as conexões e encaminha para os containers pelas **labels** de cada serviço.
 
 ```text
-ASPNETCORE_ENVIRONMENT=Production
-ASPNETCORE_FORWARDEDHEADERS_ENABLED=true      # atrás do Traefik: esquema/IP reais do cliente
-ConnectionStrings__Default=Server=192.168.101.28;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
-Redis__Configuration=192.168.101.28:6379,password=<REDIS_PASSWORD>
-RabbitMQ__Uri=amqp://admin:<RABBITMQ_DEFAULT_PASS>@192.168.101.28:5672/
+LAN  (nome .local / IP, portas 443 e extras) ─┐
+                                              ├─► Traefik (proxy.sh) ─► containers dos projetos (rede "proxy")
+Internet (domínio, 80/443, Let's Encrypt) ────┘                          └─► MySQL/Redis/RabbitMQ (rede "devnet")
 ```
 
-> As apps do Coolify ficam em redes próprias; o caminho simples até MySQL/Redis/RabbitMQ é o **IP fixo do L14 na LAN** (o firewall libera as redes Docker). Use o IP, não o `.local` — containers não resolvem mDNS.
+### 7.1 Proxy (Traefik) — `proxy.sh`
 
-Dockerfile de referência (multi-stage, solução com Clean Architecture):
+```bash
+sudo /opt/homelab/scripts/proxy.sh                         # status (versão, portas, certificados)
+sudo /opt/homelab/scripts/proxy.sh entrypoint add pdv 8081 # porta extra na LAN (labels: entrypoints=pdv)
+sudo /opt/homelab/scripts/proxy.sh entrypoint remove pdv
+sudo /opt/homelab/scripts/proxy.sh acme tls                # Let's Encrypt pela 443 (padrão) | acme http (porta 80)
+sudo /opt/homelab/scripts/proxy.sh image traefik:v3.7      # atualiza o Traefik
+sudo /opt/homelab/scripts/proxy.sh logs                    # erros e ACME dos últimos 30 min
+sudo /opt/homelab/scripts/proxy.sh apply                   # aplica proxy.conf editado à mão
+```
+
+| Arquivo (`/opt/homelab/proxy/`) | Conteúdo |
+|---|---|
+| `proxy.conf` | Configuração: imagem, rede, portas extras (`PROXY_ENTRYPOINTS`), desafio do Let's Encrypt, e-mail |
+| `docker-compose.yml` | **Gerado** pelo `proxy.sh` — não edite |
+| `dynamic/` | Configuração dinâmica (certificado e middlewares da LAN gerados pelo `homelab-ca.sh`; rotas em arquivo, se houver) |
+| `certs/` | Certificado da LAN (CA do homelab) |
+| `acme/acme.json` | Certificados Let's Encrypt (600) |
+
+- Container `traefik`, rede Docker `proxy`. Painel/API do Traefik desligados: nada além de 80, 443 e as portas extras.
+- Toda alteração passa por validação; se o proxy não ficar saudável, a configuração anterior volta sozinha.
+- O `homelab-setup.sh` roda o `apply` na etapa 12.
+
+### 7.2 Estrutura de um projeto
+
+`/opt/homelab/apps/minhaapi/docker-compose.yml`:
+
+```yaml
+services:
+  api:
+    image: ghcr.io/eduferrari/minhaapi-api:latest    # imagem publicada pelo GitHub Actions (7.5)
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_FORWARDEDHEADERS_ENABLED: "true"     # atrás do Traefik: esquema/IP reais do cliente
+    networks: [default, proxy, devnet]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      # LAN: https://homelab.local e https://<IP> (certificado da CA do homelab)
+      - traefik.http.routers.minhaapi.entrypoints=https
+      - traefik.http.routers.minhaapi.rule=Host(`homelab.local`) || Host(`192.168.1.10`)
+      - traefik.http.routers.minhaapi.tls=true
+      - traefik.http.routers.minhaapi.middlewares=homelab-lan-only@file
+      - traefik.http.routers.minhaapi.service=minhaapi
+      - traefik.http.services.minhaapi.loadbalancer.server.port=8080
+
+networks:
+  proxy:
+    external: true
+  devnet:
+    external: true      # MySQL, Redis e RabbitMQ pelo nome: mysql, redis, rabbitmq
+```
+
+`.env` do projeto (no servidor, nunca no Git):
+
+```text
+ConnectionStrings__Default=Server=mysql;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
+Redis__Configuration=redis:6379,password=<REDIS_PASSWORD>
+RabbitMQ__Uri=amqp://admin:<RABBITMQ_DEFAULT_PASS>@rabbitmq:5672/
+```
+
+Dockerfile de referência (.NET 8, multi-stage — imagens .NET 8+ escutam na **8080**):
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -208,91 +245,115 @@ USER $APP_UID
 ENTRYPOINT ["dotnet", "Api.dll"]
 ```
 
-### 7.3 Domínios e HTTPS
+> A imagem `aspnet` não tem `curl`. Se usar `HEALTHCHECK`, instale-o: container *unhealthy* é ignorado pelo Traefik (`no available server`).
 
-| Onde a app vai responder | Como configurar |
-|---|---|
-| **Internet**, com domínio próprio | Em **Domains**: `https://api.seudominio.com.br`. O Traefik emite Let's Encrypt sozinho. Exige seção 9.4 (portas no roteador, DNS, `public-access.sh enable`) |
-| **LAN**, pelo nome ou IP, em porta própria | Labels do Traefik (seção 7.5) com o middleware `homelab-lan-only@file`. O certificado da CA do homelab é servido automaticamente |
+### 7.3 Rotas na LAN
 
-> No Coolify, uma porta dentro do domínio (`https://app.exemplo.com:3000`) indica a **porta do container**, não uma porta externa. Portas externas além de 80/443 exigem *entrypoints* extras no proxy (seção 7.4).
+- **Pelo nome e pelo IP na 443:** entrypoint `https` com ``Host(`homelab.local`) || Host(`192.168.1.10`)`` (exemplo acima). Acessos pelo IP não enviam SNI e recebem o certificado padrão da CA do homelab (seção 8).
+- **Em porta própria** (ex.: um sistema por porta): crie o entrypoint e use ``PathPrefix(`/`)``:
+  ```bash
+  sudo /opt/homelab/scripts/proxy.sh entrypoint add pdv 8081
+  ```
+  ```text
+  traefik.http.routers.pdv.entrypoints=pdv
+  traefik.http.routers.pdv.rule=PathPrefix(`/`)
+  traefik.http.routers.pdv.tls=true
+  traefik.http.routers.pdv.middlewares=homelab-lan-only@file
+  traefik.http.routers.pdv.service=pdv
+  traefik.http.services.pdv.loadbalancer.server.port=80
+  ```
+- `homelab-lan-only@file` (aceita só redes privadas e Tailscale) e `homelab-redirect-https@file` vêm de `/opt/homelab/proxy/dynamic/homelab-lan.yaml`, gerado pelo `homelab-ca.sh`.
+- Em APIs com **SSE**, não use middleware de compressão (o stream precisa sair sem buffer).
+- Portas extras de containers só aceitam a LAN (seção 9.2).
 
-### 7.4 Portas extras no proxy (ex.: 8081–8083)
+### 7.4 Domínio público
 
-Para servir sistemas em portas próprias na LAN (como o MesaFácil), adicione entrypoints ao Traefik:
+Com as rotas da LAN funcionando, publicar na internet é um comando na pasta do projeto (`public-route.sh`, seção 9.4):
 
-**Servers → localhost → Proxy → Configuration**, no `docker-compose` do proxy:
-
-```yaml
-    ports:
-      # ...mantenha 80, 443 e 8080 e acrescente:
-      - '8081:8081'
-      - '8082:8082'
-      - '8083:8083'
-    command:
-      # ...mantenha os existentes e acrescente:
-      - '--entrypoints.p8081.address=:8081'
-      - '--entrypoints.p8082.address=:8082'
-      - '--entrypoints.p8083.address=:8083'
+```bash
+cd /opt/homelab/apps/minhaapi
+/opt/homelab/scripts/public-route.sh add api api.seudominio.com.br
 ```
 
-Salve e **Restart Proxy**. As portas publicadas por containers ficam acessíveis só pela LAN (seção 9.2).
+### 7.5 Deploy automático (GitHub Actions + runner no L14)
 
-### 7.5 Rotas na LAN com labels
+O runner self-hosted (seção 12) busca os jobs no GitHub, então nenhuma porta precisa ser aberta. O build roda na nuvem do GitHub e publica a imagem no GHCR; o job de deploy, no L14, só baixa a imagem e recria os containers.
 
-Em uma aplicação/serviço do Coolify (**Container Labels**), sem preencher *Domains*:
+Preparação (uma vez por projeto):
+1. Registre o runner no repositório (seção 12). Use **só em repositório privado**.
+2. O runner (`gh-runner`) precisa ler o compose e o `.env`:
+   ```bash
+   cd /opt/homelab/apps/minhaapi
+   sudo chgrp docker docker-compose*.yml .env && sudo chmod 640 .env
+   ```
+3. Proteja a `main` (*Settings → Branches → Require a pull request*): o deploy acontece no merge do PR.
 
-```text
-traefik.enable=true
-traefik.http.routers.pdv.entrypoints=p8081
-traefik.http.routers.pdv.rule=PathPrefix(`/`)
-traefik.http.routers.pdv.tls=true
-traefik.http.routers.pdv.middlewares=homelab-lan-only@file
-traefik.http.services.pdv.loadbalancer.server.port=80
-```
-
-`homelab-lan-only@file` e o certificado padrão vêm de `/data/coolify/proxy/dynamic/homelab-lan.yaml`, gerado pelo `homelab-ca.sh` (seção 8).
-
-Para acessar pelo **IP** além do nome, use ``rule=Host(`homelab-eduardo.local`) || Host(`192.168.101.28`)`` no entrypoint `https`, ou ``PathPrefix(`/`)`` numa porta extra. Em APIs com SSE, **não** use o middleware de compressão (o stream precisa sair sem buffer).
-
-Containers que **não** são gerenciados pelo Coolify (compose próprio) usam as mesmas labels: basta estarem na rede `coolify` (`networks: [default, coolify]` + `coolify: external: true`) com `traefik.docker.network=coolify`. Para publicá-los na internet, veja `public-route.sh` (seção 9.4).
-
-### 7.6 Deploy automático a partir do GitHub
-
-| Opção | Requisito |
-|---|---|
-| **GitHub App do Coolify** (push → deploy) | O GitHub precisa alcançar o webhook do Coolify pela internet: domínio público para o Coolify (*Settings → Instance's Domain*) + seção 9.4 |
-| **Runner self-hosted + API do Coolify** (sem expor nada) | Runner registrado no L14 (seção 12) chama a API local |
-
-API: **Settings → Advanced → API Access** ligado e um token em **Keys & Tokens → API tokens**. Salve como secrets do repositório: `COOLIFY_TOKEN` e `COOLIFY_APP_UUID` (UUID na URL da aplicação no Coolify).
+`.github/workflows/deploy.yml` no repositório do projeto:
 
 ```yaml
-# .github/workflows/deploy.yml
-name: build-and-deploy
+name: deploy
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+
+concurrency: { group: deploy-homelab, cancel-in-progress: false }
+permissions: { contents: read, packages: write }
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: docker/build-push-action@v6
         with:
-          dotnet-version: 8.0.x
-      - run: dotnet test --configuration Release
+          context: .
+          file: src/Api/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/eduferrari/minhaapi-api:latest
+            ghcr.io/eduferrari/minhaapi-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   deploy:
-    needs: test
+    needs: build
     runs-on: [self-hosted, homelab]
+    environment: production          # opcional: aprovação manual em Settings → Environments
+    defaults:
+      run:
+        working-directory: /opt/homelab/apps/minhaapi
     steps:
-      - name: Deploy no Coolify
-        run: |
-          curl -fsS -X POST \
-            -H "Authorization: Bearer ${{ secrets.COOLIFY_TOKEN }}" \
-            "http://localhost:8000/api/v1/deploy?uuid=${{ secrets.COOLIFY_APP_UUID }}"
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - run: docker compose pull && docker compose up -d --no-build && docker image prune -f
+      - run: sleep 15 && docker compose ps && test -z "$(docker compose ps --status exited -q)"
+      - if: always()
+        run: docker logout ghcr.io
 ```
+
+- Só os serviços com imagem nova são recriados; o `.env` e as rotas públicas do servidor continuam valendo.
+- Para voltar uma versão, troque `latest` pela tag do commit (`:<sha>`) no compose e rode `docker compose up -d`.
+
+### 7.6 Migrando de um homelab com Coolify
+
+Versões anteriores deste homelab usavam o Coolify (e o Traefik dele). A migração aproveita os certificados Let's Encrypt, as portas extras da LAN, a CA e as rotas dos projetos:
+
+```bash
+cd ~/homelab && git pull
+sudo ./homelab-setup.sh                               # instala os scripts novos (o proxy fica pendente)
+sudo /opt/homelab/scripts/proxy.sh migrate-coolify    # backup do Coolify, importa config, troca o proxy (segundos fora do ar)
+# teste a LAN (443 e portas extras) e os domínios públicos
+sudo /opt/homelab/scripts/proxy.sh rollback-coolify   # só se algo der errado: volta ao Coolify
+sudo /opt/homelab/scripts/proxy.sh remove-coolify     # com tudo certo: remove o Coolify (pede confirmação)
+sudo ./homelab-setup.sh                               # fecha o SSH de root e as regras de firewall do Coolify
+```
+
+- O backup do Coolify (banco + `/data/coolify`) fica em `/opt/homelab/backups/coolify-final-<data>/`.
+- Projetos que usam a rede `coolify` continuam funcionando, porque o proxy também entra nela (`PROXY_EXTRA_NETWORKS="coolify"`). Para padronizar, troque `coolify` por `proxy` no compose do projeto (em `networks` e em `traefik.docker.network`) e rode `docker compose up -d`. Depois de migrar todos, remova `coolify` de `PROXY_EXTRA_NETWORKS` e rode `proxy.sh apply`.
 
 ---
 
@@ -300,26 +361,26 @@ jobs:
 
 Apps na LAN são acessadas pelo nome `.local` e pelo **IP** (tablets Android não resolvem `.local` de forma confiável). Uma CA própria, instalada uma vez em cada dispositivo, emite o certificado da LAN, que o Traefik usa:
 
-- para os nomes do certificado (`homelab-eduardo.local`, IP da LAN, extras);
+- para os nomes do certificado (`homelab.local`, IP da LAN, extras);
 - **como certificado padrão**: quem acessa pelo IP não envia SNI, e o Traefik responde com este certificado — mesmo atrás do NAT do Docker (validado com Traefik v3 real).
 
 ```bash
 sudo /opt/homelab/scripts/homelab-ca.sh                    # status
 sudo /opt/homelab/scripts/homelab-ca.sh export             # exporta o raiz (para instalar nos dispositivos) e mostra o SHA-256
-sudo /opt/homelab/scripts/homelab-ca.sh issue              # reemite e reinstala no Traefik do Coolify
+sudo /opt/homelab/scripts/homelab-ca.sh issue              # reemite e reinstala no proxy
 sudo /opt/homelab/scripts/homelab-ca.sh init               # CA nova (só se não houver nenhuma)
 sudo /opt/homelab/scripts/homelab-ca.sh import root.crt root.key   # CA existente (só se não houver nenhuma)
 ```
 
 - O setup **cria a CA automaticamente** (ou importa a de `CA_IMPORT_DIR`) e emite o certificado da LAN.
 - Certificado da LAN: 365 dias; o timer semanal `homelab-ca-renew` reemite quando faltam < 30 dias **ou quando o IP muda**.
-- Nomes extras: `HOMELAB_CA_EXTRA_NAMES="pdv.local 192.168.101.29"` no `.env` + `issue`.
+- Nomes extras: `HOMELAB_CA_EXTRA_NAMES="pdv.local 192.168.1.11"` no `.env` + `issue`.
 - A chave da CA fica em `/opt/homelab/ca/root.key` (600, root) e entra no backup (`config.tar.gz`). **Não a perca**: uma CA nova exige reinstalar o raiz em todos os dispositivos.
 
 Instalar o raiz no Mac:
 
 ```bash
-scp eduardo@homelab-eduardo.local:/opt/homelab/ca/homelab-root-ca.crt .   # após "export"
+scp usuario@homelab.local:/opt/homelab/ca/homelab-root-ca.crt .   # após "export"
 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain homelab-root-ca.crt
 ```
 
@@ -335,8 +396,8 @@ O L14 responde como `<hostname>.local` (só IPv4). macOS, Windows 10+ e Linux co
 
 ### 9.2 Firewall
 
-- UFW: entrada negada por padrão; SSH com rate-limit (sem limite para as redes Docker, de onde o Coolify conecta); mDNS só da LAN.
-- O Docker publica portas ignorando o UFW. O bloco *ufw-docker* em `/etc/ufw/after.rules` (cadeia `DOCKER-USER`) faz **toda porta de container aceitar só redes privadas** (`10/8`, `172.16/12`, `192.168/16`, `100.64/10` — Tailscale). Vale para MySQL, Redis, RabbitMQ, Coolify (8000) e o proxy (80/443/8080).
+- UFW: entrada negada por padrão; SSH com rate-limit; mDNS só da LAN.
+- O Docker publica portas ignorando o UFW. O bloco *ufw-docker* em `/etc/ufw/after.rules` (cadeia `DOCKER-USER`) faz **toda porta de container aceitar só redes privadas** (`10/8`, `172.16/12`, `192.168/16`, `100.64/10` — Tailscale). Vale para MySQL, Redis, RabbitMQ e o proxy (80/443 e portas extras).
 - Acesso pela internet: só via `public-access.sh` (seção 9.4).
 
 ```bash
@@ -350,7 +411,7 @@ O roteador encaminha o IP público para **um IP da LAN**; por isso o L14 precisa
 
 ```bash
 sudo /opt/homelab/scripts/network-static.sh                       # rede atual e sugestão
-sudo /opt/homelab/scripts/network-static.sh 192.168.101.28/24     # fixa (gateway e DNS detectados)
+sudo /opt/homelab/scripts/network-static.sh 192.168.1.10/24     # fixa (gateway e DNS detectados)
 ```
 
 - Escolha um IP **fora da faixa de DHCP** do roteador; o script confere com `arping` se ninguém o usa.
@@ -358,27 +419,27 @@ sudo /opt/homelab/scripts/network-static.sh 192.168.101.28/24     # fixa (gatewa
 - **5 minutos** para conectar no IP novo e confirmar; sem confirmação, a rede volta sozinha:
 
 ```bash
-ssh eduardo@192.168.101.28
+ssh usuario@192.168.1.10
 sudo /opt/homelab/scripts/network-static.sh --confirm
 cd ~/homelab && sudo ./homelab-setup.sh && sudo /opt/homelab/scripts/homelab-ca.sh issue
 ```
 
 Voltar para DHCP: `sudo /opt/homelab/scripts/network-static.sh --dhcp`.
 
-### 9.4 Acesso pela internet — IP público fixo `177.101.139.43`
+### 9.4 Acesso pela internet — IP público fixo
 
 ```text
-Internet ─► api.seudominio.com.br (DNS A) ─► 177.101.139.43 (roteador/ONT)
-         ─► 80/443 encaminhadas ─► 192.168.101.28 (L14) ─► Traefik (Coolify) ─► app
+Internet ─► api.seudominio.com.br (DNS A) ─► 203.0.113.10 (roteador/ONT)
+         ─► 80/443 encaminhadas ─► 192.168.1.10 (L14) ─► Traefik (proxy.sh) ─► app
 ```
 
-Nos exemplos, `api.seudominio.com.br` e `app.seudominio.com.br` são domínios do seu projeto.
+Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o IP fixo do L14 na LAN e `api`/`app.seudominio.com.br` domínios do seu projeto.
 
-1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `177.101.139.43` para `192.168.101.28` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, 8000, 8080, 3306, 6379, 5672 nem 15672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
+1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, 3306, 6379, 5672 nem 15672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
 2. **DNS** (zona do seu domínio, ex.: Registro.br) — um registro por subdomínio:
    ```text
-   api   A   177.101.139.43   TTL 300
-   app   A   177.101.139.43   TTL 300
+   api   A   203.0.113.10   TTL 300
+   app   A   203.0.113.10   TTL 300
    ```
 3. **Firewall do L14:**
    ```bash
@@ -387,7 +448,7 @@ Nos exemplos, `api.seudominio.com.br` e `app.seudominio.com.br` são domínios d
    Cria regras `ufw route` para 80/443 (o proxy é um container, por isso regras de *route*). O resto continua só na LAN.
 4. **Rota pública para a app** — escolha **um** caminho por domínio (dois lugares declarando o mesmo domínio geram conflito):
 
-   - **App gerenciada pelo Coolify:** no serviço, *Domains* = `https://api.seudominio.com.br:8080` (o `:8080` é a porta **interna** do container; não aparece na URL). O Traefik emite o Let's Encrypt sozinho (desafio HTTP-01 pela porta 80; se a 80 não puder ser encaminhada, `public-access.sh acme-tls` troca para TLS-ALPN-01, só pela 443).
+   - **Certificado:** o Traefik emite o Let's Encrypt sozinho. Padrão: desafio TLS-ALPN-01, **só pela porta 443** (funciona mesmo se a 80 for do roteador); `sudo proxy.sh acme http` troca para HTTP-01 (porta 80).
    - **App em Docker Compose próprio:** use o `public-route.sh` na pasta do projeto — ele lê as labels Traefik que o serviço já tem (nome do serviço Traefik, middlewares), gera as rotas públicas no `docker-compose.override.yml` e recria só os serviços afetados. O `docker-compose.yml` do projeto não é alterado e as rotas da LAN continuam iguais.
      ```bash
      cd /opt/homelab/apps/<projeto>
@@ -397,9 +458,9 @@ Nos exemplos, `api.seudominio.com.br` e `app.seudominio.com.br` são domínios d
      /opt/homelab/scripts/public-route.sh check           # testa cada domínio e aponta conflitos
      /opt/homelab/scripts/public-route.sh remove web      # despublica
      ```
-     Requisitos do serviço: container rodando, na rede `coolify`, com `traefik.enable=true` e `traefik.http.services.<nome>.loadbalancer.server.port`. O middleware `homelab-lan-only` não vai para a rota pública; os demais (cabeçalhos, compressão) sim. Se já existir um `docker-compose.override.yml` feito à mão, o script para; revise-o e rode com `--force` (faz backup).
+     Requisitos do serviço: container rodando, na rede do proxy (`proxy`), com `traefik.enable=true` e `traefik.http.services.<nome>.loadbalancer.server.port`. O middleware `homelab-lan-only` não vai para a rota pública; os demais (cabeçalhos, compressão) sim. Se já existir um `docker-compose.override.yml` feito à mão, o script para; revise-o e rode com `--force` (faz backup).
 
-     **Conflitos** que o `check` aponta: recursos do Coolify com o mesmo domínio (a regra deles, `Host(...) && PathPrefix(/)`, é mais longa e **vence** — se o container estiver parado/reiniciando, o resultado é `no available server`) e labels esquecidas no `coolify-proxy`.
+     **Conflitos** que o `check` aponta: containers de outros projetos com o mesmo domínio (regra mais longa, como `Host(...) && PathPrefix(/)`, **vence**; se esse container estiver parado ou reiniciando, o resultado é `no available server`) e rotas em arquivo em `/opt/homelab/proxy/dynamic`.
 5. **Diagnóstico:**
    ```bash
    sudo /opt/homelab/scripts/public-access.sh check api.seudominio.com.br
@@ -413,7 +474,7 @@ Nos exemplos, `api.seudominio.com.br` e `app.seudominio.com.br` são domínios d
 builder.Services.Configure<ForwardedHeadersOptions>(o =>
 {
     o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
-    o.KnownNetworks.Clear();   // proxy na rede Docker do Coolify
+    o.KnownNetworks.Clear();   // proxy na rede Docker "proxy"
     o.KnownProxies.Clear();
 });
 // ...
@@ -422,7 +483,7 @@ app.UseForwardedHeaders();     // antes de UseHttpsRedirection / autenticação
 
 > **NAT loopback:** muitos roteadores não deixam acessar o próprio IP público de dentro da LAN — o domínio pode abrir só de fora. Dispositivos da LAN continuam pelas rotas locais (nome `.local` ou IP e porta da LAN).
 >
-> **Exposição:** confira autenticação em todos os endpoints e use rate limiting (`AddRateLimiter`) nos públicos. Para administrar de fora de casa, use **Tailscale** (já liberado: `100.64.0.0/10`) em vez de expor o painel do Coolify (porta 8000).
+> **Exposição:** confira autenticação em todos os endpoints e use rate limiting (`AddRateLimiter`) nos públicos. Para administrar de fora de casa, use **Tailscale** (já liberado: `100.64.0.0/10`) em vez de expor qualquer painel.
 
 ---
 
@@ -442,12 +503,12 @@ Connection strings:
 
 ```text
 # Do seu Mac / Rider (pelo nome ou IP)
-MySQL     Server=homelab-eduardo.local;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
-Redis     homelab-eduardo.local:6379,password=<REDIS_PASSWORD>
-RabbitMQ  amqp://admin:<RABBITMQ_DEFAULT_PASS>@homelab-eduardo.local:5672/
+MySQL     Server=homelab.local;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
+Redis     homelab.local:6379,password=<REDIS_PASSWORD>
+RabbitMQ  amqp://admin:<RABBITMQ_DEFAULT_PASS>@homelab.local:5672/
 
-# De apps no Coolify (pelo IP fixo da LAN)
-MySQL     Server=192.168.101.28;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
+# De outros projetos sem a rede devnet (pelo IP fixo da LAN)
+MySQL     Server=192.168.1.10;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
 
 # De containers na rede devnet (compose próprio)
 MySQL     Server=mysql;Port=3306;...      Redis  redis:6379,...      RabbitMQ  amqp://...@rabbitmq:5672/
@@ -479,8 +540,7 @@ Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd,
 | `mysql-all.sql.gz` | Todos os bancos, usuários, rotinas, triggers e eventos | `mysqldump --single-transaction` (sem travar as tabelas) — validado pela linha `Dump completed` |
 | `redis-dump.rdb.gz` | Snapshot do Redis | `BGSAVE` consistente, sem parar o serviço |
 | `rabbitmq-definitions.json` | vhosts, usuários, permissões, filas, exchanges, bindings, policies | `rabbitmqctl export_definitions` |
-| `coolify-db.dump`, `coolify-data.tar.gz` | Banco do Coolify (projetos, apps, variáveis, domínios) e `/data/coolify` (APP_KEY, chaves SSH, proxy) | `pg_dump` + `tar` — volumes de dados das apps **não** entram |
-| `config.tar.gz` | `.env`, compose, `my.cnf`, **CA do homelab** (`/opt/homelab/ca`), SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do systemd, e de cada projeto em `/opt/homelab/apps/<projeto>`: compose, overrides, `.env` e `public-routes.conf` (sem código-fonte nem volumes) | `tar` |
+| `config.tar.gz` | `.env`, compose, `my.cnf`, **CA do homelab** (`/opt/homelab/ca`), **proxy** (`proxy.conf`, `dynamic/`, certificados Let's Encrypt), SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do systemd, e de cada projeto em `/opt/homelab/apps/<projeto>`: compose, overrides, `.env` e `public-routes.conf` (sem código-fonte nem volumes) | `tar` |
 | `SHA256SUMS` | Checksums de todos os arquivos | conferidos antes de qualquer restauração |
 
 **Não entram no backup:** mensagens que estão nas filas do RabbitMQ (só as definições), código dos projetos (fica no Git), registro do runner do GitHub (registre de novo) e preferências do RedisInsight.
@@ -508,7 +568,6 @@ ls -l /opt/homelab/backups/                          # backups disponíveis
 sudo /opt/homelab/scripts/restore.sh latest mysql
 sudo /opt/homelab/scripts/restore.sh 2026-10-01_030512 redis
 sudo /opt/homelab/scripts/restore.sh latest rabbitmq
-sudo /opt/homelab/scripts/restore.sh latest coolify  # extrai e mostra o procedimento oficial
 sudo /opt/homelab/scripts/restore.sh latest config   # só extrai em /tmp para comparar — não sobrescreve nada
 ```
 
@@ -517,7 +576,6 @@ sudo /opt/homelab/scripts/restore.sh latest config   # só extrai em /tmp para c
 | `mysql` | Sobrescreve todos os bancos **e usuários** com o dump |
 | `redis` | Para o Redis, troca os dados do volume, carrega o snapshot sem AOF, regenera o AOF a partir da memória e sobe de novo (*trocar só o `dump.rdb` não funciona com AOF ativo — o Redis ignoraria o snapshot*) |
 | `rabbitmq` | Importa as definições (mescla com as existentes) |
-| `coolify` | Guiado: extrai banco e `/data/coolify` e mostra os passos (APP_KEY, `pg_restore`) |
 | `config` | Só extrai — a CA fica em `opt/homelab/ca` dentro do pacote |
 
 ### SSD externo
@@ -565,7 +623,7 @@ sudo /opt/homelab/scripts/restore.sh /mnt/backup-ssd/homelab/latest redis
 
 **Desconectar o SSD com segurança:** `sudo umount /mnt/backup-ssd` antes de remover.
 
-> ⚠️ O SSD guarda segredos sem criptografia (`.env`, chave privada da CA, senha do Wi-Fi, chave APP_KEY do Coolify). Guarde-o como guardaria as senhas.
+> ⚠️ O SSD guarda segredos sem criptografia (`.env`, chave privada da CA, senha do Wi-Fi, certificados Let's Encrypt). Guarde-o como guardaria as senhas.
 
 ### Recuperação total (L14 novo ou SSD interno trocado)
 
@@ -575,7 +633,7 @@ sudo mkdir -p /mnt/backup-ssd && sudo mount /dev/sdX1 /mnt/backup-ssd
 
 # 2. Recupere o .env ANTES do setup (as senhas antigas são reaproveitadas)
 sudo mkdir -p /opt/homelab/infra
-sudo tar xzf /mnt/backup-ssd/homelab/latest/config.tar.gz -C / opt/homelab/infra/.env opt/homelab/ca
+sudo tar xzf /mnt/backup-ssd/homelab/latest/config.tar.gz -C / opt/homelab/infra/.env opt/homelab/ca opt/homelab/proxy opt/homelab/apps
 sudo umount /mnt/backup-ssd                      # a CA volta junto: os dispositivos continuam confiando
 
 # 3. Rode o setup e reconfigure o SSD (sem --format!)
@@ -586,11 +644,10 @@ sudo /opt/homelab/scripts/backup-disk-setup.sh /dev/sdX1
 B=/mnt/backup-ssd/homelab/latest
 for c in mysql redis rabbitmq; do sudo /opt/homelab/scripts/restore.sh $B $c --yes; done
 sudo /opt/homelab/scripts/restore.sh $B config   # compare SSH/UFW/netplan e copie o que precisar
-sudo /opt/homelab/scripts/restore.sh $B coolify  # segue os passos exibidos (banco + APP_KEY)
-sudo /opt/homelab/scripts/homelab-ca.sh issue    # reinstala o certificado da LAN no Traefik
+sudo /opt/homelab/scripts/homelab-ca.sh issue    # reinstala o certificado da LAN no proxy
 ```
 
-Depois, no Coolify, faça *Redeploy* das aplicações (os volumes de dados das apps vêm dos backups de cada projeto).
+Depois, suba cada projeto (`cd /opt/homelab/apps/<projeto> && docker compose up -d`) ou rode o workflow de deploy no GitHub. Volumes de dados próprios dos projetos vêm dos backups de cada projeto.
 
 ---
 
@@ -604,7 +661,7 @@ O setup cria o usuário `gh-runner` (grupo `docker`) e baixa o runner em `/opt/a
    sudo /opt/homelab/scripts/register-runner.sh https://github.com/eduferrari/<repo> <TOKEN>
    ```
 
-Uso típico: o job de deploy chama a API local do Coolify (seção 7.6).
+Uso típico: o job de deploy roda `docker compose pull && up -d` na pasta do projeto (seção 7.5).
 
 > ⚠️ Nunca use runner self-hosted em **repositório público** (um PR de terceiro executaria código no servidor). O `gh-runner` está no grupo `docker` — equivale a root.
 
@@ -613,30 +670,30 @@ Uso típico: o job de deploy chama a API local do Coolify (seção 7.6).
 ## 13. Roteiro: do zero ao primeiro projeto
 
 1. **BIOS** (F1): *After Power Loss = Power On* e virtualização habilitada (seção 2).
-2. **Ubuntu Server 24.04 LTS**: instale com **OpenSSH server**, usuário comum (ex.: `eduardo`), hostname `homelab-eduardo`. Configure a rede (cabo ou Wi-Fi) no instalador.
+2. **Ubuntu Server 24.04 LTS**: instale com **OpenSSH server**, usuário comum (ex.: `usuario`), hostname `homelab`. Configure a rede (cabo ou Wi-Fi) no instalador.
 3. **Chave SSH** do seu Mac (seção 3):
    ```bash
-   ssh-copy-id eduardo@homelab-eduardo.local
+   ssh-copy-id usuario@homelab.local
    ```
 4. *(Opcional)* **Manter uma CA existente** (dispositivos que já confiam nela): copie `root.crt` e `root.key` para o L14, por exemplo em `~/ca-antiga/`, e rode o setup com `CA_IMPORT_DIR=~/ca-antiga`. Sem isso, uma CA nova é criada.
 5. **Setup**:
    ```bash
    sudo apt-get update && sudo apt-get install -y git
    git clone https://github.com/eduferrari/homelab.git && cd homelab
-   sudo PUBLIC_IP=177.101.139.43 COOLIFY_ADMIN_EMAIL=voce@exemplo.com ./homelab-setup.sh
+   sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
    sudo reboot
    ```
 6. **IP fixo na LAN** (seção 9.3) — confirme no IP novo e rode o setup de novo:
    ```bash
-   sudo /opt/homelab/scripts/network-static.sh 192.168.101.28/24
+   sudo /opt/homelab/scripts/network-static.sh 192.168.1.10/24
    ```
 7. **CA nos dispositivos** (Mac, tablets, celulares — seção 8):
    ```bash
    sudo /opt/homelab/scripts/homelab-ca.sh export
    ```
-8. **Coolify** — primeiro acesso, *Validate Server*, 2FA (seção 7.1). Se for usar portas próprias na LAN, configure os entrypoints extras (seção 7.4).
-9. **Primeiro projeto** — API .NET por Dockerfile, porta 8080, variáveis de ambiente (seção 7.2); domínio público ou rota na LAN (seções 7.3 e 7.5).
-10. **Deploy automático** — runner + API do Coolify (seções 7.6 e 12).
+8. **Proxy**: confira com `sudo /opt/homelab/scripts/proxy.sh`; portas próprias na LAN com `proxy.sh entrypoint add <nome> <porta>` (seção 7.1).
+9. **Primeiro projeto**: compose em `/opt/homelab/apps/<projeto>` na rede `proxy`, API .NET na porta 8080, `.env` no servidor (seção 7.2); rotas na LAN (7.3) e domínio público (7.4).
+10. **Deploy automático**: runner + workflow do GitHub Actions (seções 7.5 e 12).
 11. **Backup** — confira o primeiro backup e prepare o SSD externo (seção 11):
     ```bash
     sudo /opt/homelab/scripts/backup.sh
@@ -673,15 +730,14 @@ sudo tlp fullcharge BAT0
 
 | Sintoma | Causa provável / solução |
 |---|---|
-| Setup: *Coolify NÃO instalado: portas em uso* | Algo ocupa 80/443/8000/8080: `sudo ss -tlnp \| grep -E ':(80\|443\|8000\|8080) '`, pare o processo e rode o setup de novo |
-| Coolify: *Server is not reachable* ao validar | SSH do root a partir dos containers: `sudo sshd -T \| grep -E 'permitrootlogin\|allowusers'` (deve ter `prohibit-password` e `root@10.0.0.0/8`) e `sudo grep coolify /root/.ssh/authorized_keys` |
-| App no Coolify não conecta no MySQL/Redis | Use o **IP fixo da LAN** (não `.local`); confira usuário/senha do `.env` |
+| Setup: *Proxy NÃO instalado: portas em uso* | Algo ocupa 80/443: `sudo ss -tlnp \| grep -E ':(80\|443) '`. Se for o Coolify: `sudo proxy.sh migrate-coolify` (seção 7.6) |
+| Projeto não conecta no MySQL/Redis | Serviço na rede `devnet` e host `mysql`/`redis`/`rabbitmq`; sem a rede, use o **IP fixo da LAN** (não `.local`); confira usuário/senha do `.env` |
 | Navegador/tablet: certificado inválido | CA não instalada no dispositivo, ou o IP mudou: `sudo /opt/homelab/scripts/homelab-ca.sh` (status) e `issue` |
-| Acesso pelo IP falha com erro de TLS | `/data/coolify/proxy/dynamic/homelab-lan.yaml` ausente: `sudo /opt/homelab/scripts/homelab-ca.sh issue` |
-| `404 page not found` (Traefik) | Nenhuma rota casou: confira entrypoint/rule das labels ou do arquivo em `dynamic/`; `docker logs coolify-proxy --tail 50` |
-| `502 Bad Gateway` (Traefik) | O container de destino não está numa rede do Coolify ou a porta está errada |
+| Acesso pelo IP falha com erro de TLS | `/opt/homelab/proxy/dynamic/homelab-lan.yaml` ausente: `sudo /opt/homelab/scripts/homelab-ca.sh issue` |
+| `404 page not found` (Traefik) | Nenhuma rota casou: confira entrypoint/rule das labels ou do arquivo em `dynamic/`; `sudo proxy.sh logs` |
+| `502 Bad Gateway` (Traefik) | O container de destino não está na rede `proxy` (ou na de `traefik.docker.network`) ou a porta está errada |
 | `403 Forbidden` na LAN | O middleware `homelab-lan-only` não reconhece a origem (ex.: rede fora das faixas privadas) |
-| Let's Encrypt não emite | `public-access.sh check <dominio>`. Log com `reader size limit exceeded` = a porta 80 do IP público é do roteador → `sudo /opt/homelab/scripts/public-access.sh acme-tls` (valida só pela 443). DNS aponta para `177.101.139.43`? Portas 80/443 encaminhadas? `public-access.sh status`? Sem CGNAT? `docker logs coolify-proxy \| grep -i acme` |
+| Let's Encrypt não emite | `public-access.sh check <dominio>`. Log com `reader size limit exceeded` = a porta 80 do IP público é do roteador → `sudo /opt/homelab/scripts/proxy.sh acme tls` (valida só pela 443). DNS aponta para `203.0.113.10`? Portas 80/443 encaminhadas? `public-access.sh status`? Sem CGNAT? `sudo proxy.sh logs` |
 | `network-static.sh`: a rede voltou sozinha | Não houve `--confirm` em 5 min. Confira IP/gateway e aplique de novo |
 | `permission denied ... docker.sock` | Faltou reiniciar (ou logout/login) após a instalação |
 | `Connection refused` no SSH | `sudo ss -tlnp \| grep :22` e `sudo fail2ban-client unban --all` |
