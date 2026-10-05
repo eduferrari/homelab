@@ -10,6 +10,7 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 |---|---|---|---|
 | Projetos | **Proxy do homelab** (Traefik v3, `proxy.sh`) | 80, 443 (+ portas extras da LAN) | apps e domínios |
 | Projetos | Projetos em Docker Compose | — | `/opt/homelab/apps/<projeto>` |
+| Painéis | Logs (Dozzle), tráfego (GoAccess), status (Uptime Kuma), Seq | 9443, 9444, 9445, 9446 | `https://<host>:<porta>` (seção 7.6) |
 | Dados | MySQL 8.4 | 3306 | clientes MySQL / apps |
 | Dados | Adminer | **8088** | `http://<host>:8088` |
 | Dados | Redis 7 | 6379 | clientes Redis / apps |
@@ -87,6 +88,7 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 | `DOCKER_NETWORK` | `devnet` | Rede Docker da stack de dados |
 | `SSH_PORT` / `DISABLE_SSH_PASSWORD` | `22` / `auto` | SSH; `auto` desliga senha se já houver chave |
 | `INSTALL_PROXY` | `true` | Sobe o proxy Traefik do homelab (se 80 e 443 estiverem livres) |
+| `INSTALL_MONITOR` | `true` | Painéis de logs, tráfego, status e Seq (seção 7.6) |
 | `PUBLIC_IP` | — | IP público fixo do provedor (registrado no `.env`, informativo) |
 | `CA_IMPORT_DIR` | — | Pasta com `root.crt` e `root.key` de uma CA existente; sem ela, uma CA nova é criada |
 | `HEADLESS` | `true` | Desativa o boot gráfico |
@@ -111,7 +113,7 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 | 9 | Stack de dados | `.env` com senhas aleatórias, `docker-compose.yml`, `my.cnf` |
 | 10 | Subida | `docker compose up --wait` |
 | 11 | Utilitários | `scripts/*.sh` → `/opt/homelab/scripts`; timers de backup (diário) e de renovação do certificado da LAN (semanal) |
-| 12 | Proxy + CA | Traefik do homelab (`proxy.sh apply`); CA do homelab criada (ou importada) e certificado da LAN instalado no proxy |
+| 12 | Proxy, CA e painéis | Traefik do homelab (`proxy.sh apply`, com log de acesso); CA do homelab criada (ou importada) e certificado da LAN no proxy; painéis (`monitor.sh apply`) |
 | 13 | GitHub Actions | Usuário `gh-runner` e runner baixado (registro manual com token) |
 
 ---
@@ -126,11 +128,13 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 │   └── mysql/{conf.d,init}/
 ├── ca/                         # CA do homelab + certificado da LAN (700, root)
 ├── apps/<projeto>/             # compose, .env e rotas públicas de cada projeto
-├── proxy/                      # Traefik: proxy.conf, compose gerado, dynamic/, certs/, acme/
+├── proxy/                      # Traefik: proxy.conf, compose gerado, dynamic/, certs/, acme/, logs/
+├── monitor/                    # painéis: monitor.conf, .env (senha), dados do Dozzle, GoAccess, Uptime Kuma e Seq
 ├── backups/                    # backups diários (750 root:<seu grupo>)
 └── scripts/
     ├── status.sh               # visão geral
     ├── proxy.sh                # proxy Traefik (portas, Let's Encrypt, versão, migração do Coolify)
+    ├── monitor.sh              # painéis de logs, tráfego, status e Seq
     ├── homelab-ca.sh           # CA e HTTPS na LAN
     ├── backup.sh / restore.sh  # backup e restauração
     ├── backup-disk-setup.sh    # prepara o SSD externo
@@ -338,7 +342,49 @@ jobs:
 - Só os serviços com imagem nova são recriados; o `.env` e as rotas públicas do servidor continuam valendo.
 - Para voltar uma versão, troque `latest` pela tag do commit (`:<sha>`) no compose e rode `docker compose up -d`.
 
-### 7.6 Migrando de um homelab com Coolify
+### 7.6 Painéis: logs, tráfego, status e Seq — `monitor.sh`
+
+Instalados por padrão pelo setup (`INSTALL_MONITOR=true`), atrás do proxy, com HTTPS da CA do homelab e **acessíveis só pela LAN/Tailscale**:
+
+| Painel | Endereço | Para quê | Login |
+|---|---|---|---|
+| **Logs** (Dozzle) | `https://<host>:9443` | Logs de todos os containers ao vivo, com busca e filtro por projeto | usuário/senha do `monitor.sh` |
+| **Tráfego** (GoAccess) | `https://<host>:9444` | Requisições por rota do Traefik (`<router>@docker`), status 2xx/4xx/5xx, IPs, páginas, navegadores, banda; atualiza a cada 60 s e guarda histórico | usuário/senha do `monitor.sh` |
+| **Status** (Uptime Kuma) | `https://<host>:9445` | Testa domínios, portas e certificados e avisa (Telegram, e-mail, WhatsApp…) | criado no **primeiro acesso** |
+| **Seq** | `https://<host>:9446` | Logs estruturados das apps .NET (Serilog), com filtro por propriedade | `admin` + senha do `monitor.sh` (troca no 1º acesso) |
+
+```bash
+sudo /opt/homelab/scripts/monitor.sh               # status e endereços
+sudo /opt/homelab/scripts/monitor.sh credenciais   # usuário e senha
+sudo /opt/homelab/scripts/monitor.sh apply         # aplica monitor.conf editado (liga/desliga painéis, portas)
+sudo /opt/homelab/scripts/monitor.sh remove        # para os painéis e fecha as portas (dados preservados)
+```
+
+- Configuração em `/opt/homelab/monitor/monitor.conf` (`DOZZLE`, `GOACCESS`, `UPTIME_KUMA`, `SEQ` = `true`/`false`, portas, imagens, `SEQ_MEMORY`); senha em `/opt/homelab/monitor/.env` (600).
+- O tráfego vem do **log de acesso do proxy** (`/opt/homelab/proxy/logs/access.log`, `ACCESS_LOG="true"` no `proxy.conf`), com rotação diária (14 dias). Nenhum projeto precisa mudar.
+- No Uptime Kuma, crie o usuário logo após a instalação. Monitores úteis: cada domínio público (HTTP + validade do certificado) e as portas da LAN (`https://<IP>:<porta>`, ignorando o certificado ou instalando a CA).
+
+**Enviando logs de uma API .NET para o Seq** (serviço na rede `proxy`):
+
+```csharp
+// dotnet add package Serilog.AspNetCore Serilog.Sinks.Seq
+builder.Host.UseSerilog((ctx, cfg) => cfg
+    .ReadFrom.Configuration(ctx.Configuration)
+    .Enrich.FromLogContext()
+    .WriteTo.Console()
+    .WriteTo.Seq(ctx.Configuration["Seq:ServerUrl"] ?? "http://seq:5341",
+                 apiKey: ctx.Configuration["Seq:ApiKey"]));
+// ...
+app.UseSerilogRequestLogging();
+```
+
+```text
+# .env do projeto
+Seq__ServerUrl=http://seq:5341
+Seq__ApiKey=<chave criada no Seq: Settings → API Keys>
+```
+
+### 7.7 Migrando de um homelab com Coolify
 
 Versões anteriores deste homelab usavam o Coolify (e o Traefik dele). A migração aproveita os certificados Let's Encrypt, as portas extras da LAN, a CA e as rotas dos projetos:
 
@@ -397,7 +443,7 @@ O L14 responde como `<hostname>.local` (só IPv4). macOS, Windows 10+ e Linux co
 ### 9.2 Firewall
 
 - UFW: entrada negada por padrão; SSH com rate-limit; mDNS só da LAN.
-- O Docker publica portas ignorando o UFW. O bloco *ufw-docker* em `/etc/ufw/after.rules` (cadeia `DOCKER-USER`) faz **toda porta de container aceitar só redes privadas** (`10/8`, `172.16/12`, `192.168/16`, `100.64/10` — Tailscale). Vale para MySQL, Redis, RabbitMQ e o proxy (80/443 e portas extras).
+- O Docker publica portas ignorando o UFW. O bloco *ufw-docker* em `/etc/ufw/after.rules` (cadeia `DOCKER-USER`) faz **toda porta de container aceitar só redes privadas** (`10/8`, `172.16/12`, `192.168/16`, `100.64/10` — Tailscale). Vale para MySQL, Redis, RabbitMQ, o proxy (80/443 e portas extras) e os painéis (9443–9446).
 - Acesso pela internet: só via `public-access.sh` (seção 9.4).
 
 ```bash
@@ -435,7 +481,7 @@ Internet ─► api.seudominio.com.br (DNS A) ─► 203.0.113.10 (roteador/ONT)
 
 Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o IP fixo do L14 na LAN e `api`/`app.seudominio.com.br` domínios do seu projeto.
 
-1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, 3306, 6379, 5672 nem 15672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
+1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, os painéis (9443–9446), 3306, 6379, 5672 nem 15672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
 2. **DNS** (zona do seu domínio, ex.: Registro.br) — um registro por subdomínio:
    ```text
    api   A   203.0.113.10   TTL 300
@@ -540,7 +586,7 @@ Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd,
 | `mysql-all.sql.gz` | Todos os bancos, usuários, rotinas, triggers e eventos | `mysqldump --single-transaction` (sem travar as tabelas) — validado pela linha `Dump completed` |
 | `redis-dump.rdb.gz` | Snapshot do Redis | `BGSAVE` consistente, sem parar o serviço |
 | `rabbitmq-definitions.json` | vhosts, usuários, permissões, filas, exchanges, bindings, policies | `rabbitmqctl export_definitions` |
-| `config.tar.gz` | `.env`, compose, `my.cnf`, **CA do homelab** (`/opt/homelab/ca`), **proxy** (`proxy.conf`, `dynamic/`, certificados Let's Encrypt), SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do systemd, e de cada projeto em `/opt/homelab/apps/<projeto>`: compose, overrides, `.env` e `public-routes.conf` (sem código-fonte nem volumes) | `tar` |
+| `config.tar.gz` | `.env`, compose, `my.cnf`, **CA do homelab** (`/opt/homelab/ca`), **proxy** (`proxy.conf`, `dynamic/`, certificados Let's Encrypt), **painéis** (`monitor.conf`, senha, usuários do Dozzle, banco do Uptime Kuma), SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do systemd, e de cada projeto em `/opt/homelab/apps/<projeto>`: compose, overrides, `.env` e `public-routes.conf` (sem código-fonte nem volumes) | `tar` |
 | `SHA256SUMS` | Checksums de todos os arquivos | conferidos antes de qualquer restauração |
 
 **Não entram no backup:** mensagens que estão nas filas do RabbitMQ (só as definições), código dos projetos (fica no Git), registro do runner do GitHub (registre de novo) e preferências do RedisInsight.
@@ -692,6 +738,7 @@ Uso típico: o job de deploy roda `docker compose pull && up -d` na pasta do pro
    sudo /opt/homelab/scripts/homelab-ca.sh export
    ```
 8. **Proxy**: confira com `sudo /opt/homelab/scripts/proxy.sh`; portas próprias na LAN com `proxy.sh entrypoint add <nome> <porta>` (seção 7.1).
+   **Painéis**: `sudo /opt/homelab/scripts/monitor.sh credenciais`, abra `https://<host>:9443` a `:9446` e crie o usuário do Uptime Kuma (seção 7.6).
 9. **Primeiro projeto**: compose em `/opt/homelab/apps/<projeto>` na rede `proxy`, API .NET na porta 8080, `.env` no servidor (seção 7.2); rotas na LAN (7.3) e domínio público (7.4).
 10. **Deploy automático**: runner + workflow do GitHub Actions (seções 7.5 e 12).
 11. **Backup** — confira o primeiro backup e prepare o SSD externo (seção 11):
@@ -730,12 +777,13 @@ sudo tlp fullcharge BAT0
 
 | Sintoma | Causa provável / solução |
 |---|---|
-| Setup: *Proxy NÃO instalado: portas em uso* | Algo ocupa 80/443: `sudo ss -tlnp \| grep -E ':(80\|443) '`. Se for o Coolify: `sudo proxy.sh migrate-coolify` (seção 7.6) |
+| Setup: *Proxy NÃO instalado: portas em uso* | Algo ocupa 80/443: `sudo ss -tlnp \| grep -E ':(80\|443) '`. Se for o Coolify: `sudo proxy.sh migrate-coolify` (seção 7.7) |
 | Projeto não conecta no MySQL/Redis | Serviço na rede `devnet` e host `mysql`/`redis`/`rabbitmq`; sem a rede, use o **IP fixo da LAN** (não `.local`); confira usuário/senha do `.env` |
 | Navegador/tablet: certificado inválido | CA não instalada no dispositivo, ou o IP mudou: `sudo /opt/homelab/scripts/homelab-ca.sh` (status) e `issue` |
 | Acesso pelo IP falha com erro de TLS | `/opt/homelab/proxy/dynamic/homelab-lan.yaml` ausente: `sudo /opt/homelab/scripts/homelab-ca.sh issue` |
 | `404 page not found` (Traefik) | Nenhuma rota casou: confira entrypoint/rule das labels ou do arquivo em `dynamic/`; `sudo proxy.sh logs` |
 | `502 Bad Gateway` (Traefik) | O container de destino não está na rede `proxy` (ou na de `traefik.docker.network`) ou a porta está errada |
+| Painel não abre (`:9443`–`:9446`) | `sudo monitor.sh` (status); `sudo proxy.sh` mostra as portas `painel-*`; acesso só da LAN/Tailscale. Tráfego vazio: confira `ACCESS_LOG="true"` em `proxy.conf` e `docker logs goaccess` |
 | `403 Forbidden` na LAN | O middleware `homelab-lan-only` não reconhece a origem (ex.: rede fora das faixas privadas) |
 | Let's Encrypt não emite | `public-access.sh check <dominio>`. Log com `reader size limit exceeded` = a porta 80 do IP público é do roteador → `sudo /opt/homelab/scripts/proxy.sh acme tls` (valida só pela 443). DNS aponta para `203.0.113.10`? Portas 80/443 encaminhadas? `public-access.sh status`? Sem CGNAT? `sudo proxy.sh logs` |
 | `network-static.sh`: a rede voltou sozinha | Não houve `--confirm` em 5 min. Confira IP/gateway e aplique de novo |

@@ -47,11 +47,14 @@ PROXY_ENTRYPOINTS=""
 # Let'"'"'s Encrypt: tls (desafio TLS-ALPN, só porta 443) | http (desafio HTTP-01, porta 80)
 ACME_CHALLENGE="tls"
 ACME_EMAIL=""
-LOG_LEVEL="INFO"'
+LOG_LEVEL="INFO"
+# Log de acesso (tráfego) em logs/access.log — lido pelo painel de tráfego (GoAccess, monitor.sh)
+ACCESS_LOG="true"'
 
 load_conf() {
   install -d -m 755 "$PROXY_DIR" "$PROXY_DIR/dynamic" "$PROXY_DIR/certs"
   install -d -m 700 "$PROXY_DIR/acme"
+  install -d -m 755 "$PROXY_DIR/logs"
   [[ -f "$CONF" ]] || { printf '%s\n' "$DEFAULT_CONF" > "$CONF"; chmod 644 "$CONF"; }
   # shellcheck source=/dev/null
   . "$CONF"
@@ -62,6 +65,7 @@ load_conf() {
   ACME_CHALLENGE="${ACME_CHALLENGE:-tls}"
   ACME_EMAIL="${ACME_EMAIL:-}"
   LOG_LEVEL="${LOG_LEVEL:-INFO}"
+  ACCESS_LOG="${ACCESS_LOG:-true}"
 }
 
 set_conf() {   # set_conf CHAVE VALOR
@@ -90,6 +94,14 @@ extra_networks_present() {   # só as redes extras que existem (compose falharia
   done
 }
 
+host_tz() {
+  local tz
+  tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+  [[ -n "$tz" ]] || tz="$(cat /etc/timezone 2>/dev/null || true)"
+  [[ -n "$tz" ]] || tz="$(readlink /etc/localtime 2>/dev/null | sed -n 's#.*/zoneinfo/##p')"
+  echo "${tz:-UTC}"
+}
+
 generate_compose() {
   local out="$1" ep name port nets n
   nets="$(extra_networks_present)"
@@ -102,9 +114,19 @@ generate_compose() {
     echo "    container_name: ${CONTAINER}"
     echo "    restart: unless-stopped"
     echo "    security_opt: [\"no-new-privileges:true\"]"
+    echo "    environment:"
+    echo "      TZ: \"$(host_tz)\"   # horário local no log de acesso"
     echo "    command:"
     echo "      - --ping=true"
     echo "      - --log.level=${LOG_LEVEL}"
+    if [[ "$ACCESS_LOG" == "true" ]]; then
+      # formato CLF do Traefik: IP, data, requisição, status, bytes, referer, user-agent, router, duração
+      echo "      - --accesslog=true"
+      echo "      - --accesslog.filepath=/logs/access.log"
+      echo "      - --accesslog.bufferingsize=50"
+      echo "      - --accesslog.fields.headers.names.User-Agent=keep"
+      echo "      - --accesslog.fields.headers.names.Referer=keep"
+    fi
     echo "      - --entrypoints.http.address=:80"
     echo "      - --entrypoints.https.address=:443"
     for ep in $PROXY_ENTRYPOINTS; do
@@ -135,6 +157,7 @@ generate_compose() {
     echo "      - ./dynamic:/dynamic:ro"
     echo "      - ./certs:/certs:ro"
     echo "      - ./acme:/acme"
+    echo "      - ./logs:/logs"
     echo "    networks:"
     echo "      - ${PROXY_NETWORK}"
     for n in $nets; do echo "      - ${n}"; done
@@ -179,6 +202,24 @@ wait_healthy() {
   return 1
 }
 
+# Rotação diária do log de acesso (14 dias). copytruncate: o Traefik continua escrevendo no mesmo
+# arquivo; o painel de tráfego guarda o histórico no próprio banco.
+install_logrotate() {
+  [[ -d /etc/logrotate.d ]] || return 0
+  cat > /etc/logrotate.d/homelab-proxy <<ROT
+$PROXY_DIR/logs/access.log {
+    daily
+    rotate 14
+    maxsize 100M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+ROT
+}
+
 cmd_apply() {
   load_conf; validate_conf; ensure_networks
   local tmp changed=false
@@ -217,6 +258,7 @@ cmd_apply() {
     fi
     die "Proxy não ficou saudável (veja: sudo $0 logs)"
   fi
+  install_logrotate
   # certificado da LAN (CA do homelab) — gera o arquivo dinâmico se faltar
   [[ -x "$HOMELAB_DIR/scripts/homelab-ca.sh" ]] && "$HOMELAB_DIR/scripts/homelab-ca.sh" renew >/dev/null 2>&1 || true
 }
@@ -261,6 +303,7 @@ cmd_status() {
   echo "Config ........ $CONF"
   echo "Rede .......... $PROXY_NETWORK${PROXY_EXTRA_NETWORKS:+ (+ $PROXY_EXTRA_NETWORKS)}"
   echo "Portas LAN .... 80 443${PROXY_ENTRYPOINTS:+ | $PROXY_ENTRYPOINTS}"
+  echo "Log de acesso . $([[ "$ACCESS_LOG" == true ]] && echo "$PROXY_DIR/logs/access.log ($(du -h "$PROXY_DIR/logs/access.log" 2>/dev/null | cut -f1 || echo 0))" || echo desligado)"
   echo "Let's Encrypt . desafio $ACME_CHALLENGE$([[ "$ACME_CHALLENGE" == tls ]] && echo ' (porta 443)' || echo ' (porta 80)')"
   if [[ -s "$PROXY_DIR/acme/acme.json" ]] && command -v jq >/dev/null; then
     local certs; certs="$(jq -r '[.[]?.Certificates[]?.domain.main] | join(", ")' "$PROXY_DIR/acme/acme.json" 2>/dev/null || echo '?')"

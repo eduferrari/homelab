@@ -163,6 +163,8 @@ backup_config() {
     "$HOMELAB_DIR/ca"
     "$HOMELAB_DIR/proxy/proxy.conf" "$HOMELAB_DIR/proxy/docker-compose.yml"
     "$HOMELAB_DIR/proxy/dynamic" "$HOMELAB_DIR/proxy/acme"
+    "$HOMELAB_DIR/monitor/monitor.conf" "$HOMELAB_DIR/monitor/.env"
+    "$HOMELAB_DIR/monitor/dozzle" "$HOMELAB_DIR/monitor/uptime-kuma"
     /etc/homelab.conf
     /etc/ssh/sshd_config.d/00-homelab.conf
     /etc/fail2ban/jail.d/homelab.local
