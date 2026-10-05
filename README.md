@@ -10,7 +10,7 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 |---|---|---|---|
 | Projetos | **Proxy do homelab** (Traefik v3, `proxy.sh`) | 80, 443 (+ portas extras da LAN) | apps e domínios |
 | Projetos | Projetos em Docker Compose | — | `/opt/homelab/apps/<projeto>` |
-| Painéis | Logs (Dozzle), tráfego (GoAccess), status (Uptime Kuma), Seq | 9443, 9444, 9445, 9446 | `https://<host>:<porta>` (seção 7.6) |
+| Painéis | **Painel geral**, logs (Dozzle), tráfego (GoAccess), status (Uptime Kuma), Seq | 9440, 9443, 9444, 9445, 9446 | `https://<host>:<porta>` (seção 7.6) |
 | Dados | MySQL 8.4 | 3306 | clientes MySQL / apps |
 | Dados | Adminer | **8088** | `http://<host>:8088` |
 | Dados | Redis 7 | 6379 | clientes Redis / apps |
@@ -88,7 +88,7 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 | `DOCKER_NETWORK` | `devnet` | Rede Docker da stack de dados |
 | `SSH_PORT` / `DISABLE_SSH_PASSWORD` | `22` / `auto` | SSH; `auto` desliga senha se já houver chave |
 | `INSTALL_PROXY` | `true` | Sobe o proxy Traefik do homelab (se 80 e 443 estiverem livres) |
-| `INSTALL_MONITOR` | `true` | Painéis de logs, tráfego, status e Seq (seção 7.6) |
+| `INSTALL_MONITOR` | `true` | Painel geral e painéis de logs, tráfego, status e Seq (seção 7.6) |
 | `PUBLIC_IP` | — | IP público fixo do provedor (registrado no `.env`, informativo) |
 | `CA_IMPORT_DIR` | — | Pasta com `root.crt` e `root.key` de uma CA existente; sem ela, uma CA nova é criada |
 | `HEADLESS` | `true` | Desativa o boot gráfico |
@@ -129,12 +129,13 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 ├── ca/                         # CA do homelab + certificado da LAN (700, root)
 ├── apps/<projeto>/             # compose, .env e rotas públicas de cada projeto
 ├── proxy/                      # Traefik: proxy.conf, compose gerado, dynamic/, certs/, acme/, logs/
-├── monitor/                    # painéis: monitor.conf, .env (senha), dados do Dozzle, GoAccess, Uptime Kuma e Seq
-├── backups/                    # backups diários (750 root:<seu grupo>)
+├── monitor/                    # painéis: monitor.conf, .env (senha), painel/ (página gerada), dados do Dozzle, GoAccess, Uptime Kuma e Seq
+├── backups/                    # backups diários (750 root:<seu grupo>) + last-status.json (resultado do último)
 └── scripts/
     ├── status.sh               # visão geral
     ├── proxy.sh                # proxy Traefik (portas, Let's Encrypt, versão, migração do Coolify)
     ├── monitor.sh              # painéis de logs, tráfego, status e Seq
+    ├── painel.sh               # gera o painel geral (timer a cada minuto)
     ├── homelab-ca.sh           # CA e HTTPS na LAN
     ├── backup.sh / restore.sh  # backup e restauração
     ├── backup-disk-setup.sh    # prepara o SSD externo
@@ -145,6 +146,7 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 
 /etc/homelab.conf               # configuração lida pelos scripts
 /var/log/homelab-setup.log
+/var/log/homelab/backup.log     # log dos backups (rotação semanal, 8 semanas)
 ```
 
 Repositório:
@@ -342,13 +344,14 @@ jobs:
 - Só os serviços com imagem nova são recriados; o `.env` e as rotas públicas do servidor continuam valendo.
 - Para voltar uma versão, troque `latest` pela tag do commit (`:<sha>`) no compose e rode `docker compose up -d`.
 
-### 7.6 Painéis: logs, tráfego, status e Seq — `monitor.sh`
+### 7.6 Painéis: geral, logs, tráfego, status e Seq — `monitor.sh`
 
-Instalados por padrão pelo setup (`INSTALL_MONITOR=true`), atrás do proxy, com HTTPS da CA do homelab e **acessíveis só pela LAN/Tailscale**:
+Instalados por padrão pelo setup (`INSTALL_MONITOR=true`), atrás do proxy, com HTTPS da CA do homelab e **acessíveis só pela LAN/Tailscale**. Comece pelo **painel geral**: ele junta o resumo de tudo e tem atalhos para os outros.
 
 | Painel | Endereço | Para quê | Login |
 |---|---|---|---|
-| **Logs** (Dozzle) | `https://<host>:9443` | Logs de todos os containers ao vivo, com busca e filtro por projeto | usuário/senha do `monitor.sh` |
+| **Geral** | `https://<host>:9440` | Uma página com tudo (detalhes abaixo), atualizada a cada minuto | usuário/senha do `monitor.sh` |
+| **Logs** (Dozzle) | `https://<host>:9443` | Logs de todos os containers ao vivo, com busca e filtro por projeto — inclusive o **log do backup** (container `backup-log`) | usuário/senha do `monitor.sh` |
 | **Tráfego** (GoAccess) | `https://<host>:9444` | Requisições por rota do Traefik (`<router>@docker`), status 2xx/4xx/5xx, IPs, páginas, navegadores, banda; atualiza a cada 60 s e guarda histórico | usuário/senha do `monitor.sh` |
 | **Status** (Uptime Kuma) | `https://<host>:9445` | Testa domínios, portas e certificados e avisa (Telegram, e-mail, WhatsApp…) | criado no **primeiro acesso** |
 | **Seq** | `https://<host>:9446` | Logs estruturados das apps .NET (Serilog), com filtro por propriedade | `admin` + senha do `monitor.sh` (troca no 1º acesso) |
@@ -360,9 +363,37 @@ sudo /opt/homelab/scripts/monitor.sh apply         # aplica monitor.conf editado
 sudo /opt/homelab/scripts/monitor.sh remove        # para os painéis e fecha as portas (dados preservados)
 ```
 
-- Configuração em `/opt/homelab/monitor/monitor.conf` (`DOZZLE`, `GOACCESS`, `UPTIME_KUMA`, `SEQ` = `true`/`false`, portas, imagens, `SEQ_MEMORY`); senha em `/opt/homelab/monitor/.env` (600).
+- Configuração em `/opt/homelab/monitor/monitor.conf` (`PAINEL`, `DOZZLE`, `GOACCESS`, `UPTIME_KUMA`, `SEQ`, `BACKUP_LOG` = `true`/`false`, portas, imagens, `SEQ_MEMORY`); senha em `/opt/homelab/monitor/.env` (600). Trocou a senha no `.env`? Rode `monitor.sh apply`.
 - O tráfego vem do **log de acesso do proxy** (`/opt/homelab/proxy/logs/access.log`, `ACCESS_LOG="true"` no `proxy.conf`), com rotação diária (14 dias). Nenhum projeto precisa mudar.
 - No Uptime Kuma, crie o usuário logo após a instalação. Monitores úteis: cada domínio público (HTTP + validade do certificado) e as portas da LAN (`https://<IP>:<porta>`, ignorando o certificado ou instalando a CA).
+
+**Painel geral** (`painel.sh`, gerado a cada minuto pelo `homelab-painel.timer`):
+
+| Bloco | Mostra |
+|---|---|
+| Atenção | Só aparece com problema: container parado com erro, reiniciando ou *unhealthy*; proxy fora do ar; domínio sem resposta ou com 5xx; certificado vencendo; backup falho ou com mais de 26 h; disco externo desconectado; disco > 80%; notebook fora da tomada |
+| Atalhos | Painéis, portas dos projetos na LAN, Adminer, RedisInsight, RabbitMQ — o endereço segue o que você usou para abrir o painel (nome `.local`, IP ou Tailscale) |
+| Servidor | Tempo ligado, carga, memória, discos (sistema, backups, disco externo), bateria, temperatura |
+| Backup | Última execução (resultado, tamanho, duração), próxima execução, disco externo e as últimas linhas do log |
+| Domínios públicos | Cada domínio de `public-routes.conf` e do Let's Encrypt: resposta HTTP pelo proxy, tempo e dias até o certificado vencer |
+| Tráfego — 24 h | Requisições, 4xx e 5xx por rota do Traefik e tempo médio (detalhes no GoAccess) |
+| Containers | Todos, agrupados por projeto (compose), com estado, CPU, memória e reinícios |
+
+```bash
+sudo /opt/homelab/scripts/painel.sh          # gera agora (o timer já faz a cada minuto)
+sudo /opt/homelab/scripts/painel.sh json     # os mesmos dados em JSON (também em https://<host>:9440/status.json)
+```
+
+**Alerta do backup no Uptime Kuma** (avisa quando o backup falha **ou não roda**):
+
+1. No Uptime Kuma: *Add New Monitor* → tipo **Push** → *Heartbeat Interval* `90000` s (25 h) → salve e copie a **Push URL**.
+2. No servidor, cole a URL no `.env` da infra:
+   ```bash
+   sudo sed -i 's|^BACKUP_PUSH_URL=.*|BACKUP_PUSH_URL=https://127.0.0.1:9445/api/push/<token>|' /opt/homelab/infra/.env
+   grep -q '^BACKUP_PUSH_URL=' /opt/homelab/infra/.env || echo 'BACKUP_PUSH_URL=https://127.0.0.1:9445/api/push/<token>' | sudo tee -a /opt/homelab/infra/.env
+   sudo /opt/homelab/scripts/backup.sh          # testa: o monitor fica verde
+   ```
+   Use `https://127.0.0.1:9445/...` (o backup roda no próprio servidor; o certificado da LAN é aceito). Cada backup completo envia `up` ou `down` com a mensagem do resultado; sem aviso por 25 h, o Kuma alerta sozinho. Configure a notificação (Telegram, e-mail…) no próprio monitor.
 
 **Enviando logs de uma API .NET para o Seq** (serviço na rede `proxy`):
 
@@ -594,6 +625,7 @@ Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd,
 **Regras de segurança do processo**
 - Um backup por vez (`flock`); aborta se houver menos de 1 GB livre.
 - Se **qualquer** componente falhar, o comando sai com erro e a **retenção não é aplicada** — backups antigos nunca são apagados por causa de um backup ruim.
+- Resultado de cada execução completa em `last-status.json` (painel geral) e, com `BACKUP_PUSH_URL` no `.env`, aviso para o Uptime Kuma — alerta se falhar ou deixar de rodar (seção 7.6).
 - Retenção: `BACKUP_KEEP_DAYS` no `.env` (padrão **7** dias). O link `latest` aponta sempre para o último backup completo bem-sucedido.
 - Os arquivos contêm segredos (`.env`, chave da CA): diretórios `750` e arquivos `640`, dono `root`, grupo do seu usuário — só você e o root leem.
 
@@ -604,7 +636,8 @@ sudo /opt/homelab/scripts/backup.sh                  # backup completo agora
 sudo /opt/homelab/scripts/backup.sh redis rabbitmq   # só alguns componentes
 
 systemctl list-timers homelab-backup.timer           # próxima execução
-journalctl -u homelab-backup -n 50 --no-pager        # log da última execução
+tail -n 50 /var/log/homelab/backup.log               # log (também no painel de logs: container backup-log)
+cat /opt/homelab/backups/last-status.json            # resultado da última execução (lido pelo painel geral)
 ls -l /opt/homelab/backups/                          # backups disponíveis
 ```
 
@@ -738,7 +771,7 @@ Uso típico: o job de deploy roda `docker compose pull && up -d` na pasta do pro
    sudo /opt/homelab/scripts/homelab-ca.sh export
    ```
 8. **Proxy**: confira com `sudo /opt/homelab/scripts/proxy.sh`; portas próprias na LAN com `proxy.sh entrypoint add <nome> <porta>` (seção 7.1).
-   **Painéis**: `sudo /opt/homelab/scripts/monitor.sh credenciais`, abra `https://<host>:9443` a `:9446` e crie o usuário do Uptime Kuma (seção 7.6).
+   **Painéis**: `sudo /opt/homelab/scripts/monitor.sh credenciais`, abra o painel geral `https://<host>:9440`, crie o usuário do Uptime Kuma (`:9445`) e o monitor Push do backup (seção 7.6).
 9. **Primeiro projeto**: compose em `/opt/homelab/apps/<projeto>` na rede `proxy`, API .NET na porta 8080, `.env` no servidor (seção 7.2); rotas na LAN (7.3) e domínio público (7.4).
 10. **Deploy automático**: runner + workflow do GitHub Actions (seções 7.5 e 12).
 11. **Backup** — confira o primeiro backup e prepare o SSD externo (seção 11):
@@ -790,7 +823,7 @@ sudo tlp fullcharge BAT0
 | `permission denied ... docker.sock` | Faltou reiniciar (ou logout/login) após a instalação |
 | `Connection refused` no SSH | `sudo ss -tlnp \| grep :22` e `sudo fail2ban-client unban --all` |
 | Backup terminou com código 2 | SSD externo não montado: conecte e rode `sudo /opt/homelab/scripts/backup.sh --sync-external` |
-| Backup falhou | `journalctl -u homelab-backup -n 50` mostra o componente com `✘` |
+| Backup falhou | `tail -n 50 /var/log/homelab/backup.log` (ou o painel de logs, container `backup-log`) mostra o componente com `✘` |
 | `<host>.local` não resolve | `systemctl status avahi-daemon`; containers nunca resolvem `.local` |
 
 Log da instalação: `/var/log/homelab-setup.log`

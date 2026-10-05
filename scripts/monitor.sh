@@ -2,10 +2,14 @@
 # Painéis do homelab — logs, tráfego, disponibilidade e logs estruturados das aplicações.
 # Acessíveis só pela LAN/Tailscale, pelo proxy (HTTPS com a CA do homelab), cada um numa porta:
 #
+#   Geral ....... painel.sh     — tudo numa página: alertas, atalhos, servidor,
+#                                 containers, domínios, tráfego 24 h e backup   (padrão :9440)
 #   Logs ........ Dozzle        — logs de todos os containers, ao vivo        (padrão :9443)
 #   Tráfego ..... GoAccess      — requisições por rota, status, IPs, páginas  (padrão :9444)
 #   Status ...... Uptime Kuma   — monitora domínios/portas e envia alertas    (padrão :9445)
 #   Seq ......... Seq           — logs estruturados (Serilog) das apps .NET   (padrão :9446)
+#
+# O log do backup (/var/log/homelab/backup.log) aparece no Dozzle como o container "backup-log".
 #
 #   sudo monitor.sh                 # status e endereços
 #   sudo monitor.sh apply           # gera o compose a partir de monitor.conf e sobe/atualiza
@@ -32,6 +36,8 @@ die()  { echo "✘ $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "Execute com sudo: sudo $0 $*"
 
 DEFAULT_CONF='# Painéis do homelab — gerenciado por monitor.sh (edite e rode: sudo monitor.sh apply)
+PAINEL="true"           # painel geral (uma página com tudo, atualizada a cada minuto)
+PAINEL_PORT="9440"
 DOZZLE="true"           # logs dos containers
 DOZZLE_PORT="9443"
 GOACCESS="true"         # tráfego (lê o log de acesso do proxy)
@@ -42,6 +48,7 @@ UPTIME_KUMA_PORT="9445"
 SEQ="true"              # logs estruturados das apps (.NET/Serilog → http://seq:5341)
 SEQ_PORT="9446"
 SEQ_MEMORY="1g"         # limite de memória do Seq
+BACKUP_LOG="true"       # mostra o log do backup no Dozzle (container backup-log)
 # Imagens
 DOZZLE_IMAGE="amir20/dozzle:latest"
 GOACCESS_IMAGE="allinurl/goaccess:latest"
@@ -56,12 +63,20 @@ GOACCESS_LOG_FORMAT='%h %^[%d:%t %^] "%r" %s %b "%R" "%u" %^ "%v" "%^" %Lms'
 load_conf() {
   install -d -m 755 "$MONITOR_DIR"
   [[ -f "$CONF" ]] || { printf '%s\n' "$DEFAULT_CONF" > "$CONF"; chmod 644 "$CONF"; }
+  # monitor.conf de versões anteriores: acrescenta as opções novas (com o valor padrão)
+  local key added=""
+  for key in PAINEL PAINEL_PORT BACKUP_LOG; do
+    grep -q "^${key}=" "$CONF" || added+="$(grep "^${key}=" <<<"$DEFAULT_CONF")"$'\n'
+  done
+  [[ -z "$added" ]] || printf '# Opções novas (monitor.sh)\n%s' "$added" >> "$CONF"
   # shellcheck source=/dev/null
   . "$CONF"
+  PAINEL="${PAINEL:-true}"; PAINEL_PORT="${PAINEL_PORT:-9440}"
   DOZZLE="${DOZZLE:-true}"; DOZZLE_PORT="${DOZZLE_PORT:-9443}"
   GOACCESS="${GOACCESS:-true}"; GOACCESS_PORT="${GOACCESS_PORT:-9444}"; GOACCESS_INTERVAL="${GOACCESS_INTERVAL:-60}"
   UPTIME_KUMA="${UPTIME_KUMA:-true}"; UPTIME_KUMA_PORT="${UPTIME_KUMA_PORT:-9445}"
   SEQ="${SEQ:-true}"; SEQ_PORT="${SEQ_PORT:-9446}"; SEQ_MEMORY="${SEQ_MEMORY:-1g}"
+  BACKUP_LOG="${BACKUP_LOG:-true}"
   DOZZLE_IMAGE="${DOZZLE_IMAGE:-amir20/dozzle:latest}"
   GOACCESS_IMAGE="${GOACCESS_IMAGE:-allinurl/goaccess:latest}"
   WEB_IMAGE="${WEB_IMAGE:-nginx:alpine}"
@@ -85,6 +100,21 @@ EOF
   fi
   # shellcheck source=/dev/null
   . "$SECRETS"
+  ensure_auth_hash
+}
+
+# Hash da senha (basic auth do proxy) guardado no .env: gerado uma vez e refeito só se a senha
+# mudar — assim o middleware não muda a cada apply.
+ensure_auth_hash() {
+  local salt
+  # shellcheck disable=SC2016  # prefixo literal do hash
+  if [[ "${MONITOR_AUTH_HASH:-}" == '$apr1$'* ]]; then
+    salt="$(cut -d'$' -f3 <<<"$MONITOR_AUTH_HASH")"
+    [[ "$(openssl passwd -apr1 -salt "$salt" "$MONITOR_PASSWORD")" == "$MONITOR_AUTH_HASH" ]] && return 0
+  fi
+  MONITOR_AUTH_HASH="$(openssl passwd -apr1 "$MONITOR_PASSWORD")"
+  sed -i '/^MONITOR_AUTH_HASH=/d' "$SECRETS"
+  printf "MONITOR_AUTH_HASH='%s'\n" "$MONITOR_AUTH_HASH" >> "$SECRETS"
 }
 
 lan_host() { echo "$(hostname).local"; }
@@ -92,6 +122,7 @@ lan_ip()   { hostname -I | awk '{print $1}'; }
 
 # painel => "nome-do-entrypoint porta"
 panels() {
+  [[ "$PAINEL" == true ]]      && echo "painel-geral $PAINEL_PORT"
   [[ "$DOZZLE" == true ]]      && echo "painel-logs $DOZZLE_PORT"
   [[ "$GOACCESS" == true ]]    && echo "painel-trafego $GOACCESS_PORT"
   [[ "$UPTIME_KUMA" == true ]] && echo "painel-status $UPTIME_KUMA_PORT"
@@ -182,11 +213,57 @@ ensure_dozzle_users() {
   mv "$f.tmp" "$f"; chmod 600 "$f"
 }
 
-basic_auth_label() {   # middleware de senha (GoAccess não tem login próprio)
-  local hash
-  hash="$(openssl passwd -apr1 "$MONITOR_PASSWORD")"
-  # no compose, "$" precisa ser escrito "$$"
-  echo "      - traefik.http.middlewares.painel-senha.basicauth.users=${MONITOR_USER}:${hash//\$/\$\$}"
+# Middleware de senha (painel geral e GoAccess não têm login próprio), no provedor de arquivo
+# do proxy: painel-senha@file.
+AUTH_FILE="$PROXY_DIR/dynamic/homelab-monitor.yaml"
+write_auth_middleware() {
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+# Gerado por monitor.sh — senha dos painéis (sudo monitor.sh credenciais)
+http:
+  middlewares:
+    painel-senha:
+      basicAuth:
+        realm: homelab
+        users:
+          - '${MONITOR_USER}:${MONITOR_AUTH_HASH}'
+EOF
+  if ! cmp -s "$tmp" "$AUTH_FILE"; then install -m 600 "$tmp" "$AUTH_FILE"; fi
+  rm -f "$tmp"
+}
+
+# Gerador do painel geral: roda a cada minuto (systemd), como root (lê Docker, acme.json, backups).
+install_painel_timer() {
+  cat > /etc/systemd/system/homelab-painel.service <<EOF
+[Unit]
+Description=Gera o painel geral do homelab
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=${HOMELAB_DIR}/scripts/painel.sh
+Nice=10
+EOF
+  cat > /etc/systemd/system/homelab-painel.timer <<'EOF'
+[Unit]
+Description=Atualiza o painel geral do homelab a cada minuto
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable --now homelab-painel.timer >/dev/null 2>&1 || warn "Não foi possível ativar homelab-painel.timer"
+}
+
+remove_painel_timer() {
+  [[ -f /etc/systemd/system/homelab-painel.timer ]] || return 0
+  systemctl disable --now homelab-painel.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/homelab-painel.{service,timer}
+  systemctl daemon-reload 2>/dev/null || true
 }
 
 generate_compose() {
@@ -195,6 +272,18 @@ generate_compose() {
     echo "# Gerado por monitor.sh — NÃO edite. Configure $CONF e rode: sudo monitor.sh apply"
     echo "name: homelab-monitor"
     echo "services:"
+    if [[ "$PAINEL" == true ]]; then
+      cat <<EOF
+  painel-web:
+    image: ${WEB_IMAGE}
+    container_name: painel
+    restart: unless-stopped
+    volumes:
+      - ./painel:/usr/share/nginx/html:ro
+    networks: [${PROXY_NETWORK}]
+EOF
+      labels painel-geral 80 painel-senha@file
+    fi
     if [[ "$DOZZLE" == true ]]; then
       cat <<EOF
   dozzle:
@@ -233,8 +322,7 @@ EOF
       - ./goaccess/report:/usr/share/nginx/html:ro
     networks: [${PROXY_NETWORK}]
 EOF
-      labels painel-trafego 80 painel-senha
-      basic_auth_label
+      labels painel-trafego 80 painel-senha@file
     fi
     if [[ "$UPTIME_KUMA" == true ]]; then
       cat <<EOF
@@ -265,6 +353,20 @@ EOF
 EOF
       labels painel-seq 80
     fi
+    if [[ "$BACKUP_LOG" == true && "$DOZZLE" == true ]]; then
+      cat <<EOF
+  backup-log:
+    # só repassa o log do backup para o Dozzle (container "backup-log")
+    image: ${WEB_IMAGE}
+    container_name: backup-log
+    restart: unless-stopped
+    init: true
+    entrypoint: ["tail", "-n", "200", "-F", "/logs/backup.log"]
+    volumes:
+      - /var/log/homelab:/logs:ro
+    network_mode: none
+EOF
+    fi
     echo "networks:"
     echo "  ${PROXY_NETWORK}:"
     echo "    name: ${PROXY_NETWORK}"
@@ -278,7 +380,14 @@ cmd_apply() {
     warn "Todos os painéis desligados em $CONF"; cmd_remove; return 0
   fi
   sync_proxy
+  write_auth_middleware
   [[ "$DOZZLE" == true ]] && ensure_dozzle_users
+  [[ "$BACKUP_LOG" == true ]] && install -d -m 755 /var/log/homelab
+  if [[ "$PAINEL" == true ]]; then
+    install -d -m 755 "$MONITOR_DIR/painel"
+    [[ -s "$MONITOR_DIR/painel/index.html" ]] || \
+      echo '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="10"><p>Gerando o painel…</p>' > "$MONITOR_DIR/painel/index.html"
+  fi
   [[ "$GOACCESS" == true ]] && write_goaccess_runner
   [[ "$UPTIME_KUMA" == true ]] && install -d -m 700 "$MONITOR_DIR/uptime-kuma"
   [[ "$SEQ" == true ]] && install -d -m 700 "$MONITOR_DIR/seq"
@@ -289,6 +398,12 @@ cmd_apply() {
   docker compose --project-directory "$MONITOR_DIR" -f "$COMPOSE" up -d --remove-orphans
   # o script do GoAccess é montado como arquivo: mudou → reinicia para valer
   if $GOACCESS_CHANGED && docker ps --format '{{.Names}}' | grep -qx goaccess; then docker restart goaccess >/dev/null; fi
+  if [[ "$PAINEL" == true ]]; then
+    install_painel_timer
+    "$HOMELAB_DIR/scripts/painel.sh" || warn "Painel geral: falha ao gerar a página (sudo $HOMELAB_DIR/scripts/painel.sh)"
+  else
+    remove_painel_timer
+  fi
   cmd_status
   echo
   echo "Usuário e senha: sudo $0 credenciais"
@@ -305,6 +420,7 @@ cmd_status() {
   while read -r name port; do
     [[ -n "$name" ]] || continue
     case "$name" in
+      painel-geral)   c=painel;       label="Geral" ;;
       painel-logs)    c=dozzle;       label="Logs (Dozzle)" ;;
       painel-trafego) c=goaccess-web; label="Tráfego (GoAccess)" ;;
       painel-status)  c=uptime-kuma;  label="Status (Uptime Kuma)" ;;
@@ -319,7 +435,7 @@ cmd_status() {
 
 cmd_credentials() {
   load_conf; load_secrets
-  echo "Usuário ... $MONITOR_USER   (Dozzle e Tráfego)"
+  echo "Usuário ... $MONITOR_USER   (Geral, Logs e Tráfego)"
   echo "Senha ..... $MONITOR_PASSWORD"
   echo "Seq ....... admin / mesma senha (troca obrigatória no primeiro acesso)"
   echo "Uptime Kuma: usuário criado por você no primeiro acesso"
@@ -329,6 +445,8 @@ cmd_credentials() {
 cmd_remove() {
   load_conf
   [[ -f "$COMPOSE" ]] && docker compose --project-directory "$MONITOR_DIR" -f "$COMPOSE" down --remove-orphans || true
+  remove_painel_timer
+  rm -f "$AUTH_FILE"
   if [[ -f "$PROXY_CONF" ]] && grep -q 'painel-' "$PROXY_CONF"; then
     local current want ep
     # shellcheck source=/dev/null
