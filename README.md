@@ -17,7 +17,7 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 | Dados | RabbitMQ 4 (AMQP / Management) | 5672 / 15672 | `http://<host>:15672` |
 | Host | SSH | 22 | `ssh <usuario>@<host>` |
 
-`<host>` é o nome mDNS do L14 — `homelab-eduardo.local` — ou o IP fixo da LAN.
+`<host>` é o nome mDNS do L14 — `homelab.local` — ou o IP fixo da LAN.
 
 - A stack de dados fica em `/opt/homelab/infra` (compose `homelab`, rede `devnet`, volumes persistentes).
 - Tudo que roda em container é acessível **somente pela LAN** (seção 9.2). Para a internet, apenas 80/443 do proxy, quando você ativar (seção 9.4).
@@ -51,7 +51,7 @@ Pressione **F1** no boot:
 No seu computador principal (macOS/Linux):
 
 ```bash
-ssh-keygen -t ed25519 -C "eduardo@homelab"   # se ainda não tiver chave
+ssh-keygen -t ed25519 -C "usuario@homelab"   # se ainda não tiver chave
 ssh-copy-id <usuario>@<IP-do-L14>
 ```
 
@@ -76,7 +76,7 @@ sudo reboot        # na primeira instalação
 ### Opções (variáveis de ambiente)
 
 ```bash
-sudo PUBLIC_IP=177.101.139.43 ./homelab-setup.sh
+sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 ```
 
 | Variável | Padrão | Descrição |
@@ -203,9 +203,9 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=proxy
-      # LAN: https://homelab-eduardo.local e https://<IP> (certificado da CA do homelab)
+      # LAN: https://homelab.local e https://<IP> (certificado da CA do homelab)
       - traefik.http.routers.minhaapi.entrypoints=https
-      - traefik.http.routers.minhaapi.rule=Host(`homelab-eduardo.local`) || Host(`192.168.101.28`)
+      - traefik.http.routers.minhaapi.rule=Host(`homelab.local`) || Host(`192.168.1.10`)
       - traefik.http.routers.minhaapi.tls=true
       - traefik.http.routers.minhaapi.middlewares=homelab-lan-only@file
       - traefik.http.routers.minhaapi.service=minhaapi
@@ -249,7 +249,7 @@ ENTRYPOINT ["dotnet", "Api.dll"]
 
 ### 7.3 Rotas na LAN
 
-- **Pelo nome e pelo IP na 443:** entrypoint `https` com ``Host(`homelab-eduardo.local`) || Host(`192.168.101.28`)`` (exemplo acima). Acessos pelo IP não enviam SNI e recebem o certificado padrão da CA do homelab (seção 8).
+- **Pelo nome e pelo IP na 443:** entrypoint `https` com ``Host(`homelab.local`) || Host(`192.168.1.10`)`` (exemplo acima). Acessos pelo IP não enviam SNI e recebem o certificado padrão da CA do homelab (seção 8).
 - **Em porta própria** (ex.: um sistema por porta): crie o entrypoint e use ``PathPrefix(`/`)``:
   ```bash
   sudo /opt/homelab/scripts/proxy.sh entrypoint add pdv 8081
@@ -361,7 +361,7 @@ sudo ./homelab-setup.sh                               # fecha o SSH de root e as
 
 Apps na LAN são acessadas pelo nome `.local` e pelo **IP** (tablets Android não resolvem `.local` de forma confiável). Uma CA própria, instalada uma vez em cada dispositivo, emite o certificado da LAN, que o Traefik usa:
 
-- para os nomes do certificado (`homelab-eduardo.local`, IP da LAN, extras);
+- para os nomes do certificado (`homelab.local`, IP da LAN, extras);
 - **como certificado padrão**: quem acessa pelo IP não envia SNI, e o Traefik responde com este certificado — mesmo atrás do NAT do Docker (validado com Traefik v3 real).
 
 ```bash
@@ -374,13 +374,13 @@ sudo /opt/homelab/scripts/homelab-ca.sh import root.crt root.key   # CA existent
 
 - O setup **cria a CA automaticamente** (ou importa a de `CA_IMPORT_DIR`) e emite o certificado da LAN.
 - Certificado da LAN: 365 dias; o timer semanal `homelab-ca-renew` reemite quando faltam < 30 dias **ou quando o IP muda**.
-- Nomes extras: `HOMELAB_CA_EXTRA_NAMES="pdv.local 192.168.101.29"` no `.env` + `issue`.
+- Nomes extras: `HOMELAB_CA_EXTRA_NAMES="pdv.local 192.168.1.11"` no `.env` + `issue`.
 - A chave da CA fica em `/opt/homelab/ca/root.key` (600, root) e entra no backup (`config.tar.gz`). **Não a perca**: uma CA nova exige reinstalar o raiz em todos os dispositivos.
 
 Instalar o raiz no Mac:
 
 ```bash
-scp eduardo@homelab-eduardo.local:/opt/homelab/ca/homelab-root-ca.crt .   # após "export"
+scp usuario@homelab.local:/opt/homelab/ca/homelab-root-ca.crt .   # após "export"
 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain homelab-root-ca.crt
 ```
 
@@ -411,7 +411,7 @@ O roteador encaminha o IP público para **um IP da LAN**; por isso o L14 precisa
 
 ```bash
 sudo /opt/homelab/scripts/network-static.sh                       # rede atual e sugestão
-sudo /opt/homelab/scripts/network-static.sh 192.168.101.28/24     # fixa (gateway e DNS detectados)
+sudo /opt/homelab/scripts/network-static.sh 192.168.1.10/24     # fixa (gateway e DNS detectados)
 ```
 
 - Escolha um IP **fora da faixa de DHCP** do roteador; o script confere com `arping` se ninguém o usa.
@@ -419,27 +419,27 @@ sudo /opt/homelab/scripts/network-static.sh 192.168.101.28/24     # fixa (gatewa
 - **5 minutos** para conectar no IP novo e confirmar; sem confirmação, a rede volta sozinha:
 
 ```bash
-ssh eduardo@192.168.101.28
+ssh usuario@192.168.1.10
 sudo /opt/homelab/scripts/network-static.sh --confirm
 cd ~/homelab && sudo ./homelab-setup.sh && sudo /opt/homelab/scripts/homelab-ca.sh issue
 ```
 
 Voltar para DHCP: `sudo /opt/homelab/scripts/network-static.sh --dhcp`.
 
-### 9.4 Acesso pela internet — IP público fixo `177.101.139.43`
+### 9.4 Acesso pela internet — IP público fixo
 
 ```text
-Internet ─► api.seudominio.com.br (DNS A) ─► 177.101.139.43 (roteador/ONT)
-         ─► 80/443 encaminhadas ─► 192.168.101.28 (L14) ─► Traefik (proxy.sh) ─► app
+Internet ─► api.seudominio.com.br (DNS A) ─► 203.0.113.10 (roteador/ONT)
+         ─► 80/443 encaminhadas ─► 192.168.1.10 (L14) ─► Traefik (proxy.sh) ─► app
 ```
 
-Nos exemplos, `api.seudominio.com.br` e `app.seudominio.com.br` são domínios do seu projeto.
+Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o IP fixo do L14 na LAN e `api`/`app.seudominio.com.br` domínios do seu projeto.
 
-1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `177.101.139.43` para `192.168.101.28` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, 3306, 6379, 5672 nem 15672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
+1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, 3306, 6379, 5672 nem 15672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
 2. **DNS** (zona do seu domínio, ex.: Registro.br) — um registro por subdomínio:
    ```text
-   api   A   177.101.139.43   TTL 300
-   app   A   177.101.139.43   TTL 300
+   api   A   203.0.113.10   TTL 300
+   app   A   203.0.113.10   TTL 300
    ```
 3. **Firewall do L14:**
    ```bash
@@ -503,12 +503,12 @@ Connection strings:
 
 ```text
 # Do seu Mac / Rider (pelo nome ou IP)
-MySQL     Server=homelab-eduardo.local;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
-Redis     homelab-eduardo.local:6379,password=<REDIS_PASSWORD>
-RabbitMQ  amqp://admin:<RABBITMQ_DEFAULT_PASS>@homelab-eduardo.local:5672/
+MySQL     Server=homelab.local;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
+Redis     homelab.local:6379,password=<REDIS_PASSWORD>
+RabbitMQ  amqp://admin:<RABBITMQ_DEFAULT_PASS>@homelab.local:5672/
 
 # De outros projetos sem a rede devnet (pelo IP fixo da LAN)
-MySQL     Server=192.168.101.28;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
+MySQL     Server=192.168.1.10;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
 
 # De containers na rede devnet (compose próprio)
 MySQL     Server=mysql;Port=3306;...      Redis  redis:6379,...      RabbitMQ  amqp://...@rabbitmq:5672/
@@ -670,22 +670,22 @@ Uso típico: o job de deploy roda `docker compose pull && up -d` na pasta do pro
 ## 13. Roteiro: do zero ao primeiro projeto
 
 1. **BIOS** (F1): *After Power Loss = Power On* e virtualização habilitada (seção 2).
-2. **Ubuntu Server 24.04 LTS**: instale com **OpenSSH server**, usuário comum (ex.: `eduardo`), hostname `homelab-eduardo`. Configure a rede (cabo ou Wi-Fi) no instalador.
+2. **Ubuntu Server 24.04 LTS**: instale com **OpenSSH server**, usuário comum (ex.: `usuario`), hostname `homelab`. Configure a rede (cabo ou Wi-Fi) no instalador.
 3. **Chave SSH** do seu Mac (seção 3):
    ```bash
-   ssh-copy-id eduardo@homelab-eduardo.local
+   ssh-copy-id usuario@homelab.local
    ```
 4. *(Opcional)* **Manter uma CA existente** (dispositivos que já confiam nela): copie `root.crt` e `root.key` para o L14, por exemplo em `~/ca-antiga/`, e rode o setup com `CA_IMPORT_DIR=~/ca-antiga`. Sem isso, uma CA nova é criada.
 5. **Setup**:
    ```bash
    sudo apt-get update && sudo apt-get install -y git
    git clone https://github.com/eduferrari/homelab.git && cd homelab
-   sudo PUBLIC_IP=177.101.139.43 ./homelab-setup.sh
+   sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
    sudo reboot
    ```
 6. **IP fixo na LAN** (seção 9.3) — confirme no IP novo e rode o setup de novo:
    ```bash
-   sudo /opt/homelab/scripts/network-static.sh 192.168.101.28/24
+   sudo /opt/homelab/scripts/network-static.sh 192.168.1.10/24
    ```
 7. **CA nos dispositivos** (Mac, tablets, celulares — seção 8):
    ```bash
@@ -737,7 +737,7 @@ sudo tlp fullcharge BAT0
 | `404 page not found` (Traefik) | Nenhuma rota casou: confira entrypoint/rule das labels ou do arquivo em `dynamic/`; `sudo proxy.sh logs` |
 | `502 Bad Gateway` (Traefik) | O container de destino não está na rede `proxy` (ou na de `traefik.docker.network`) ou a porta está errada |
 | `403 Forbidden` na LAN | O middleware `homelab-lan-only` não reconhece a origem (ex.: rede fora das faixas privadas) |
-| Let's Encrypt não emite | `public-access.sh check <dominio>`. Log com `reader size limit exceeded` = a porta 80 do IP público é do roteador → `sudo /opt/homelab/scripts/proxy.sh acme tls` (valida só pela 443). DNS aponta para `177.101.139.43`? Portas 80/443 encaminhadas? `public-access.sh status`? Sem CGNAT? `sudo proxy.sh logs` |
+| Let's Encrypt não emite | `public-access.sh check <dominio>`. Log com `reader size limit exceeded` = a porta 80 do IP público é do roteador → `sudo /opt/homelab/scripts/proxy.sh acme tls` (valida só pela 443). DNS aponta para `203.0.113.10`? Portas 80/443 encaminhadas? `public-access.sh status`? Sem CGNAT? `sudo proxy.sh logs` |
 | `network-static.sh`: a rede voltou sozinha | Não houve `--confirm` em 5 min. Confira IP/gateway e aplique de novo |
 | `permission denied ... docker.sock` | Faltou reiniciar (ou logout/login) após a instalação |
 | `Connection refused` no SSH | `sudo ss -tlnp \| grep :22` e `sudo fail2ban-client unban --all` |

@@ -170,7 +170,7 @@ cmd_export() {
   install -m 644 "$CA_DIR/root.crt" "$out"
   echo "Certificado raiz: $out"
   echo "SHA-256: $(fingerprint "$CA_DIR/root.crt")"
-  echo "No Mac:  scp $(logname 2>/dev/null || echo eduardo)@$(lan_host):$out ."
+  echo "No Mac:  scp $(logname 2>/dev/null || echo usuario)@$(lan_host):$out ."
   echo "         sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain $(basename "$out")"
 }
 

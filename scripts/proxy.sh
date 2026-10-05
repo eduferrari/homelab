@@ -9,6 +9,7 @@
 #   sudo proxy.sh acme tls|http [EMAIL]    # desafio do Let's Encrypt (tls = só porta 443)
 #   sudo proxy.sh image traefik:v3.7       # troca a versão do Traefik
 #   sudo proxy.sh logs                     # últimos logs (erros e ACME)
+#   sudo proxy.sh check                    # containers com rotas em rede que o proxy não alcança
 #
 # Migração de um homelab com Coolify (uma vez):
 #   sudo proxy.sh migrate-coolify          # importa certificados/entrypoints, para o Coolify, sobe o proxy
@@ -220,6 +221,37 @@ cmd_apply() {
   [[ -x "$HOMELAB_DIR/scripts/homelab-ca.sh" ]] && "$HOMELAB_DIR/scripts/homelab-ca.sh" renew >/dev/null 2>&1 || true
 }
 
+# Containers com traefik.enable=true cuja rede (label traefik.docker.network ou a padrão do proxy)
+# não é alcançável: o container não está nela, ou o proxy não está nela → "no available server".
+check_routes() {
+  local c name net nets proxy_nets bad=0 total=0
+  proxy_nets=" $(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$CONTAINER" 2>/dev/null) "
+  while read -r c; do
+    [[ -n "$c" ]] || continue
+    name="$(docker inspect -f '{{.Name}}' "$c")"; name="${name#/}"
+    [[ "$name" == "$CONTAINER" ]] && continue
+    total=$((total + 1))
+    net="$(docker inspect -f '{{index .Config.Labels "traefik.docker.network"}}' "$c")"
+    nets=" $(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$c") "
+    if [[ -z "$net" ]]; then
+      # sem label: o Traefik usa a rede padrão do proxy; se o container não estiver nela, usa a
+      # PRIMEIRA rede do container — que pode ser uma que o proxy não alcança (502/504)
+      local n shared=0 count=0
+      for n in $nets; do count=$((count + 1)); [[ "$proxy_nets" == *" $n "* ]] && shared=$((shared + 1)); done
+      if [[ "$nets" != *" $PROXY_NETWORK "* ]] && { (( shared == 0 )) || (( count > 1 )); }; then
+        bad=1; warn "$name: sem traefik.docker.network e fora da rede '$PROXY_NETWORK' (redes:${nets% })"
+        echo "     → no compose do projeto, adicione a label  traefik.docker.network=<rede em comum com o proxy>  (ex.: ${PROXY_NETWORK}) e rode docker compose up -d" >&2
+      fi
+    elif [[ "$nets" != *" $net "* ]]; then
+      bad=1; warn "$name: traefik.docker.network=$net, mas o container não está nessa rede (redes:${nets% })"
+    elif [[ "$proxy_nets" != *" $net "* ]]; then
+      bad=1; warn "$name: rede '$net' não está conectada ao proxy → acrescente em PROXY_EXTRA_NETWORKS e rode: sudo $0 apply"
+    fi
+  done < <(docker ps -q --filter label=traefik.enable=true)
+  if (( bad == 0 )); then ok "$total container(s) com rotas: redes OK"; fi
+  return "$bad"
+}
+
 cmd_status() {
   load_conf
   local s img
@@ -235,6 +267,8 @@ cmd_status() {
     echo "Certificados .. ${certs:-nenhum emitido ainda}"
   fi
   [[ -f "$PROXY_DIR/dynamic/homelab-lan.yaml" ]] && echo "LAN (CA) ...... $PROXY_DIR/dynamic/homelab-lan.yaml" || echo "LAN (CA) ...... não configurado (homelab-ca.sh)"
+  echo "Rotas ......... containers com traefik.enable=true:"
+  check_routes || true
   if [[ -d "$COOLIFY_DIR" ]]; then
     echo
     if docker ps --format '{{.Names}}' | grep -qx coolify-proxy; then
@@ -374,6 +408,7 @@ cmd_migrate_coolify() {
   fi
 
   log "6/6 Conferência"
+  check_routes || warn "Corrija os itens acima (no compose de cada projeto) — senão essas rotas respondem 'no available server'"
   local ip; ip="$(hostname -I | awk '{print $1}')"
   for ep in 443 ${PROXY_ENTRYPOINTS}; do
     port="${ep##*=}"
@@ -421,6 +456,7 @@ cmd_remove_coolify() {
 
 case "${1:-status}" in
   status)           cmd_status ;;
+  check)            load_conf; check_routes ;;
   apply|up)         cmd_apply ;;
   entrypoint)       shift; cmd_entrypoint "$@" ;;
   acme)             shift; cmd_acme "$@" ;;

@@ -19,7 +19,7 @@ set -Eeuo pipefail
 
 # ------------------------------- Configuração --------------------------------
 # Todas as variáveis podem ser sobrescritas via ambiente:
-#   sudo HOMELAB_USER=eduardo INSTALL_TLP=false ./homelab-setup.sh
+#   sudo HOMELAB_USER=usuario INSTALL_TLP=false ./homelab-setup.sh
 HOMELAB_USER="${HOMELAB_USER:-${SUDO_USER:-}}"
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 TIMEZONE="${TIMEZONE:-America/Sao_Paulo}"
