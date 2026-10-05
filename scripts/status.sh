@@ -22,6 +22,12 @@ else
   echo "não instalado (sudo $HOMELAB_DIR/scripts/proxy.sh apply)"
 fi
 echo
+echo "== Painéis (só LAN) =="
+for c in dozzle:9443 goaccess-web:9444 uptime-kuma:9445 seq:9446; do
+  n="${c%%:*}"; s="$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo '-')"
+  [[ "$s" == "-" ]] || printf '%-14s %-10s https://%s:%s\n' "$n" "$s" "$HOST" "${c##*:}"
+done
+echo
 echo "== Projetos ($HOMELAB_DIR/apps) =="
 for d in "$HOMELAB_DIR"/apps/*/; do
   [[ -f "$d/docker-compose.yml" || -f "$d/compose.yml" ]] || continue

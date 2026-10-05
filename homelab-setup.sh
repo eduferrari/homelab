@@ -47,6 +47,8 @@ GH_RUNNER_DIR="${GH_RUNNER_DIR:-/opt/actions-runner}"
 
 # Proxy reverso (Traefik) do homelab — portas 80/443. Ajustes finos em /opt/homelab/proxy/proxy.conf
 INSTALL_PROXY="${INSTALL_PROXY:-true}"
+# Painéis (só LAN): logs (Dozzle), tráfego (GoAccess), status (Uptime Kuma) e Seq. Ajustes em /opt/homelab/monitor/monitor.conf
+INSTALL_MONITOR="${INSTALL_MONITOR:-true}"
 
 # IP público fixo do provedor (informativo: status e README)
 PUBLIC_IP="${PUBLIC_IP:-}"
@@ -688,6 +690,20 @@ fi
 "$CA" renew
 ok "CA do homelab: instale o certificado raiz nos dispositivos — sudo $CA export"
 
+# Painéis de logs, tráfego e status (atrás do proxy, só LAN)
+MONITOR_STATE="não instalado"
+if [[ "$INSTALL_MONITOR" != "true" ]]; then
+  warn "Painéis ignorados (INSTALL_MONITOR=false)"
+elif [[ "$PROXY_STATE" != "no ar" ]]; then
+  MONITOR_STATE="pendente (proxy fora do ar)"
+  warn "Painéis pendentes: suba o proxy e rode  sudo $HOMELAB_DIR/scripts/monitor.sh apply"
+elif "$HOMELAB_DIR/scripts/monitor.sh" apply; then
+  MONITOR_STATE="no ar"
+else
+  MONITOR_STATE="falhou (veja acima)"
+  warn "Painéis não subiram — o resto do homelab segue normal. Tente: sudo $HOMELAB_DIR/scripts/monitor.sh apply"
+fi
+
 # =================== 13. Preparação GitHub Actions ===========================
 step "13/13 Preparando GitHub Actions self-hosted runner"
 if [[ "$PREPARE_GH_RUNNER" == "true" ]]; then
@@ -727,6 +743,8 @@ ${C_GREEN}=====================================================================
 =====================================================================${C_RESET}
   SSH ............ ssh ${HOMELAB_USER}@${HOST} -p ${SSH_PORT}
   Proxy .......... Traefik nas portas 80/443   [${PROXY_STATE}]   (sudo ${HOMELAB_DIR}/scripts/proxy.sh)
+  Painéis ........ logs :9443 | tráfego :9444 | status :9445 | Seq :9446   [${MONITOR_STATE}]
+                   https://${HOST}:<porta>  — senha: sudo ${HOMELAB_DIR}/scripts/monitor.sh credenciais
   Projetos ....... ${HOMELAB_DIR}/apps/<projeto>  (compose na rede "proxy"; deploy: GitHub Actions + runner)
   Adminer ........ http://${HOST}:$(grep -m1 '^ADMINER_PORT=' "$ENV_FILE" | cut -d= -f2)   (servidor: mysql)
   RedisInsight ... http://${HOST}:5540
