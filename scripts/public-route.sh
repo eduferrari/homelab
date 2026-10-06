@@ -255,19 +255,27 @@ cmd_list() {
 cmd_check() {
   local name domain code ok=0
   [[ -n "$(conf_entries)" ]] || { echo "Nenhuma rota pública configurada"; return 0; }
+  # compose inválido: sem o nome do projeto, os próprios containers apareceriam como "conflito"
+  compose config --quiet || die "docker compose config falhou em $DIR — corrija o compose antes (erro acima)"
   echo "Rotas públicas (teste local no Traefik, sem passar pelo roteador):"
+  local out body
   while read -r name domain; do
     local waited=0
     while :; do
-      code="$(curl --noproxy "*" -sk -o /dev/null -w '%{http_code}' -m 10 --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null || true)"
+      out="$(curl --noproxy "*" -sk --max-filesize 65536 -w '\n%{http_code}' -m 10 --resolve "$domain:443:127.0.0.1" "https://$domain/" 2>/dev/null || true)"
+      code="${out##*$'\n'}"; body="${out%$'\n'*}"; body="${body%$'\n'}"
       if [[ ! "${code:-000}" =~ ^(000|404|502|503)$ ]] || (( waited >= WAIT_SECS )); then break; fi
       sleep 2; waited=$((waited + 2))
     done
-    case "${code:-000}" in
-      000) echo "  ✘ $domain ($name) → sem resposta (proxy no ar? sudo proxy.sh status)"; ok=1 ;;
-      502|503|504) echo "  ✘ $domain ($name) → HTTP $code (container fora do ar ou outra rota disputando o domínio)"; ok=1 ;;
-      *) echo "  ✔ $domain ($name) → HTTP $code" ;;
-    esac
+    if [[ "$body" == "404 page not found" ]]; then
+      echo "  ✘ $domain ($name) → 404 do Traefik: nenhuma rota. Container recriado sem o $OVERRIDE_NAME (compose com -f)? Rode: $0 apply"; ok=1
+    else
+      case "${code:-000}" in
+        000) echo "  ✘ $domain ($name) → sem resposta (proxy no ar? sudo proxy.sh status)"; ok=1 ;;
+        502|503|504) echo "  ✘ $domain ($name) → HTTP $code (container fora do ar ou outra rota disputando o domínio)"; ok=1 ;;
+        *) echo "  ✔ $domain ($name) → HTTP $code" ;;
+      esac
+    fi
     find_conflicts "$domain" && ok=1
   done < <(conf_entries)
   echo
