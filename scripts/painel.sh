@@ -242,25 +242,34 @@ def public_domains(certs):
     for d in certs:
         doms.setdefault(d, {"project": "", "service": ""})
     def check(d):
-        o = run(["curl", "--noproxy", "*", "-sk", "-o", "/dev/null", "-w", "%{http_code} %{time_total}", "-m", "8",
-                 "--resolve", f"{d}:443:127.0.0.1", f"https://{d}/"], timeout=12) or "000 0"
-        code, t = (o.split() + ["0"])[:2]
-        return d, code, round(float(t) * 1000)
+        # corpo + "código tempo" na última linha: o corpo diferencia o 404/503 do próprio Traefik
+        # (rota ausente / sem servidor) do 404 da aplicação (ex.: raiz de uma API)
+        o = run(["curl", "--noproxy", "*", "-sk", "--max-filesize", "65536", "-w", "\n%{http_code} %{time_total}", "-m", "8",
+                 "--resolve", f"{d}:443:127.0.0.1", f"https://{d}/"], timeout=12) or "\n000 0"
+        body, _, last = o.rpartition("\n")
+        code, t = (last.split() + ["0", "0"])[:2]
+        proxy = {"404 page not found": "sem rota no proxy", "no available server": "proxy sem servidor disponível"}.get(body.strip(), "")
+        return d, code, round(float(t) * 1000), proxy
     with ThreadPoolExecutor(8) as ex:
         results = list(ex.map(check, doms))
     rows = []
-    for d, code, ms in results:
+    for d, code, ms, proxy in results:
         end = certs.get(d) or certs.get("*." + d.split(".", 1)[-1])
         days = (end - NOW).days if end else None
         level = "ok"
-        if code == "000" or code.startswith("5"):
+        if proxy:
+            level = "erro"
+            hint = (" — rotas públicas fora do container? rode: public-route.sh apply na pasta do projeto"
+                    if proxy == "sem rota no proxy" else " — container parado, reiniciando ou unhealthy")
+            alerts.append(("erro", f"{d}: HTTP {code}, {proxy}{hint}"))
+        elif code == "000" or code.startswith("5"):
             level = "erro"; alerts.append(("erro", f"{d}: {'sem resposta' if code == '000' else 'HTTP ' + code}"))
         if days is None:
             level = "erro"; alerts.append(("erro", f"{d}: sem certificado Let's Encrypt"))
         elif days < 15:
             level = "erro" if days < 7 else ("aviso" if level == "ok" else level)
             alerts.append(("erro" if days < 7 else "aviso", f"Certificado de {d} vence em {days} dias"))
-        rows.append({"domain": d, **doms[d], "code": code, "ms": ms, "cert_days": days,
+        rows.append({"domain": d, **doms[d], "code": code, "ms": ms, "proxy": proxy, "cert_days": days,
                      "cert_end": end.astimezone().strftime("%d/%m/%Y") if end else "", "level": level})
     return rows
 
@@ -476,12 +485,12 @@ P.append("</section>")
 if domains:
     P.append('<section><h2>Domínios públicos</h2><div class="scroll"><table><tr><th>Domínio</th><th>HTTP</th><th class=num>Tempo</th><th>Certificado</th></tr>')
     for d in domains:
-        lv = "erro" if d["code"] == "000" or d["code"].startswith("5") else "ok"
+        lv = "erro" if d.get("proxy") or d["code"] == "000" or d["code"].startswith("5") else "ok"
         cert = (f'{badge("ok" if d["cert_days"] >= 15 else "aviso" if d["cert_days"] >= 7 else "erro", str(d["cert_days"]) + " dias")}'
                 if d["cert_days"] is not None else badge("erro", "sem Let's Encrypt"))
         P.append(f'<tr><td><a href="https://{esc(d["domain"])}" target="_blank" rel="noopener">{esc(d["domain"])}</a>'
                  f'<br><span class="mut">{esc(d["project"])}{"/" if d["service"] else ""}{esc(d["service"])}</span></td>'
-                 f'<td>{badge(lv, d["code"])}</td><td class=num>{d["ms"]} ms</td><td>{cert}</td></tr>')
+                 f'<td>{badge(lv, d["code"])}{"<br><span class=mut>" + esc(d["proxy"]) + "</span>" if d.get("proxy") else ""}</td><td class=num>{d["ms"]} ms</td><td>{cert}</td></tr>')
     P.append("</table></div>")
     if lan:
         P.append(f'<p class="mut">Certificado da LAN (CA do homelab): vence em {lan["days"]} dias ({esc(lan["end"])})</p>')

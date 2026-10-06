@@ -342,6 +342,7 @@ jobs:
 ```
 
 - Só os serviços com imagem nova são recriados; o `.env` e as rotas públicas do servidor continuam valendo.
+- Rode o compose **sem `-f`**: assim o Docker carrega também o `docker-compose.override.yml`, onde ficam as rotas públicas. Com `-f docker-compose.yml`, o container é recriado sem elas e o domínio passa a responder `404 page not found` (o painel geral alerta; corrija com `public-route.sh apply` na pasta do projeto). Se precisar do `-f`, liste os dois arquivos.
 - Para voltar uma versão, troque `latest` pela tag do commit (`:<sha>`) no compose e rode `docker compose up -d`.
 
 ### 7.6 Painéis: geral, logs, tráfego, status e Seq — `monitor.sh`
@@ -815,6 +816,7 @@ sudo tlp fullcharge BAT0
 | Navegador/tablet: certificado inválido | CA não instalada no dispositivo, ou o IP mudou: `sudo /opt/homelab/scripts/homelab-ca.sh` (status) e `issue` |
 | Acesso pelo IP falha com erro de TLS | `/opt/homelab/proxy/dynamic/homelab-lan.yaml` ausente: `sudo /opt/homelab/scripts/homelab-ca.sh issue` |
 | `404 page not found` (Traefik) | Nenhuma rota casou: confira entrypoint/rule das labels ou do arquivo em `dynamic/`; `sudo proxy.sh logs` |
+| Domínio público com `404 page not found` depois de um deploy | O container foi recriado sem o `docker-compose.override.yml` (compose com `-f`): `public-route.sh apply` na pasta do projeto e tire o `-f` do deploy (seção 7.5) |
 | `502 Bad Gateway` (Traefik) | O container de destino não está na rede `proxy` (ou na de `traefik.docker.network`) ou a porta está errada |
 | Painel não abre (`:9443`–`:9446`) | `sudo monitor.sh` (status); `sudo proxy.sh` mostra as portas `painel-*`; acesso só da LAN/Tailscale. Tráfego vazio: confira `ACCESS_LOG="true"` em `proxy.conf` e `docker logs goaccess` |
 | `403 Forbidden` na LAN | O middleware `homelab-lan-only` não reconhece a origem (ex.: rede fora das faixas privadas) |
