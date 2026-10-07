@@ -142,6 +142,7 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
     ├── network-static.sh       # IP fixo na LAN
     ├── public-access.sh        # libera 80/443 para a internet
     ├── public-route.sh         # publica serviços de um compose por domínio (labels Traefik)
+    ├── seq-app.sh              # liga um serviço ao Seq (rede, variáveis, chave no .env, teste)
     └── register-runner.sh      # registra o runner do GitHub
 
 /etc/homelab.conf               # configuração lida pelos scripts
@@ -410,11 +411,24 @@ builder.Host.UseSerilog((ctx, cfg) => cfg
 app.UseSerilogRequestLogging();
 ```
 
-```text
-# .env do projeto
-Seq__ServerUrl=http://seq:5341
-Seq__ApiKey=<chave criada no Seq: Settings → API Keys>
+**No servidor: `seq-app.sh`** (na pasta do projeto; não precisa de sudo):
+
+```bash
+cd /opt/homelab/apps/<projeto>
+/opt/homelab/scripts/seq-app.sh add api        # pede a chave criada no Seq (Settings → API Keys); Enter vazio = sem chave
+/opt/homelab/scripts/seq-app.sh check          # rede, variáveis e evento de teste de cada serviço
 ```
+
+O `add`:
+1. Põe o serviço na rede `proxy`, onde o Seq está. Se o compose ainda usa a rede legada `coolify`, troca por `proxy` no arquivo todo (pede confirmação).
+2. Acrescenta `Seq__ServerUrl: http://seq:5341` e `Seq__ApiKey: ${SEQ_APIKEY_<SERVIÇO>}` no `environment:` do serviço. A chave fica no `.env` do projeto, fora do Git.
+3. Valida o compose. Se der erro, volta o original (há sempre um backup `docker-compose.yml.bak-<data>`).
+4. Recria o serviço **sem `-f`**, mantendo as rotas públicas.
+5. Envia um evento "Teste do homelab" pela rede do container.
+
+Comentários e formatação do compose são preservados. Opções: `--key <chave>`, `--sem-chave`, `--yes`, `-C <pasta>`.
+
+A chave não é obrigatória (o Seq aceita eventos sem ela), mas com uma chave por aplicação dá para filtrar a origem, definir nível mínimo e, se quiser, exigir chave em *Settings → Ingestion*.
 
 ### 7.7 Migrando de um homelab com Coolify
 
