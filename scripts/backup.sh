@@ -3,10 +3,12 @@
 [[ -r "${HOMELAB_CONF:-/etc/homelab.conf}" ]] && . "${HOMELAB_CONF:-/etc/homelab.conf}"
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 BACKUP_GROUP="${BACKUP_GROUP:-root}"
-# Backup do homelab: MySQL, Redis, RabbitMQ (definições), Coolify e configurações (inclui a CA).
-# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|coolify|config ...]
+# Backup do homelab: MySQL, Redis, RabbitMQ (definições) e configurações (CA, proxy, projetos).
+# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|config ...]
 #      sudo backup.sh --sync-external      # só copia para o SSD externo
 # Agendado diariamente pelo homelab-backup.timer (systemd).
+# Resultado: $HOMELAB_DIR/backups/last-status.json (painel geral) e, se BACKUP_PUSH_URL estiver no
+# .env, um aviso para o Uptime Kuma (monitor "Push"). Log também em /var/log/homelab/backup.log.
 # Backup completo: grava em $HOMELAB_DIR/backups e copia para o SSD externo
 # (configurado por backup-disk-setup.sh).
 set -Eeuo pipefail
@@ -33,7 +35,7 @@ if [[ "${1:-}" == "--sync-external" ]]; then SYNC_ONLY=1; shift; fi
 
 COMPONENTS=("$@")
 if [[ ${#COMPONENTS[@]} -eq 0 || "${COMPONENTS[0]}" == "all" ]]; then
-  COMPONENTS=(mysql redis rabbitmq coolify config)
+  COMPONENTS=(mysql redis rabbitmq config)
   FULL_RUN=1
 else
   FULL_RUN=0
@@ -43,18 +45,60 @@ fi
 exec 9>/run/homelab-backup.lock
 flock -n 9 || { log "Outro backup já está em execução"; exit 1; }
 
+# Log em arquivo (lido pelo painel de logs) além do journal
+LOG_DIR=/var/log/homelab
+install -d -m 755 "$LOG_DIR"
+mkdir -p "$ROOT"
+exec > >(tee -a "$LOG_DIR/backup.log") 2>&1
+
+# ------------------------------------------------- Resultado e aviso (Kuma)
+STARTED="$(date +%s)"
+STATUS_MSG=""
+DEST=""
+FAILED=()
+EXT_RESULT="não configurado"
+record_result() {
+  local code="$1" ok=false msg url
+  # só o backup completo conta como "o backup do dia" (parciais e --sync-external não mudam o status)
+  (( FULL_RUN && ! SYNC_ONLY )) || return 0
+  [[ "$code" == 0 ]] && ok=true
+  msg="${STATUS_MSG:-$([[ "$code" == 0 ]] && echo "OK" || echo "Falhou (código $code)")}"
+  jq -n --arg time "$(date -Iseconds)" --argjson ok "$ok" --argjson code "$code" --arg msg "$msg" \
+        --arg dest "$DEST" --arg size "$( [[ -n "$DEST" && -d "$DEST" ]] && du -sh "$DEST" | cut -f1 || echo -)" \
+        --arg external "$EXT_RESULT" --argjson duration "$(( $(date +%s) - STARTED ))" \
+        --argjson failed "$(printf '%s\n' "${FAILED[@]}" | jq -R . | jq -s 'map(select(length>0))')" \
+        '{time:$time, ok:$ok, code:$code, message:$msg, dest:$dest, size:$size,
+          external:$external, failed:$failed, duration_s:$duration}' \
+    > "$ROOT/last-status.json.tmp" 2>/dev/null && mv "$ROOT/last-status.json.tmp" "$ROOT/last-status.json"
+  chmod 644 "$ROOT/last-status.json" 2>/dev/null || true
+  url="$(envget BACKUP_PUSH_URL)"
+  if [[ -n "$url" ]]; then
+    if curl --noproxy '*' -fsSk -m 15 -G "${url%%\?*}" \
+         --data-urlencode "status=$([[ "$code" == 0 ]] && echo up || echo down)" \
+         --data-urlencode "msg=$msg" --data-urlencode "ping=$(( $(date +%s) - STARTED ))" >/dev/null; then
+      log "Aviso enviado ao Uptime Kuma"
+    else
+      log "! Não foi possível avisar o Uptime Kuma (confira BACKUP_PUSH_URL em $ENV_FILE)"
+    fi
+  fi
+  return 0
+}
+trap 'record_result $?' EXIT
+
 # ------------------------------------------------ Cópia para o SSD externo
 # Copia todo backup local que ainda não está no SSD (recupera dias em que ele
 # estava desconectado), confere os checksums na cópia e aplica a retenção do SSD.
 sync_external() {
   if [[ -z "$EXT_MNT" || -z "$EXT_DIR" ]]; then
     log "SSD externo não configurado (rode backup-disk-setup.sh) — cópia externa ignorada"
+    EXT_RESULT="não configurado"
     return 0
   fi
   # nofail no fstab: sem o disco, o diretório existe vazio no disco interno — nunca grave nele
   mountpoint -q "$EXT_MNT" || mount "$EXT_MNT" 2>/dev/null || true
   if ! mountpoint -q "$EXT_MNT"; then
     log "✘ SSD externo não está montado em $EXT_MNT — conecte o disco"
+    EXT_RESULT="não montado"
     return 1
   fi
   mkdir -p "$EXT_DIR"
@@ -79,20 +123,23 @@ sync_external() {
   find "$EXT_DIR" -mindepth 1 -maxdepth 1 -type d -name '20??-??-??_*' \
     -mtime +"$EXT_KEEP" -print -exec rm -rf {} + | sed 's/^/  removido do SSD: /'
   sync
+  EXT_RESULT="ok"
   log "SSD externo: ${copied} backup(s) copiado(s) | livre: $(df -h --output=avail "$EXT_MNT" | tail -1 | tr -d ' ') | retenção: ${EXT_KEEP} dias"
 }
 
 if (( SYNC_ONLY )); then
-  sync_external && exit 0
-  exit 2
+  if sync_external; then
+    STATUS_MSG="$([[ "$EXT_RESULT" == ok ]] && echo "Cópia para o disco externo OK" || echo "Disco externo $EXT_RESULT")"
+    exit 0
+  fi
+  STATUS_MSG="Cópia para o disco externo falhou ($EXT_RESULT)"; exit 2
 fi
-
-FAILED=()
 
 mkdir -p "$ROOT"
 AVAIL_KB="$(df --output=avail -k "$ROOT" | tail -1 | tr -d ' ')"
 if (( AVAIL_KB < 1048576 )); then
   log "Menos de 1 GB livre em $ROOT — backup abortado"
+  STATUS_MSG="Abortado: menos de 1 GB livre"
   exit 1
 fi
 
@@ -100,7 +147,6 @@ STAMP="$(date +%F_%H%M%S)"
 DEST="$ROOT/$STAMP"
 umask 027
 mkdir -p "$DEST"
-FAILED=()
 
 container_up() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]; }
 volume_of()    { docker inspect -f "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{.Name}}{{end}}{{end}}" "$1" 2>/dev/null; }
@@ -156,25 +202,15 @@ backup_rabbitmq() {
   jq -e '.vhosts and .users' "$out" >/dev/null || { log "  JSON de definições inválido"; return 1; }
 }
 
-# ----------------------------------------------------------------- Coolify
-# Banco do Coolify (pg_dump) + /data/coolify: chave APP_KEY (source/.env — sem ela os
-# segredos salvos no banco não podem ser lidos), chaves SSH, proxy (acme.json, dynamic,
-# certs) e configurações das aplicações. Os volumes de dados das apps não entram aqui.
-backup_coolify() {
-  if [[ ! -d /data/coolify ]]; then log "  Coolify não instalado — pulando"; return 0; fi
-  container_up coolify-db || { log "  container coolify-db não está rodando"; return 1; }
-  docker exec coolify-db pg_dump -U coolify -d coolify -Fc > "$DEST/coolify-db.dump" || return 1
-  [[ -s "$DEST/coolify-db.dump" ]] || { log "  dump do Coolify vazio"; return 1; }
-  tar czf "$DEST/coolify-data.tar.gz" -C / --exclude=data/coolify/backups \
-    --exclude='data/coolify/applications/*/.git' data/coolify || return 1
-  gzip -t "$DEST/coolify-data.tar.gz" || return 1
-}
-
 # ----------------------------------------------------------- Configurações
 backup_config() {
   local candidates=(
     "$INFRA/docker-compose.yml" "$INFRA/.env" "$INFRA/mysql"
     "$HOMELAB_DIR/ca"
+    "$HOMELAB_DIR/proxy/proxy.conf" "$HOMELAB_DIR/proxy/docker-compose.yml"
+    "$HOMELAB_DIR/proxy/dynamic" "$HOMELAB_DIR/proxy/acme"
+    "$HOMELAB_DIR/monitor/monitor.conf" "$HOMELAB_DIR/monitor/.env"
+    "$HOMELAB_DIR/monitor/dozzle" "$HOMELAB_DIR/monitor/uptime-kuma"
     /etc/homelab.conf
     /etc/ssh/sshd_config.d/00-homelab.conf
     /etc/fail2ban/jail.d/homelab.local
@@ -225,6 +261,7 @@ log "Tamanho: $(du -sh "$DEST" | cut -f1)"
 
 if (( ${#FAILED[@]} )); then
   log "Backup concluído COM FALHAS: ${FAILED[*]} — retenção não aplicada"
+  STATUS_MSG="Falhou: ${FAILED[*]}"
   exit 1
 fi
 
@@ -236,7 +273,9 @@ if (( FULL_RUN )); then
 
   if ! sync_external; then
     log "Backup local concluído, mas a cópia para o SSD externo FALHOU"
+    STATUS_MSG="Local OK; disco externo: $EXT_RESULT"
     exit 2
   fi
 fi
 log "Backup concluído com sucesso"
+STATUS_MSG="OK ($(du -sh "$DEST" | cut -f1); disco externo: $EXT_RESULT)"

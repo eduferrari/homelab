@@ -2,8 +2,8 @@
 # shellcheck source=/dev/null
 [[ -r "${HOMELAB_CONF:-/etc/homelab.conf}" ]] && . "${HOMELAB_CONF:-/etc/homelab.conf}"
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
-# Libera o acesso da INTERNET ao proxy do Coolify (Traefik, portas 80/443) para apps com domínio.
-# Todo o resto (Coolify :8000, bancos, RabbitMQ, SSH) continua só na LAN.
+# Libera o acesso da INTERNET ao proxy do homelab (Traefik, portas 80/443) para apps com domínio.
+# Todo o resto (portas extras da LAN, bancos, RabbitMQ, SSH) continua só na LAN.
 #
 #   sudo public-access.sh status
 #   sudo public-access.sh enable
@@ -20,7 +20,7 @@ set_env() {
   if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
 }
 
-# O proxy do Coolify é um container: as portas publicadas passam pela cadeia DOCKER-USER, que só
+# O proxy é um container: as portas publicadas passam pela cadeia DOCKER-USER, que só
 # aceita redes privadas. Regras "route" do UFW entram em ufw-user-forward, consultada primeiro.
 RULES=("proto tcp from any to any port 80" "proto tcp from any to any port 443" "proto udp from any to any port 443")
 
@@ -63,11 +63,11 @@ check_domain() {
   if ufw status | grep -q 'Proxy publico'; then pass "80/443 liberados (public-access.sh enable)"
   else fail "80/443 fechados para a internet — rode: sudo $0 enable"; fi
 
-  echo "3. Proxy do Coolify"
+  echo "3. Proxy (Traefik)"
   if ss -Hltn 'sport = :80' | grep -q . && ss -Hltn 'sport = :443' | grep -q .; then
     pass "escutando em 80 e 443"
   else
-    fail "nada escutando em 80/443 — o coolify-proxy está rodando? (docker ps | grep coolify-proxy)"
+    fail "nada escutando em 80/443 — o proxy está rodando? (sudo $HOMELAB_DIR/scripts/proxy.sh status)"
   fi
 
   echo "4. Rota no Traefik (teste local, sem passar pelo roteador)"
@@ -75,7 +75,7 @@ check_domain() {
   code="${code:-000}"
   case "$code" in
     000) fail "sem resposta em https://$domain" ;;
-    404) warn "HTTP 404 — normal se a raiz da app não tem rota; se o corpo for '404 page not found' (Traefik), falta a rota: Domains no Coolify ou labels Host(\`$domain\`)" ;;
+    404) warn "HTTP 404 — normal se a raiz da app não tem rota; se o corpo for '404 page not found' (Traefik), falta a rota: public-route.sh add <serviço> $domain (ou labels Host(\`$domain\`))" ;;
     *)   pass "HTTP $code" ;;
   esac
 
@@ -93,13 +93,13 @@ check_domain() {
     echo "     O desafio HTTP-01 precisa que a internet alcance a porta 80. Se o log disser"
     echo "     'reader size limit exceeded', a 80 é do roteador: use  sudo $0 acme-tls  (valida pela 443)."
     echo "     Veja o motivo:"
-    echo "     docker logs coolify-proxy 2>&1 | grep -i -E 'acme|$domain' | tail"
+    echo "     sudo $HOMELAB_DIR/scripts/proxy.sh logs"
   else
     fail "ainda não é Let's Encrypt (emissor: ${issuer:-?}; titular: ${subject:-?})"
     echo "     O desafio HTTP-01 precisa que a internet alcance a porta 80. Se o log disser"
     echo "     'reader size limit exceeded', a 80 é do roteador: use  sudo $0 acme-tls  (valida pela 443)."
     echo "     Veja o motivo:"
-    echo "     docker logs coolify-proxy 2>&1 | grep -i -E 'acme|$domain' | tail"
+    echo "     sudo $HOMELAB_DIR/scripts/proxy.sh logs"
   fi
 
   echo "6. Encaminhamento no roteador (precisa de um acesso de FORA da rede)"
@@ -113,34 +113,10 @@ check_domain() {
 
 # Let's Encrypt pelo desafio TLS-ALPN-01 (só porta 443) em vez do HTTP-01 (porta 80).
 # Útil quando a porta 80 do IP público é do roteador/provedor ("reader size limit exceeded").
-PROXY_COMPOSE="${COOLIFY_PROXY_DIR:-/data/coolify/proxy}/docker-compose.yml"
 acme_tls() {
-  local f="$PROXY_COMPOSE" bak
-  [[ -f "$f" ]] || die "Não encontrei $f (Coolify instalado?)"
-  if grep -q 'certificatesresolvers.letsencrypt.acme.tlschallenge=true' "$f"; then
-    echo "✔ O resolver letsencrypt já usa TLS-ALPN-01 (porta 443)"; return 0
-  fi
-  grep -q 'certificatesresolvers.letsencrypt.acme.httpchallenge' "$f" \
-    || die "Resolver letsencrypt com httpchallenge não encontrado em $f — ajuste manualmente"
-  bak="$f.bak.$(date +%Y%m%d-%H%M%S)"; cp "$f" "$bak"
-  sed -i -E \
-    -e '/certificatesresolvers\.letsencrypt\.acme\.httpchallenge=true/d' \
-    -e 's#certificatesresolvers\.letsencrypt\.acme\.httpchallenge\.entrypoint=[a-z0-9-]+#certificatesresolvers.letsencrypt.acme.tlschallenge=true#' \
-    "$f"
-  grep -q 'certificatesresolvers.letsencrypt.acme.tlschallenge=true' "$f" || { cp "$bak" "$f"; die "Edição falhou — arquivo restaurado"; }
-  if ! docker compose -f "$f" config --quiet; then cp "$bak" "$f"; die "Compose inválido — arquivo restaurado ($bak)"; fi
-  echo "==> Recriando o proxy (alguns segundos fora do ar)"
-  if ! docker compose -f "$f" up -d; then
-    cp "$bak" "$f"; docker compose -f "$f" up -d || true
-    die "Proxy não subiu com a nova configuração — arquivo restaurado ($bak)"
-  fi
-  echo "✔ Let's Encrypt agora valida pela porta 443 (backup: $bak)"
-  echo
-  echo "IMPORTANTE: no Coolify, Servers → localhost → Proxy: confira que o editor mostra"
-  echo "  --certificatesresolvers.letsencrypt.acme.tlschallenge=true  (e nenhum httpchallenge)"
-  echo "e clique em Save — senão o próximo \"Restart Proxy\" volta ao HTTP-01."
-  echo
-  echo "Acompanhe a emissão:  docker logs -f coolify-proxy 2>&1 | grep -i acme"
+  [[ -x "$HOMELAB_DIR/scripts/proxy.sh" ]] || die "proxy.sh não encontrado em $HOMELAB_DIR/scripts"
+  "$HOMELAB_DIR/scripts/proxy.sh" acme tls
+  echo "✔ Let's Encrypt valida pela porta 443. Acompanhe: sudo $HOMELAB_DIR/scripts/proxy.sh logs"
 }
 
 case "${1:-status}" in
@@ -151,7 +127,7 @@ case "${1:-status}" in
     done
     set_env PUBLIC_ACCESS true
     ufw reload >/dev/null
-    echo "✔ Internet → proxy do Coolify liberado (80/tcp, 443/tcp, 443/udp)."
+    echo "✔ Internet → proxy do homelab liberado (80/tcp, 443/tcp, 443/udp)."
     echo
     show_status
     echo
@@ -159,7 +135,7 @@ case "${1:-status}" in
     echo "  1. No roteador/ONT: encaminhe as portas 80/tcp, 443/tcp e 443/udp para $(lan_ip)"
     echo "     (o L14 precisa de IP fixo na LAN — network-static.sh)."
     echo "  2. No DNS do seu domínio: registro A  ex.: api.seudominio.com.br → $(public_ip)"
-    echo "  3. No Coolify, na aplicação: Domains = https://api.seudominio.com.br"
+    echo "  3. Na pasta do projeto: $HOMELAB_DIR/scripts/public-route.sh add <serviço> api.seudominio.com.br"
     echo "     (o Traefik emite o certificado Let's Encrypt automaticamente)."
     echo "  4. Teste de FORA da sua rede (ex.: 4G do celular): https://api.seudominio.com.br"
     ;;

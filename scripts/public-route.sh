@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publica serviços de um projeto Docker Compose na internet por domínio, pelo proxy do Coolify
+# Publica serviços de um projeto Docker Compose na internet por domínio, pelo proxy do homelab
 # (Traefik + Let's Encrypt), SEM mexer no docker-compose.yml do projeto.
 #
 # As rotas públicas ficam no docker-compose.override.yml do projeto, gerado a partir de
@@ -17,10 +17,12 @@
 #   public-route.sh add api api.seudominio.com.br
 #   public-route.sh add web app.seudominio.com.br
 #
-# Requisitos de cada serviço: container rodando, rede do Coolify e uma label
+# Requisitos de cada serviço: container rodando, na rede do proxy (proxy) e uma label
 # traefik.http.services.<nome>.loadbalancer.server.port (o script usa esse <nome>).
 # DNS, encaminhamento 80/443 e firewall: veja public-access.sh (README, seção 9.4).
 set -Eeuo pipefail
+# shellcheck source=/dev/null
+[[ -r "${HOMELAB_CONF:-/etc/homelab.conf}" ]] && . "${HOMELAB_CONF:-/etc/homelab.conf}"
 
 MARKER="# gerado por public-route.sh"
 CONF_NAME="public-routes.conf"
@@ -68,7 +70,7 @@ labels_of() {
 }
 
 # Lê do container: serviço Traefik, routers da LAN e middlewares a reaproveitar.
-#   saída: TSV "svc<TAB>routers(espaço)<TAB>middlewares(vírgula)<TAB>network"
+#   saída: "svc|routers(espaço)|middlewares(vírgula)|network"
 inspect_service() {
   local name="$1" labels svc routers r mws="" network
   labels="$(labels_of "$name")"
@@ -89,8 +91,8 @@ inspect_service() {
     break   # middlewares do primeiro router da LAN bastam
   done
   network="$(grep -oP '^traefik\.docker\.network=\K.*' <<<"$labels" || true)"
-  [[ -n "$network" ]] || warn "Serviço '$name' sem traefik.docker.network — se estiver em mais de uma rede, defina =coolify"
-  printf '%s\t%s\t%s\t%s\n' "$svc" "$routers" "$mws" "$network"
+  [[ -n "$network" ]] || warn "Serviço '$name' sem traefik.docker.network — se estiver em mais de uma rede, defina =proxy"
+  printf '%s|%s|%s|%s\n' "$svc" "$routers" "$mws" "$network"   # '|' preserva campos vazios (TAB não)
 }
 
 conf_entries() { [[ -f "$CONF" ]] && grep -vE '^\s*(#|$)' "$CONF" | awk 'NF>=2{print $1, $2}' || true; }
@@ -116,7 +118,7 @@ generate_override() {
   tmp="$(mktemp)"
   {
     echo "$MARKER — não edite; use: public-route.sh add|remove|apply ($CONF_NAME)"
-    echo "# Rotas públicas (internet) pelo Traefik do Coolify + Let's Encrypt."
+    echo "# Rotas públicas (internet) pelo proxy do homelab (Traefik) + Let's Encrypt."
   } > "$tmp"
   if [[ -z "$(conf_services)" ]]; then
     echo "services: {}" >> "$tmp"
@@ -124,7 +126,7 @@ generate_override() {
     echo "services:" >> "$tmp"
     for name in $(conf_services); do
       info="$(inspect_service "$name")"
-      IFS=$'\t' read -r svc routers mws _ <<<"$info"
+      IFS='|' read -r svc routers mws _ <<<"$info"
       domains="$(conf_entries | awk -v s="$name" '$1==s{print $2}' | sort -u)"
       rule=""
       for d in $domains; do rule="${rule:+$rule || }Host(\`$d\`)"; done
@@ -149,7 +151,7 @@ generate_override() {
   echo "$tmp"
 }
 
-# Containers de OUTROS projetos (ex.: recursos do Coolify) que declaram o mesmo domínio.
+# Containers de OUTROS projetos que declaram o mesmo domínio.
 # Regras mais longas têm prioridade no Traefik — ex.: Host(`x`) && PathPrefix(`/`) vence Host(`x`).
 find_conflicts() {
   local domain="$1" project c line found=1
@@ -163,15 +165,14 @@ find_conflicts() {
     warn "Conflito: ${cname#/} ($cstate) também declara $domain"
     if [[ "$cstate" =~ ^(exited|created|dead)$ ]]; then
       warn "  (parado: não atrapalha agora, mas volta a disputar o domínio se for religado)"
-      echo "     → remova o recurso no Coolify (ou apague o Domains dele), ou: docker rm ${cname#/}" >&2
-    elif [[ "$cname" == "/coolify-proxy" ]]; then
-      echo "     → labels esquecidas no proxy: sudo sed -i '/$domain/d;/-pub/d' /data/coolify/proxy/docker-compose.yml (revise antes)"
+      echo "     → remova o container (docker rm ${cname#/}) ou a rota dele no projeto de origem" >&2
     else
-      echo "     → recurso do Coolify? Abra-o no Coolify, Stop e apague Domains (ou: docker update --restart=no ${cname#/} && docker stop ${cname#/})"
+      echo "     → tire o domínio do outro projeto (${cproj:-sem projeto}) ou pare-o: docker update --restart=no ${cname#/} && docker stop ${cname#/}"
     fi
   done
-  if [[ -d /data/coolify/proxy/dynamic ]] && grep -rlsF "$domain" /data/coolify/proxy/dynamic/ 2>/dev/null | grep -q .; then
-    found=0; warn "Conflito: $domain aparece em $(grep -rlsF "$domain" /data/coolify/proxy/dynamic/ | xargs)"
+  local dyn="${PROXY_DIR:-${HOMELAB_DIR:-/opt/homelab}/proxy}/dynamic"
+  if [[ -d "$dyn" ]] && grep -rlsF "$domain" "$dyn" 2>/dev/null | grep -q .; then
+    found=0; warn "Conflito: $domain aparece em $(grep -rlsF "$domain" "$dyn" | xargs)"
   fi
   return "$found"
 }
@@ -263,7 +264,7 @@ cmd_check() {
       sleep 2; waited=$((waited + 2))
     done
     case "${code:-000}" in
-      000) echo "  ✘ $domain ($name) → sem resposta (proxy do Coolify no ar?)"; ok=1 ;;
+      000) echo "  ✘ $domain ($name) → sem resposta (proxy no ar? sudo proxy.sh status)"; ok=1 ;;
       502|503|504) echo "  ✘ $domain ($name) → HTTP $code (container fora do ar ou outra rota disputando o domínio)"; ok=1 ;;
       *) echo "  ✔ $domain ($name) → HTTP $code" ;;
     esac

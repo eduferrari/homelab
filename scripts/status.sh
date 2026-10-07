@@ -14,13 +14,25 @@ echo
 echo "== Stack (MySQL, Redis, RabbitMQ) =="
 docker compose -f "$HOMELAB_DIR/infra/docker-compose.yml" ps --format 'table {{.Name}}\t{{.Status}}'
 echo
-echo "== Coolify =="
-if docker inspect coolify >/dev/null 2>&1; then
-  docker ps --filter name=coolify --format 'table {{.Names}}\t{{.Status}}'
-  echo "Painel: http://$HOST:8000"
+echo "== Proxy (Traefik) =="
+if docker inspect traefik >/dev/null 2>&1; then
+  docker inspect -f '{{.Config.Image}} | {{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' traefik
+  echo "Detalhes: sudo $HOMELAB_DIR/scripts/proxy.sh status"
 else
-  echo "não instalado"
+  echo "não instalado (sudo $HOMELAB_DIR/scripts/proxy.sh apply)"
 fi
+echo
+echo "== Painéis (só LAN) =="
+for c in painel:9440 dozzle:9443 goaccess-web:9444 uptime-kuma:9445 seq:9446; do
+  n="${c%%:*}"; s="$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo '-')"
+  [[ "$s" == "-" ]] || printf '%-14s %-10s https://%s:%s\n' "$n" "$s" "$HOST" "${c##*:}"
+done
+echo
+echo "== Projetos ($HOMELAB_DIR/apps) =="
+for d in "$HOMELAB_DIR"/apps/*/; do
+  [[ -f "$d/docker-compose.yml" || -f "$d/compose.yml" ]] || continue
+  printf '%-14s %s\n' "$(basename "$d")" "$(docker compose --project-directory "$d" ps --format '{{.Service}}:{{.State}}' 2>/dev/null | xargs || echo '?')"
+done
 echo
 echo "== Firewall =="; sudo ufw status | head -12
 echo; echo "== Disco =="; df -h / | tail -1
@@ -33,6 +45,9 @@ else
 fi
 echo; echo "== Backup =="
 echo "Último backup completo: $(readlink "$HOMELAB_DIR/backups/latest" 2>/dev/null || echo 'nenhum')"
+if [[ -r "$HOMELAB_DIR/backups/last-status.json" ]]; then
+  jq -r '"Última execução: \(.time) | \(if .ok then "OK" else "FALHOU" end) | \(.message)"' "$HOMELAB_DIR/backups/last-status.json" 2>/dev/null || true
+fi
 systemctl list-timers homelab-backup.timer --no-pager 2>/dev/null | sed -n 2p
 EXT_MNT="$(envget BACKUP_EXTERNAL_MOUNT)"; EXT_DIR="$(envget BACKUP_EXTERNAL_DIR)"
 if [[ -z "$EXT_MNT" ]]; then
