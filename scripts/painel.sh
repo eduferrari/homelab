@@ -396,140 +396,295 @@ status = {
 }
 
 # --------------------------------------------------------------------- HTML
+# Painel em abas: "Visão geral" responde se está tudo bem e mostra só o essencial; os
+# detalhes (containers, domínios e tráfego, servidor e backup) ficam nas outras abas.
 esc = lambda s: html.escape(str(s if s is not None else ""))
-def badge(level, text=None):
-    return f'<span class="b {esc(level)}">{esc(text or level)}</span>'
-def bar(pct):
-    cls = "erro" if pct >= 90 else "aviso" if pct >= 80 else "ok"
-    return f'<div class="bar"><i class="{cls}" style="width:{min(pct,100)}%"></i></div>'
 
-errs = [a for a in alerts if a[0] == "erro"]; warns = [a for a in alerts if a[0] == "aviso"]
-overall = "erro" if errs else "aviso" if warns else "ok"
+def pill(level, text):
+    return f'<span class="pill {esc(level)}">{esc(text)}</span>'
+
+def meter(pct, warn=80, err=90):
+    cls = "erro" if pct >= err else "aviso" if pct >= warn else "ok"
+    return f'<span class="meter" role="img" aria-label="{pct}%"><i class="{cls}" style="width:{min(max(pct,0),100)}%"></i></span>'
+
+def plural(n, um, varios):
+    return f"{n} {um if n == 1 else varios}"
+
+def worst(levels):
+    return "erro" if "erro" in levels else "aviso" if "aviso" in levels else "ok"
+
+errs = [t for l, t in alerts if l == "erro"]; warns = [t for l, t in alerts if l == "aviso"]
+overall = worst([l for l, _ in alerts])
+headline = {"ok": "Tudo funcionando",
+            "aviso": plural(len(warns), "ponto pede atenção", "pontos pedem atenção"),
+            "erro": plural(len(errs), "problema precisa de ação", "problemas precisam de ação")}[overall]
+
+projects = {}
+for c in cont:
+    projects.setdefault(c["project"], []).append(c)
+active = [c for c in cont if c["level"] != "parado"]
+c_bad = [c for c in active if c["level"] == "erro"]
+d_ok = [d for d in domains if not d.get("proxy") and d["code"] != "000" and not d["code"].startswith("5")]
+last = bk.get("last")
+disk_max = max([d["pct"] for d in host.get("disks", [])] or [0])
+mem_pct = (host.get("mem") or {}).get("pct", 0)
+
+STATE = {"running": "rodando", "exited": "parado", "restarting": "reiniciando", "created": "criado",
+         "paused": "pausado", "dead": "morto"}
+def state_text(c):
+    s = STATE.get(c["status"], c["status"])
+    if c["health"]:
+        s += {"healthy": ", saudável", "unhealthy": ", healthcheck falhando", "starting": ", iniciando"}.get(c["health"], f", {c['health']}")
+    if c["status"] == "exited" and c["exit"] not in (0, None):
+        s += f" (código {c['exit']})"
+    return s
+
+# ---- resumo (4 indicadores)
+tiles = [
+    ("Containers", worst([c["level"] for c in active]),
+     f"{len(active) - len(c_bad)}<small>/{len(active)}</small>", "funcionando" if not c_bad else plural(len(c_bad), "com problema", "com problema"), "containers"),
+    ("Domínios", "ok" if len(d_ok) == len(domains) else "erro",
+     f"{len(d_ok)}<small>/{len(domains)}</small>", "respondendo", "rede"),
+    ("Backup", ("erro" if not last.get("ok") or bk.get("age_h", 0) > 26 else "ok") if last else "aviso",
+     esc(bk["when"].replace(" atrás", "")) if last else "—", ("último, concluído" if last.get("ok") else "último, falhou") if last else "sem registro", "sistema"),
+    ("Servidor", "erro" if disk_max >= 90 else "aviso" if disk_max >= 80 or mem_pct >= 90 else "ok",
+     f"{disk_max}<small>%</small>", "disco mais cheio", "sistema"),
+]
+
 P = []
 P.append(f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60">
-<title>{esc(hostname)} — painel</title><style>
-:root{{--bg:#f6f7f9;--card:#fff;--fg:#1d2330;--mut:#667085;--bd:#e4e7ec;--ok:#12805c;--okb:#e3f6ee;--av:#a15c00;--avb:#fff4e0;--er:#b42318;--erb:#fdecea;--ln:#2557d6}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#0f1218;--card:#171b23;--fg:#e6e8ec;--mut:#98a2b3;--bd:#2a303c;--ok:#4cc38a;--okb:#11291f;--av:#f0b450;--avb:#2d2410;--er:#f97066;--erb:#33171a;--ln:#7aa2ff}}}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}
-header{{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;justify-content:space-between;padding:16px;max-width:1200px;margin:auto}}
-h1{{font-size:20px;margin:0}}h2{{font-size:15px;margin:0 0 10px}}main{{max-width:1200px;margin:auto;padding:0 16px 32px;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}}
-section{{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;min-width:0}}.wide{{grid-column:1/-1}}
-.mut{{color:var(--mut)}}.b{{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600;white-space:nowrap}}
-.b.ok{{background:var(--okb);color:var(--ok)}}.b.aviso{{background:var(--avb);color:var(--av)}}.b.erro{{background:var(--erb);color:var(--er)}}.b.parado{{background:var(--bd);color:var(--mut)}}
-table{{width:100%;border-collapse:collapse}}td,th{{text-align:left;padding:5px 6px;border-top:1px solid var(--bd);vertical-align:top}}th{{color:var(--mut);font-weight:500;font-size:12px;border-top:0}}
-.scroll{{overflow-x:auto}}.num{{text-align:right;font-variant-numeric:tabular-nums}}tr.proj td{{background:var(--bg);font-weight:600}}
-.bar{{height:6px;background:var(--bd);border-radius:3px;overflow:hidden;margin-top:3px}}.bar i{{display:block;height:100%}}.bar i.ok{{background:var(--ok)}}.bar i.aviso{{background:var(--av)}}.bar i.erro{{background:var(--er)}}
-.kv{{display:grid;grid-template-columns:auto 1fr;gap:6px 14px}}.links{{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}}
-.links a{{display:block;padding:10px;border:1px solid var(--bd);border-radius:8px;text-decoration:none;color:var(--fg)}}.links a:hover{{border-color:var(--ln)}}.links b{{color:var(--ln)}}
-.alert{{padding:6px 10px;border-radius:6px;margin:4px 0}}.alert.erro{{background:var(--erb);color:var(--er)}}.alert.aviso{{background:var(--avb);color:var(--av)}}
-pre{{background:var(--bg);padding:8px;border-radius:6px;overflow:auto;font-size:12px;max-height:320px;margin:8px 0 0}}a{{color:var(--ln)}}
-</style></head><body><header><div><h1>{esc(hostname)}</h1>
-<div class="mut">Atualizado às {NOW.strftime('%H:%M:%S')} de {NOW.strftime('%d/%m/%Y')} · atualiza a cada minuto · <a href="status.json">status.json</a></div></div>
-<div>{badge(overall, {"ok": "Tudo certo", "aviso": f"{len(warns)} aviso(s)", "erro": f"{len(errs)} problema(s)"}[overall])}</div></header><main>""")
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">
+<title>{esc(hostname)} — {esc(headline)}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{{
+  --bg:#eef1f4; --surface:#ffffff; --ink:#18212b; --muted:#5b6877; --line:#dce2e8; --accent:#2f5da8;
+  --ok:#1e7f5c; --ok-bg:#e2f1ea; --warn:#9a6200; --warn-bg:#fbefd9; --err:#b4322b; --err-bg:#fbe6e4; --off:#9aa6b2;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --cond:"IBM Plex Sans Condensed","IBM Plex Sans",system-ui,sans-serif;
+}}
+@media (prefers-color-scheme:dark){{:root{{
+  --bg:#10161d; --surface:#18202a; --ink:#e3e8ee; --muted:#8d9aa9; --line:#273342; --accent:#8fb0f2;
+  --ok:#4cc391; --ok-bg:#132a21; --warn:#e8ad45; --warn-bg:#2e2412; --err:#f2786e; --err-bg:#341a1b; --off:#5d6b7a;
+}}}}
+*{{box-sizing:border-box}}
+html{{-webkit-text-size-adjust:100%}}
+body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 var(--sans);font-variant-numeric:tabular-nums}}
+a{{color:var(--accent);text-underline-offset:2px}}
+:focus-visible{{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}}
+.wrap{{max-width:1080px;margin:0 auto;padding:0 20px}}
+.muted{{color:var(--muted)}}
 
-# alertas
+/* topo */
+header{{background:var(--surface);border-bottom:1px solid var(--line)}}
+.top{{display:flex;align-items:center;gap:8px 14px;padding-top:18px;padding-bottom:14px;flex-wrap:wrap}}
+.title{{display:flex;align-items:center;gap:12px;min-width:0}}
+.top .dot{{width:12px;height:12px;border-radius:50%;flex:none;background:var(--ok)}}
+.top .dot.aviso{{background:var(--warn)}} .top .dot.erro{{background:var(--err)}}
+h1{{font:600 26px/1.15 var(--cond);margin:0}}
+.top .meta{{margin-left:auto;font-size:13px;color:var(--muted);text-align:right}}
+@media (max-width:640px){{.top .meta{{margin-left:24px;text-align:left}} .top .meta br{{display:none}} .top .meta b::after{{content:', '}}}}
+.top .meta b{{color:var(--ink);font-weight:600}}
+nav.tabs{{display:flex;gap:4px;overflow-x:auto;scrollbar-width:none}}
+nav.tabs button{{font:inherit;font-weight:500;color:var(--muted);background:none;border:0;border-bottom:2px solid transparent;
+  padding:10px 12px;cursor:pointer;white-space:nowrap}}
+nav.tabs button[aria-selected=true]{{color:var(--ink);border-bottom-color:var(--accent)}}
+nav.tabs button .n{{display:inline-block;min-width:18px;padding:0 5px;margin-left:6px;border-radius:9px;font-size:12px;background:var(--err-bg);color:var(--err)}}
+
+main.wrap{{padding-top:24px;padding-bottom:16px}}
+[role=tabpanel][hidden]{{display:none}}
+h2{{font:600 17px/1.3 var(--cond);margin:28px 0 10px}}
+h2:first-child{{margin-top:0}}
+.panel{{background:var(--surface);border:1px solid var(--line);border-radius:10px}}
+
+/* resumo */
+.tiles{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}}
+@media (max-width:760px){{.tiles{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
+.tile{{display:block;padding:14px 16px;text-decoration:none;color:inherit;border-top:3px solid var(--ok)}}
+.tile.aviso{{border-top-color:var(--warn)}} .tile.erro{{border-top-color:var(--err)}}
+.tile .t{{font-size:14px;color:var(--muted)}}
+.tile .v{{font:600 30px/1.2 var(--cond);margin:4px 0 0}}
+.tile .v small{{font-size:18px;color:var(--muted);font-weight:500}}
+.tile .d{{font-size:13px;color:var(--muted)}}
+.tile.erro .d{{color:var(--err)}}
+
+.issues{{list-style:none;margin:0;padding:4px 0}}
+.issues li{{display:flex;gap:10px;padding:8px 16px;align-items:baseline}}
+.issues li+li{{border-top:1px solid var(--line)}}
+.issues .mark{{flex:none;width:8px;height:8px;border-radius:50%;background:var(--err);transform:translateY(-1px)}}
+.issues li.aviso .mark{{background:var(--warn)}}
+
+/* projetos em cartões */
+.projects{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}}
+.proj{{padding:14px 16px}}
+.proj h3{{font:600 16px/1.3 var(--cond);margin:0 0 2px;display:flex;align-items:center;gap:8px}}
+.proj .s{{font-size:13px;color:var(--muted);margin-bottom:10px}}
+.proj.erro .s{{color:var(--err)}}
+.chips{{display:flex;flex-wrap:wrap;gap:6px}}
+.chip{{display:inline-flex;align-items:center;gap:6px;padding:2px 9px 2px 7px;border-radius:12px;background:var(--bg);font-size:13px}}
+.chip.erro{{background:var(--err-bg);color:var(--err)}}
+.cdot{{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none}}
+.cdot.aviso{{background:var(--warn)}} .cdot.erro{{background:var(--err)}} .cdot.parado{{background:var(--off)}}
+
+/* atalhos */
+.links{{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}}
+.links a{{padding:10px 14px;text-decoration:none;color:var(--ink);font-weight:500}}
+.links a small{{display:block;color:var(--muted);font-weight:400;font-size:12px}}
+.links a:hover{{border-color:var(--accent)}}
+
+/* tabelas */
+table{{width:100%;border-collapse:collapse}}
+th,td{{text-align:left;padding:9px 16px;border-top:1px solid var(--line);vertical-align:middle}}
+th{{font-weight:500;font-size:13px;color:var(--muted);border-top:0}}
+td.num,th.num{{text-align:right}}
+tr.group td{{background:var(--bg);font-weight:600;font-size:14px}}
+.name{{font-weight:500}}
+.sub{{display:block;font-size:13px;color:var(--muted)}}
+.err{{color:var(--err)}}
+.bar{{display:block;height:8px;border-radius:4px;background:var(--bg);overflow:hidden;min-width:80px}}
+.bar i{{display:block;height:100%;background:var(--accent);opacity:.75}}
+.pill{{display:inline-block;padding:1px 8px;border-radius:5px;font-size:13px;font-weight:500;white-space:nowrap}}
+.pill.ok{{background:var(--ok-bg);color:var(--ok)}} .pill.aviso{{background:var(--warn-bg);color:var(--warn)}}
+.pill.erro{{background:var(--err-bg);color:var(--err)}}
+@media (max-width:640px){{.opt{{display:none}} th,td{{padding:8px 12px}}}}
+
+dl.facts{{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px 18px;margin:0;padding:16px}}
+dl.facts dt{{color:var(--muted)}} dl.facts dd{{margin:0;min-width:0}}
+.meter{{display:block;height:6px;border-radius:3px;background:var(--bg);overflow:hidden;margin-top:5px;max-width:320px}}
+.meter i{{display:block;height:100%;background:var(--ok)}} .meter i.aviso{{background:var(--warn)}} .meter i.erro{{background:var(--err)}}
+.two{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}
+@media (max-width:760px){{.two{{grid-template-columns:minmax(0,1fr)}}}}
+pre{{margin:0;padding:14px 16px;border-top:1px solid var(--line);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;color:var(--muted)}}
+.empty{{padding:16px;color:var(--muted)}}
+footer{{padding:16px 20px 28px;text-align:center;font-size:13px;color:var(--muted)}}
+</style></head><body>""")
+
+# ---- topo + abas
+tabs = [("geral", "Visão geral", len(alerts)), ("containers", "Containers", len(c_bad)),
+        ("rede", "Domínios e tráfego", sum(1 for d in domains if d["level"] == "erro")), ("sistema", "Servidor e backup", 0)]
+P.append(f"""<header><div class="wrap">
+<div class="top"><div class="title"><span class="dot {overall}" aria-hidden="true"></span><h1>{esc(headline)}</h1></div>
+<div class="meta"><b>{esc(hostname)}</b><br>atualizado às {NOW.strftime('%H:%M')}</div></div>
+<nav class="tabs" role="tablist">""" + "".join(
+    f'<button role="tab" id="t-{k}" aria-controls="{k}" aria-selected="false">{esc(label)}'
+    f'{f"<span class=n>{n}</span>" if n and k != "geral" else ""}</button>' for k, label, n in tabs) +
+    "</nav></div></header><main class=\"wrap\">")
+
+# ---- aba: visão geral
+P.append('<section id="geral" role="tabpanel" aria-labelledby="t-geral">')
+P.append('<div class="tiles">' + "".join(
+    f'<a class="panel tile {lv}" href="#{tab}"><div class="t">{t}</div><div class="v">{v}</div><div class="d">{esc(d)}</div></a>'
+    for t, lv, v, d, tab in tiles) + "</div>")
 if alerts:
-    P.append('<section class="wide"><h2>Atenção</h2>' + "".join(f'<div class="alert {l}">{esc(t)}</div>' for l, t in sorted(alerts, key=lambda a: a[0] != "erro")) + "</section>")
-
-# atalhos (endereço montado no navegador: funciona pelo nome .local, pelo IP ou pelo Tailscale)
-groups = defaultdict(list)
-for l in status["links"]:
-    groups[l["group"]].append(l)
-P.append('<section class="wide"><h2>Atalhos</h2>')
-for g, items in groups.items():
-    P.append(f'<div class="mut" style="margin:6px 0 4px">{esc(g)}</div><div class="links">')
-    for l in items:
-        P.append(f'<a class="lk" data-scheme="{esc(l["scheme"])}" data-port="{esc(l["port"])}" href="#"><b>{esc(l["name"])}</b>'
-                 f' <span class="mut">:{esc(l["port"])}</span><br><span class="mut">{esc(l["desc"])}</span></a>')
-    P.append("</div>")
+    P.append('<h2>Precisa de atenção</h2><ul class="panel issues">' + "".join(
+        f'<li class="{l}"><span class="mark"></span><span>{esc(t)}</span></li>'
+        for l, t in sorted(alerts, key=lambda a: a[0] != "erro")) + "</ul>")
+P.append('<h2>Projetos</h2><div class="projects">')
+order = sorted(projects.items(), key=lambda kv: (worst([c["level"] for c in kv[1]]) != "erro", kv[0] == "(sem projeto)", kv[0]))
+for proj, cs in order:
+    run_ = [c for c in cs if c["level"] != "parado"]
+    bad = [c for c in cs if c["level"] == "erro"]
+    lv = worst([c["level"] for c in cs])
+    s = (plural(len(bad), "container com problema", "containers com problema") if bad
+         else f"{plural(len(run_), 'container rodando', 'containers rodando')}" + (f", {len(cs) - len(run_)} parado(s)" if len(cs) > len(run_) else ""))
+    chips = "".join(f'<span class="chip {"erro" if c["level"] == "erro" else ""}" title="{esc(state_text(c))}">'
+                    f'<span class="cdot {esc(c["level"])}"></span>{esc(c["service"] or c["name"])}</span>' for c in cs)
+    P.append(f'<div class="panel proj {lv}"><h3><span class="cdot {lv}"></span>{esc(proj)}</h3><div class="s">{esc(s)}</div><div class="chips">{chips}</div></div>')
+P.append("</div>")
+P.append('<h2>Atalhos</h2><div class="links">' + "".join(
+    f'<a class="panel lk" data-scheme="{esc(l["scheme"])}" data-port="{esc(l["port"])}" href="#">{esc(l["name"])}<small>{esc(l["desc"])}</small></a>'
+    for l in status["links"]) + "</div>")
 P.append("</section>")
 
-# servidor
-h = host
-kv = [("Ligado há", esc(h.get("uptime"))),
-      ("Carga", esc(" / ".join(h.get("load", []))) + f' <span class="mut">({h.get("cpus")} CPUs)</span>')]
-if h.get("mem"):
-    m = h["mem"]; kv.append(("Memória", f'{human(m["used"])} de {human(m["total"])} ({m["pct"]}%){bar(m["pct"])}'))
-for d in h.get("disks", []):
-    kv.append((esc(d["label"]), f'{human(d["total"] - d["free"])} de {human(d["total"])} ({d["pct"]}%) <span class="mut">{esc(d["path"])}</span>{bar(d["pct"])}'))
-if h.get("battery"):
-    bt = h["battery"]; kv.append(("Bateria", f'{bt["pct"]}% — {esc(bt["status"])}{"" if bt.get("ac", True) else " " + badge("erro", "sem tomada")}'))
-if h.get("temp"):
-    kv.append(("Temperatura", f'{h["temp"]} °C'))
-P.append('<section><h2>Servidor</h2><div class="kv">' + "".join(f"<span class=mut>{k}</span><span>{v}</span>" for k, v in kv) + "</div></section>")
-
-# backup
-b = bk; last = b.get("last")
-kv = []
-if last:
-    kv.append(("Último", f'{badge("ok" if last.get("ok") else "erro", "OK" if last.get("ok") else "falhou")} {esc(b["when"])}'
-               f' <span class="mut">(levou {esc(last.get("duration_s"))} s)</span>'))
-    kv.append(("Resultado", esc(last.get("message"))))
-    if last.get("size") and last.get("size") != "-": kv.append(("Tamanho", esc(last["size"])))
-else:
-    kv.append(("Último", f'{badge("aviso", "sem registro")} {esc(b.get("latest") or "")}'))
-if b.get("next"):
-    kv.append(("Próximo", esc(b["next"])))
-ext = b.get("external")
-if ext is None:
-    kv.append(("Disco externo", badge("parado", "não configurado")))
-else:
-    kv.append(("Disco externo", (badge("ok", "montado") + f' <span class="mut">último: {esc(ext.get("latest") or "-")}</span>') if ext["mounted"] else badge("erro", "não montado")))
-P.append('<section><h2>Backup</h2><div class="kv">' + "".join(f"<span class=mut>{k}</span><span>{v}</span>" for k, v in kv) + "</div>")
-if b.get("log"):
-    P.append("<details><summary class=mut>Log do último backup</summary><pre>" + esc("\n".join(b["log"])) + "</pre></details>")
-P.append("</section>")
-
-# domínios
-if domains:
-    P.append('<section><h2>Domínios públicos</h2><div class="scroll"><table><tr><th>Domínio</th><th>HTTP</th><th class=num>Tempo</th><th>Certificado</th></tr>')
-    for d in domains:
-        lv = "erro" if d.get("proxy") or d["code"] == "000" or d["code"].startswith("5") else "ok"
-        cert = (f'{badge("ok" if d["cert_days"] >= 15 else "aviso" if d["cert_days"] >= 7 else "erro", str(d["cert_days"]) + " dias")}'
-                if d["cert_days"] is not None else badge("erro", "sem Let's Encrypt"))
-        P.append(f'<tr><td><a href="https://{esc(d["domain"])}" target="_blank" rel="noopener">{esc(d["domain"])}</a>'
-                 f'<br><span class="mut">{esc(d["project"])}{"/" if d["service"] else ""}{esc(d["service"])}</span></td>'
-                 f'<td>{badge(lv, d["code"])}{"<br><span class=mut>" + esc(d["proxy"]) + "</span>" if d.get("proxy") else ""}</td><td class=num>{d["ms"]} ms</td><td>{cert}</td></tr>')
-    P.append("</table></div>")
-    if lan:
-        P.append(f'<p class="mut">Certificado da LAN (CA do homelab): vence em {lan["days"]} dias ({esc(lan["end"])})</p>')
-    P.append("</section>")
-elif lan:
-    P.append(f'<section><h2>Certificados</h2><p>LAN (CA do homelab): vence em {lan["days"]} dias ({esc(lan["end"])})</p></section>')
-
-# tráfego
-tt = traf["total"]
-P.append(f'<section><h2>Tráfego — últimas 24 h</h2><p><b>{tt["req"]}</b> requisições · '
-         f'{badge("aviso" if tt["c4"] else "ok", str(tt["c4"]) + " 4xx")} {badge("erro" if tt["c5"] else "ok", str(tt["c5"]) + " 5xx")}</p>')
-if traf["routers"]:
-    P.append('<div class="scroll"><table><tr><th>Rota</th><th class=num>Req.</th><th class=num>4xx</th><th class=num>5xx</th><th class=num>Média</th><th>Última</th></tr>')
-    for r in traf["routers"]:
-        P.append(f'<tr><td>{esc(r["router"].removesuffix("@docker"))}</td><td class=num>{r["req"]}</td><td class=num>{r["c4"]}</td>'
-                 f'<td class=num>{"<b style=color:var(--er)>" + str(r["c5"]) + "</b>" if r["c5"] else 0}</td><td class=num>{r["avg_ms"]} ms</td><td class=mut style="white-space:nowrap">{esc(r["last"])}</td></tr>')
-    P.append("</table></div>")
-else:
-    P.append('<p class="mut">Sem requisições registradas (log de acesso do proxy vazio ou desligado).</p>')
-P.append("</section>")
-
-# containers
-P.append('<section class="wide"><h2>Containers</h2><div class="scroll"><table><tr><th>Container</th><th>Estado</th><th class=num>CPU</th><th class=num>Memória</th><th>Desde</th><th>Imagem</th></tr>')
-cur = None
-for c in cont:
-    if c["project"] != cur:
-        cur = c["project"]; n = [x for x in cont if x["project"] == cur]
-        bad = sum(1 for x in n if x["level"] == "erro")
-        P.append(f'<tr class=proj><td colspan=6>{esc(cur)} <span class="mut">({len(n)})</span> {badge("erro", str(bad) + " com problema") if bad else ""}</td></tr>')
-    state = c["status"] + (f" · {c['health']}" if c["health"] else "") + (f" · código {c['exit']}" if c["status"] == "exited" else "")
-    rst = f' <span class="mut">↻{c["restarts"]}</span>' if c["restarts"] else ""
-    P.append(f'<tr><td>{esc(c["name"])}</td><td>{badge(c["level"], state)}{rst}</td><td class=num>{esc(c["cpu"])}</td>'
-             f'<td class=num>{esc(c["mem"])}</td><td class=mut>{esc(c["since"])}</td><td class=mut>{esc(c["image"])}</td></tr>')
+# ---- aba: containers
+P.append('<section id="containers" role="tabpanel" aria-labelledby="t-containers" hidden><div class="panel"><table>'
+         '<tr><th>Container</th><th>Estado</th><th class="num opt">CPU</th><th class="num opt">Memória</th><th class="opt">Desde</th></tr>')
+for proj, cs in order:
+    P.append(f'<tr class="group"><td colspan="5">{esc(proj)}</td></tr>')
+    for c in cs:
+        st = state_text(c) + (f", {c['restarts']} reinício(s)" if c["restarts"] else "")
+        P.append(f'<tr><td><span class="name">{esc(c["name"])}</span><span class="sub">{esc(c["image"])}</span></td>'
+                 f'<td>{pill(c["level"] if c["level"] != "parado" else "aviso", st) if c["level"] != "ok" else esc(st)}</td>'
+                 f'<td class="num opt">{esc(c["cpu"])}</td><td class="num opt">{esc(c["mem"])}</td><td class="opt muted">{esc(c["since"])}</td></tr>')
 P.append("</table></div></section>")
 
-P.append(f"""</main><footer class="mut" style="text-align:center;padding:0 16px 24px">Gerado em {status['elapsed_ms']} ms por painel.sh</footer>
-<script>for(const a of document.querySelectorAll('a.lk')){{const s=a.dataset.scheme,p=a.dataset.port;
-a.href=s+'://'+location.hostname+((s==='https'&&p==='443')||(s==='http'&&p==='80')?'':':'+p)+'/';a.target='_blank';a.rel='noopener'}}</script>
-</body></html>""")
+# ---- aba: domínios e tráfego
+P.append('<section id="rede" role="tabpanel" aria-labelledby="t-rede" hidden>')
+P.append('<h2>Domínios públicos</h2><div class="panel">')
+if domains:
+    P.append('<table><tr><th>Domínio</th><th>Resposta</th><th class="num opt">Tempo</th><th>Certificado</th></tr>')
+    for d in domains:
+        rl = "erro" if d.get("proxy") or d["code"] == "000" or d["code"].startswith("5") else "ok"
+        days = d["cert_days"]
+        cert = pill("erro", "sem Let's Encrypt") if days is None else pill("ok" if days >= 15 else "aviso" if days >= 7 else "erro", f"{days} dias")
+        P.append(f'<tr><td><a class="name" href="https://{esc(d["domain"])}" target="_blank" rel="noopener">{esc(d["domain"])}</a>'
+                 f'<span class="sub">{esc(d.get("proxy") or (d["project"] + "/" + d["service"] if d["service"] else ""))}</span></td>'
+                 f'<td>{pill(rl, "sem resposta" if d["code"] == "000" else "HTTP " + d["code"])}</td>'
+                 f'<td class="num opt muted">{d["ms"]} ms</td><td>{cert}</td></tr>')
+    P.append("</table>")
+else:
+    P.append('<p class="empty">Nenhum domínio público configurado (public-route.sh add).</p>')
+P.append("</div>")
+tt = traf["total"]
+P.append(f'<h2>Tráfego nas últimas 24 h <span class="muted" style="font:400 14px var(--sans)">{plural(tt["req"], "requisição", "requisições")}</span></h2><div class="panel">')
+if traf["routers"]:
+    top = max(r["req"] for r in traf["routers"]) or 1
+    P.append('<table><tr><th>Rota</th><th class="opt">Volume</th><th class="num">4xx</th><th class="num">5xx</th><th class="num opt">Média</th></tr>')
+    for r in traf["routers"]:
+        P.append(f'<tr><td><span class="name">{esc(r["router"].removesuffix("@docker"))}</span><span class="sub">{r["req"]} req., última {esc(r["last"])}</span></td>'
+                 f'<td class="opt"><span class="bar"><i style="width:{max(2, round(100 * r["req"] / top))}%"></i></span></td>'
+                 f'<td class="num">{r["c4"]}</td><td class="num{" err" if r["c5"] else ""}">{r["c5"]}</td><td class="num opt muted">{r["avg_ms"]} ms</td></tr>')
+    P.append("</table>")
+else:
+    P.append('<p class="empty">Nenhuma requisição registrada. Confira ACCESS_LOG no proxy.conf.</p>')
+P.append("</div></section>")
+
+# ---- aba: servidor e backup
+h = host
+facts = [("Ligado há", esc(h.get("uptime"))), ("Carga", f'{esc(" / ".join(h.get("load", [])))} <span class="muted">em {h.get("cpus")} CPUs</span>')]
+if h.get("mem"):
+    m = h["mem"]; facts.append(("Memória", f'{human(m["used"])} de {human(m["total"])}{meter(m["pct"])}'))
+for d in h.get("disks", []):
+    facts.append((esc(d["label"]), f'{human(d["free"])} livres de {human(d["total"])}{meter(d["pct"])}'))
+if h.get("battery"):
+    bt = h["battery"]; facts.append(("Bateria", f'{bt["pct"]}%, ' + ("na tomada" if bt.get("ac", True) else '<span class="err">sem tomada</span>')))
+if h.get("temp"):
+    facts.append(("Temperatura", f'{h["temp"]} °C'))
+if lan:
+    facts.append(("Certificado LAN", f'{pill("ok" if lan["days"] >= 15 else "aviso", str(lan["days"]) + " dias")} <span class="muted">até {esc(lan["end"])}</span>'))
+bfacts = []
+if last:
+    bfacts += [("Último", f'{pill("ok" if last.get("ok") else "erro", "concluído" if last.get("ok") else "falhou")} {esc(bk["when"])}'),
+               ("Resultado", esc(last.get("message"))), ("Duração", f'{esc(last.get("duration_s"))} s')]
+else:
+    bfacts.append(("Último", pill("aviso", "sem registro")))
+if bk.get("next"):
+    bfacts.append(("Próximo", esc(bk["next"])))
+ext = bk.get("external")
+bfacts.append(("Disco externo", '<span class="muted">não configurado</span>' if ext is None else
+               (pill("ok", "conectado") if ext["mounted"] else pill("erro", "desconectado"))))
+dl = lambda fs: '<dl class="facts">' + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in fs) + "</dl>"
+P.append('<section id="sistema" role="tabpanel" aria-labelledby="t-sistema" hidden><div class="two">'
+         f'<div><h2>Servidor</h2><div class="panel">{dl(facts)}</div></div>'
+         f'<div><h2>Backup</h2><div class="panel">{dl(bfacts)}' +
+         (f'<pre>{esc(chr(10).join(bk["log"][-15:]))}</pre>' if bk.get("log") else "") + "</div></div></div></section>")
+
+P.append(f"""</main><footer>Atualiza sozinho a cada minuto. Dados em <a href="status.json">status.json</a>.</footer>
+<script>
+for(const a of document.querySelectorAll('a.lk')){{const s=a.dataset.scheme,p=a.dataset.port;
+  a.href=s+'://'+location.hostname+((s==='https'&&p==='443')||(s==='http'&&p==='80')?'':':'+p)+'/';a.target='_blank';a.rel='noopener'}}
+const tabs=[...document.querySelectorAll('[role=tab]')];
+function show(id){{if(!document.getElementById(id))id='geral';
+  for(const t of tabs){{const on=t.getAttribute('aria-controls')===id;t.setAttribute('aria-selected',on);t.tabIndex=on?0:-1;
+    document.getElementById(t.getAttribute('aria-controls')).hidden=!on}}}}
+for(const t of tabs)t.addEventListener('click',()=>{{history.replaceState(null,'','#'+t.getAttribute('aria-controls'));show(t.getAttribute('aria-controls'))}});
+document.querySelector('[role=tablist]').addEventListener('keydown',e=>{{const i=tabs.indexOf(document.activeElement);
+  if(i<0||!['ArrowLeft','ArrowRight'].includes(e.key))return;const n=tabs[(i+(e.key==='ArrowRight'?1:tabs.length-1))%tabs.length];n.focus();n.click()}});
+addEventListener('hashchange',()=>show(location.hash.slice(1)));
+show(location.hash.slice(1));
+setTimeout(()=>location.reload(),60000);   // mantém a aba aberta (o #hash fica na URL)
+</script></body></html>""")
 
 def write(name, content, mode=0o644):
     tmp = os.path.join(OUT, f".{name}.tmp")
