@@ -259,7 +259,7 @@ def public_domains(certs):
         level = "ok"
         if proxy:
             level = "erro"
-            hint = (" — rotas públicas fora do container? rode: public-route.sh apply na pasta do projeto"
+            hint = (" — rode public-route.sh check na pasta do projeto (container parado ou rota sem destino)"
                     if proxy == "sem rota no proxy" else " — container parado, reiniciando ou unhealthy")
             alerts.append(("erro", f"{d}: HTTP {code}, {proxy}{hint}"))
         elif code == "000" or code.startswith("5"):

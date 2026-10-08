@@ -3,7 +3,7 @@
 #   1. coloca o serviço na rede do proxy (onde o Seq está) — e migra a rede "coolify" legada;
 #   2. define Seq__ServerUrl e Seq__ApiKey no environment do serviço (a chave fica no .env
 #      do projeto, fora do Git: Seq__ApiKey: ${SEQ_APIKEY_<SERVIÇO>});
-#   3. recria o serviço (sem -f: o override das rotas públicas continua valendo);
+#   3. recria o serviço (as rotas públicas ficam no proxy, via public-route.sh, e não são afetadas);
 #   4. envia um evento de teste pela rede do próprio container e confere a chave.
 #
 #   seq-app.sh [-C DIR] add <serviço> [--key CHAVE | --sem-chave] [--yes]
@@ -56,7 +56,7 @@ ENV_FILE="$DIR/.env"
 command -v docker >/dev/null || die "docker não encontrado"
 docker info >/dev/null 2>&1 || die "Sem acesso ao Docker (usuário no grupo docker? ou use sudo)"
 command -v python3 >/dev/null || die "python3 não encontrado"
-compose() { docker compose --project-directory "$DIR" "$@"; }   # sem -f: inclui o override
+compose() { docker compose --project-directory "$DIR" "$@"; }   # inclui override, se houver
 
 PROXY_NETWORK="proxy"
 # shellcheck source=/dev/null
