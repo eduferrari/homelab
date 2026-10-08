@@ -53,6 +53,9 @@ ACCESS_LOG="true"'
 
 load_conf() {
   install -d -m 755 "$PROXY_DIR" "$PROXY_DIR/dynamic" "$PROXY_DIR/certs"
+  # rotas públicas dos projetos (public-route.sh, sem sudo) ficam em dynamic/: grupo docker escreve
+  # (quem está no grupo docker já controla os containers — não é permissão nova)
+  if getent group docker >/dev/null; then chgrp docker "$PROXY_DIR/dynamic"; chmod 2775 "$PROXY_DIR/dynamic"; fi
   install -d -m 700 "$PROXY_DIR/acme"
   install -d -m 755 "$PROXY_DIR/logs"
   [[ -f "$CONF" ]] || { printf '%s\n' "$DEFAULT_CONF" > "$CONF"; chmod 644 "$CONF"; }
