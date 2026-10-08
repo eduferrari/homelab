@@ -343,7 +343,7 @@ jobs:
 ```
 
 - Só os serviços com imagem nova são recriados; o `.env` e as rotas públicas do servidor continuam valendo.
-- Rode o compose **sem `-f`**: assim o Docker carrega também o `docker-compose.override.yml`, onde ficam as rotas públicas. Com `-f docker-compose.yml`, o container é recriado sem elas e o domínio passa a responder `404 page not found` (o painel geral alerta; corrija com `public-route.sh apply` na pasta do projeto). Se precisar do `-f`, liste os dois arquivos.
+- As rotas públicas ficam no proxy (`public-route.sh`), não no compose: o deploy pode usar `docker compose -f ...` ou `--project-directory` sem perder os domínios. Antes do `up`, um `docker compose ... config --quiet` faz o job falhar com uma mensagem clara se o compose do servidor estiver inválido.
 - Para voltar uma versão, troque `latest` pela tag do commit (`:<sha>`) no compose e rode `docker compose up -d`.
 
 ### 7.6 Painéis: geral, logs, tráfego, status e Seq — `monitor.sh`
@@ -423,7 +423,7 @@ O `add`:
 1. Põe o serviço na rede `proxy`, onde o Seq está. Se o compose ainda usa a rede legada `coolify`, troca por `proxy` no arquivo todo (pede confirmação).
 2. Acrescenta `Seq__ServerUrl: http://seq:5341` e `Seq__ApiKey: ${SEQ_APIKEY_<SERVIÇO>}` no `environment:` do serviço. A chave fica no `.env` do projeto, fora do Git.
 3. Valida o compose. Se der erro, volta o original (há sempre um backup `docker-compose.yml.bak-<data>`).
-4. Recria o serviço **sem `-f`**, mantendo as rotas públicas.
+4. Recria o serviço (as rotas públicas ficam no proxy e não são afetadas).
 5. Envia um evento "Teste do homelab" pela rede do container.
 
 Comentários e formatação do compose são preservados. Opções: `--key <chave>`, `--sem-chave`, `--yes`, `-C <pasta>`.
@@ -541,7 +541,7 @@ Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o
 4. **Rota pública para a app** — escolha **um** caminho por domínio (dois lugares declarando o mesmo domínio geram conflito):
 
    - **Certificado:** o Traefik emite o Let's Encrypt sozinho. Padrão: desafio TLS-ALPN-01, **só pela porta 443** (funciona mesmo se a 80 for do roteador); `sudo proxy.sh acme http` troca para HTTP-01 (porta 80).
-   - **App em Docker Compose próprio:** use o `public-route.sh` na pasta do projeto — ele lê as labels Traefik que o serviço já tem (nome do serviço Traefik, middlewares), gera as rotas públicas no `docker-compose.override.yml` e recria só os serviços afetados. O `docker-compose.yml` do projeto não é alterado e as rotas da LAN continuam iguais.
+   - **App em Docker Compose próprio:** use o `public-route.sh` na pasta do projeto. Ele lê no compose as labels Traefik que o serviço já tem (nome do serviço Traefik, middlewares) e grava as rotas públicas na configuração do **proxy** (`/opt/homelab/proxy/dynamic/public-<projeto>.yaml`), apontando para esse serviço. Nada no projeto é alterado, nenhum container é recriado e as rotas da LAN continuam iguais. Como as rotas não dependem do container, elas **sobrevivem a qualquer deploy**: compose com ou sem `-f`, container recriado ou trocado.
      ```bash
      cd /opt/homelab/apps/<projeto>
      /opt/homelab/scripts/public-route.sh add api api.seudominio.com.br    # <serviço do compose> <domínio>
@@ -550,7 +550,9 @@ Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o
      /opt/homelab/scripts/public-route.sh check           # testa cada domínio e aponta conflitos
      /opt/homelab/scripts/public-route.sh remove web      # despublica
      ```
-     Requisitos do serviço: container rodando, na rede do proxy (`proxy`), com `traefik.enable=true` e `traefik.http.services.<nome>.loadbalancer.server.port`. O middleware `homelab-lan-only` não vai para a rota pública; os demais (cabeçalhos, compressão) sim. Se já existir um `docker-compose.override.yml` feito à mão, o script para; revise-o e rode com `--force` (faz backup).
+     Requisitos do serviço: na rede do proxy (`proxy`), com `traefik.enable=true` e `traefik.http.services.<nome>.loadbalancer.server.port`. O middleware `homelab-lan-only` não vai para a rota pública; os demais (cabeçalhos, compressão) sim. Não precisa de sudo: o grupo `docker` escreve em `proxy/dynamic`.
+
+     **Versões anteriores** guardavam as rotas no `docker-compose.override.yml` do projeto e as perdiam a cada deploy com `-f`. Um `public-route.sh apply` na pasta do projeto migra: grava as rotas no proxy, guarda o override antigo (`docker-compose.override.yml.bak-<data>`) e recria os serviços sem as labels antigas.
 
      **Conflitos** que o `check` aponta: containers de outros projetos com o mesmo domínio (regra mais longa, como `Host(...) && PathPrefix(/)`, **vence**; se esse container estiver parado ou reiniciando, o resultado é `no available server`) e rotas em arquivo em `/opt/homelab/proxy/dynamic`.
 5. **Diagnóstico:**
@@ -830,7 +832,7 @@ sudo tlp fullcharge BAT0
 | Navegador/tablet: certificado inválido | CA não instalada no dispositivo, ou o IP mudou: `sudo /opt/homelab/scripts/homelab-ca.sh` (status) e `issue` |
 | Acesso pelo IP falha com erro de TLS | `/opt/homelab/proxy/dynamic/homelab-lan.yaml` ausente: `sudo /opt/homelab/scripts/homelab-ca.sh issue` |
 | `404 page not found` (Traefik) | Nenhuma rota casou: confira entrypoint/rule das labels ou do arquivo em `dynamic/`; `sudo proxy.sh logs` |
-| Domínio público com `404 page not found` depois de um deploy | O container foi recriado sem o `docker-compose.override.yml` (compose com `-f`): `public-route.sh apply` na pasta do projeto e tire o `-f` do deploy (seção 7.5) |
+| Domínio público com `404 page not found` | Rode `public-route.sh check` na pasta do projeto: aponta container parado, rota sem destino ou rotas ainda no formato antigo (`docker-compose.override.yml` — `public-route.sh apply` migra) |
 | `502 Bad Gateway` (Traefik) | O container de destino não está na rede `proxy` (ou na de `traefik.docker.network`) ou a porta está errada |
 | Painel não abre (`:9443`–`:9446`) | `sudo monitor.sh` (status); `sudo proxy.sh` mostra as portas `painel-*`; acesso só da LAN/Tailscale. Tráfego vazio: confira `ACCESS_LOG="true"` em `proxy.conf` e `docker logs goaccess` |
 | `403 Forbidden` na LAN | O middleware `homelab-lan-only` não reconhece a origem (ex.: rede fora das faixas privadas) |
