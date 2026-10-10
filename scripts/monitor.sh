@@ -8,6 +8,7 @@
 #   Tráfego ..... GoAccess      — requisições por rota, status, IPs, páginas  (padrão :9444)
 #   Status ...... Uptime Kuma   — monitora domínios/portas e envia alertas    (padrão :9445)
 #   Seq ......... Seq           — logs estruturados (Serilog) das apps .NET   (padrão :9446)
+#   Adminer, RedisInsight e RabbitMQ (stack de dados) também passam pelo proxy:  :9447, :9448, :9449
 #
 # O log do backup (/var/log/homelab/backup.log) aparece no Dozzle como o container "backup-log".
 #
@@ -49,6 +50,10 @@ SEQ="true"              # logs estruturados das apps (.NET/Serilog → http://se
 SEQ_PORT="9446"
 SEQ_MEMORY="1g"         # limite de memória do Seq
 BACKUP_LOG="true"       # mostra o log do backup no Dozzle (container backup-log)
+INFRA_UIS="true"        # Adminer, RedisInsight e RabbitMQ (stack de dados) em HTTPS pelo proxy
+ADMINER_UI_PORT="9447"
+REDIS_UI_PORT="9448"
+RABBITMQ_UI_HTTPS_PORT="9449"
 # Imagens
 DOZZLE_IMAGE="amir20/dozzle:latest"
 GOACCESS_IMAGE="allinurl/goaccess:latest"
@@ -65,7 +70,7 @@ load_conf() {
   [[ -f "$CONF" ]] || { printf '%s\n' "$DEFAULT_CONF" > "$CONF"; chmod 644 "$CONF"; }
   # monitor.conf de versões anteriores: acrescenta as opções novas (com o valor padrão)
   local key added=""
-  for key in PAINEL PAINEL_PORT BACKUP_LOG; do
+  for key in PAINEL PAINEL_PORT BACKUP_LOG INFRA_UIS ADMINER_UI_PORT REDIS_UI_PORT RABBITMQ_UI_HTTPS_PORT; do
     grep -q "^${key}=" "$CONF" || added+="$(grep "^${key}=" <<<"$DEFAULT_CONF")"$'\n'
   done
   [[ -z "$added" ]] || printf '# Opções novas (monitor.sh)\n%s' "$added" >> "$CONF"
@@ -77,6 +82,8 @@ load_conf() {
   UPTIME_KUMA="${UPTIME_KUMA:-true}"; UPTIME_KUMA_PORT="${UPTIME_KUMA_PORT:-9445}"
   SEQ="${SEQ:-true}"; SEQ_PORT="${SEQ_PORT:-9446}"; SEQ_MEMORY="${SEQ_MEMORY:-1g}"
   BACKUP_LOG="${BACKUP_LOG:-true}"
+  INFRA_UIS="${INFRA_UIS:-true}"; ADMINER_UI_PORT="${ADMINER_UI_PORT:-9447}"
+  REDIS_UI_PORT="${REDIS_UI_PORT:-9448}"; RABBITMQ_UI_HTTPS_PORT="${RABBITMQ_UI_HTTPS_PORT:-9449}"
   DOZZLE_IMAGE="${DOZZLE_IMAGE:-amir20/dozzle:latest}"
   GOACCESS_IMAGE="${GOACCESS_IMAGE:-allinurl/goaccess:latest}"
   WEB_IMAGE="${WEB_IMAGE:-nginx:alpine}"
@@ -127,6 +134,9 @@ panels() {
   [[ "$GOACCESS" == true ]]    && echo "painel-trafego $GOACCESS_PORT"
   [[ "$UPTIME_KUMA" == true ]] && echo "painel-status $UPTIME_KUMA_PORT"
   [[ "$SEQ" == true ]]         && echo "painel-seq $SEQ_PORT"
+  if [[ "$INFRA_UIS" == true ]]; then   # containers da stack de dados (labels no compose da infra)
+    echo "painel-adminer $ADMINER_UI_PORT"; echo "painel-redis $REDIS_UI_PORT"; echo "painel-rabbitmq $RABBITMQ_UI_HTTPS_PORT"
+  fi
   return 0
 }
 
@@ -425,8 +435,11 @@ cmd_status() {
       painel-trafego) c=goaccess-web; label="Tráfego (GoAccess)" ;;
       painel-status)  c=uptime-kuma;  label="Status (Uptime Kuma)" ;;
       painel-seq)     c=seq;          label="Seq (logs .NET)" ;;
+      painel-adminer) c=adminer;      label="Adminer (MySQL)" ;;
+      painel-redis)   c=redisinsight; label="RedisInsight" ;;
+      painel-rabbitmq) c=rabbitmq;    label="RabbitMQ" ;;
     esac
-    s="$(docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' "$c" 2>/dev/null || echo 'parado')"
+    s="$(docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' "$c" 2>/dev/null)" || s="não instalado"
     printf '  %s%*s https://%s:%s  |  https://%s:%s   [%s]\n' "$label" $((22 - ${#label})) '' "$host" "$port" "$ip" "$port" "$s"
   done < <(panels)
   [[ "$SEQ" == true ]] && echo "  Apps .NET → Seq: WriteTo.Seq(\"http://seq:5341\")  (serviço na rede ${PROXY_NETWORK})"

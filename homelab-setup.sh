@@ -425,18 +425,18 @@ MYSQL_USER=dev
 MYSQL_PASSWORD=$(gen_secret)
 
 # Adminer
-ADMINER_PORT=8088
+ADMINER_PORT=8088            # (não usado: o Adminer abre em https://<host>:9447, monitor.conf)
 
 # Redis 7
 REDIS_PORT=6379
 REDIS_PASSWORD=$(gen_secret)
 
 # RedisInsight
-REDISINSIGHT_PORT=5540
+REDISINSIGHT_PORT=5540       # (não usado: https://<host>:9448)
 
 # RabbitMQ 4
 RABBITMQ_PORT=5672
-RABBITMQ_UI_PORT=15672
+RABBITMQ_UI_PORT=15672       # (não usado: https://<host>:9449)
 RABBITMQ_DEFAULT_USER=admin
 RABBITMQ_DEFAULT_PASS=$(gen_secret)
 
@@ -510,12 +510,19 @@ services:
     environment:
       ADMINER_DEFAULT_SERVER: mysql
       ADMINER_DESIGN: dracula
-    ports:
-      - "${ADMINER_PORT}:8080"
     depends_on:
       mysql:
         condition: service_healthy
-    networks: [devnet]
+    networks: [devnet, proxy]
+    labels:   # painel na LAN pelo proxy (HTTPS, CA do homelab): porta em monitor.conf (painel-adminer)
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.painel-adminer.entrypoints=painel-adminer
+      - traefik.http.routers.painel-adminer.rule=PathPrefix(`/`)
+      - traefik.http.routers.painel-adminer.tls=true
+      - traefik.http.routers.painel-adminer.middlewares=homelab-lan-only@file
+      - traefik.http.routers.painel-adminer.service=painel-adminer
+      - traefik.http.services.painel-adminer.loadbalancer.server.port=8080
 
   redis:
     image: redis:7-alpine
@@ -546,14 +553,21 @@ services:
       RI_REDIS_PORT: "6379"
       RI_REDIS_ALIAS: homelab-redis
       RI_REDIS_PASSWORD: ${REDIS_PASSWORD}
-    ports:
-      - "${REDISINSIGHT_PORT}:5540"
     volumes:
       - redisinsight_data:/data
     depends_on:
       redis:
         condition: service_healthy
-    networks: [devnet]
+    networks: [devnet, proxy]
+    labels:   # painel na LAN pelo proxy (HTTPS, CA do homelab): porta em monitor.conf (painel-redis)
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.painel-redis.entrypoints=painel-redis
+      - traefik.http.routers.painel-redis.rule=PathPrefix(`/`)
+      - traefik.http.routers.painel-redis.tls=true
+      - traefik.http.routers.painel-redis.middlewares=homelab-lan-only@file
+      - traefik.http.routers.painel-redis.service=painel-redis
+      - traefik.http.services.painel-redis.loadbalancer.server.port=5540
 
   rabbitmq:
     image: rabbitmq:4-management
@@ -566,7 +580,6 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
     ports:
       - "${RABBITMQ_PORT}:5672"
-      - "${RABBITMQ_UI_PORT}:15672"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -575,7 +588,16 @@ services:
       timeout: 10s
       retries: 10
       start_period: 30s
-    networks: [devnet]
+    networks: [devnet, proxy]
+    labels:   # painel na LAN pelo proxy (HTTPS, CA do homelab): porta em monitor.conf (painel-rabbitmq)
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.painel-rabbitmq.entrypoints=painel-rabbitmq
+      - traefik.http.routers.painel-rabbitmq.rule=PathPrefix(`/`)
+      - traefik.http.routers.painel-rabbitmq.tls=true
+      - traefik.http.routers.painel-rabbitmq.middlewares=homelab-lan-only@file
+      - traefik.http.routers.painel-rabbitmq.service=painel-rabbitmq
+      - traefik.http.services.painel-rabbitmq.loadbalancer.server.port=15672
 
 volumes:
   mysql_data:
@@ -586,6 +608,8 @@ volumes:
 networks:
   devnet:
     external: true
+  proxy:
+    external: true
 EOF
 chown "$HOMELAB_USER":docker "$INFRA_DIR/docker-compose.yml"
 ok "docker-compose.yml gerado em $INFRA_DIR"
@@ -593,6 +617,8 @@ ok "docker-compose.yml gerado em $INFRA_DIR"
 # ======================= 10. Subindo a stack de dados ========================
 step "10/13 Baixando imagens e subindo MySQL, Redis e RabbitMQ"
 cd "$INFRA_DIR"
+# Adminer, RedisInsight e RabbitMQ UI ficam atrás do proxy (rede "proxy", criada aqui se faltar)
+docker network inspect proxy >/dev/null 2>&1 || docker network create proxy >/dev/null
 docker compose pull -q
 docker compose up -d --wait --wait-timeout 240
 ok "Stack de dados no ar"
@@ -764,9 +790,9 @@ ${C_GREEN}=====================================================================
   Painéis ........ logs :9443 | tráfego :9444 | status :9445 | Seq :9446   [${MONITOR_STATE}]
                    senha: sudo ${HOMELAB_DIR}/scripts/monitor.sh credenciais
   Projetos ....... ${HOMELAB_DIR}/apps/<projeto>  (compose na rede "proxy"; deploy: GitHub Actions + runner)
-  Adminer ........ http://${HOST}:$(grep -m1 '^ADMINER_PORT=' "$ENV_FILE" | cut -d= -f2)   (servidor: mysql)
-  RedisInsight ... http://${HOST}:5540
-  RabbitMQ UI .... http://${HOST}:15672
+  Adminer ........ https://${HOST}:9447   (servidor: mysql)
+  RedisInsight ... https://${HOST}:9448
+  RabbitMQ UI .... https://${HOST}:9449
   MySQL / Redis .. ${IP}:3306 / ${IP}:6379   |   RabbitMQ AMQP ${IP}:5672
 
   Credenciais .... sudo cat ${ENV_FILE}
