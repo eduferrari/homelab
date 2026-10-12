@@ -239,8 +239,8 @@ def public_domains(certs):
                 parts = line.split("#")[0].split()
                 if len(parts) >= 2:
                     doms[parts[1]] = {"project": p, "service": parts[0]}
-    for d in certs:
-        doms.setdefault(d, {"project": "", "service": ""})
+    # Só os domínios publicados (public-routes.conf). Certificados de domínios que saíram
+    # continuam no acme.json até vencer — não são problema e não entram na lista.
     def check(d):
         # corpo + "código tempo" na última linha: o corpo diferencia o 404/503 do próprio Traefik
         # (rota ausente / sem servidor) do 404 da aplicação (ex.: raiz de uma API)
