@@ -370,10 +370,11 @@ def links():
         if p and not n.startswith("painel"):
             L.append({"group": "Projetos (LAN)", "name": n, "desc": f"entrypoint {n}", "scheme": "https", "port": p})
     L.append({"group": "Projetos (LAN)", "name": "443", "desc": "rotas na porta padrão", "scheme": "https", "port": "443"})
-    for key, name, desc, dflt in (("ADMINER_PORT", "Adminer", "MySQL (servidor: mysql)", "8088"),
-                                  ("REDISINSIGHT_PORT", "RedisInsight", "Redis", "5540"),
-                                  ("RABBITMQ_UI_PORT", "RabbitMQ", "Filas e conexões", "15672")):
-        L.append({"group": "Infraestrutura", "name": name, "desc": desc, "scheme": "http", "port": infra.get(key, dflt)})
+    if on("INFRA_UIS"):
+        for key, name, desc, dflt in (("ADMINER_UI_PORT", "Adminer", "MySQL (servidor: mysql)", "9447"),
+                                      ("REDIS_UI_PORT", "RedisInsight", "Redis", "9448"),
+                                      ("RABBITMQ_UI_HTTPS_PORT", "RabbitMQ", "Filas e conexões", "9449")):
+            L.append({"group": "Infraestrutura", "name": name, "desc": desc, "scheme": "https", "port": mon.get(key, dflt)})
     return L
 
 t0 = time.time()

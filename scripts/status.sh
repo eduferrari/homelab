@@ -23,7 +23,7 @@ else
 fi
 echo
 echo "== Painéis (só LAN) =="
-for c in painel:9440 dozzle:9443 goaccess-web:9444 uptime-kuma:9445 seq:9446; do
+for c in painel:9440 dozzle:9443 goaccess-web:9444 uptime-kuma:9445 seq:9446 adminer:9447 redisinsight:9448 rabbitmq:9449; do
   n="${c%%:*}"; s="$(docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null || echo '-')"
   [[ "$s" == "-" ]] || printf '%-14s %-10s https://%s:%s\n' "$n" "$s" "$HOST" "${c##*:}"
 done

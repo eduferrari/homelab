@@ -12,10 +12,10 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 | Projetos | Projetos em Docker Compose | — | `/opt/homelab/apps/<projeto>` |
 | Painéis | **Painel geral**, logs (Dozzle), tráfego (GoAccess), status (Uptime Kuma), Seq | 9440, 9443, 9444, 9445, 9446 | `https://<host>:<porta>` (seção 7.6) |
 | Dados | MySQL 8.4 | 3306 | clientes MySQL / apps |
-| Dados | Adminer | **8088** | `http://<host>:8088` |
+| Dados | Adminer | 9447 | `https://<host>:9447` (pelo proxy, só LAN) |
 | Dados | Redis 7 | 6379 | clientes Redis / apps |
-| Dados | RedisInsight | 5540 | `http://<host>:5540` |
-| Dados | RabbitMQ 4 (AMQP / Management) | 5672 / 15672 | `http://<host>:15672` |
+| Dados | RedisInsight | 9448 | `https://<host>:9448` (pelo proxy, só LAN) |
+| Dados | RabbitMQ 4 (AMQP / Management) | 5672 / 9449 | AMQP direto; painel em `https://<host>:9449` (pelo proxy, só LAN) |
 | Host | SSH | 22 | `ssh <usuario>@<host>` |
 
 `<host>` é o nome mDNS do L14 — `homelab.local` — ou o IP fixo da LAN.
@@ -365,7 +365,7 @@ sudo /opt/homelab/scripts/monitor.sh apply         # aplica monitor.conf editado
 sudo /opt/homelab/scripts/monitor.sh remove        # para os painéis e fecha as portas (dados preservados)
 ```
 
-- Configuração em `/opt/homelab/monitor/monitor.conf` (`PAINEL`, `DOZZLE`, `GOACCESS`, `UPTIME_KUMA`, `SEQ`, `BACKUP_LOG` = `true`/`false`, portas, imagens, `SEQ_MEMORY`); senha em `/opt/homelab/monitor/.env` (600). Trocou a senha no `.env`? Rode `monitor.sh apply`.
+- Configuração em `/opt/homelab/monitor/monitor.conf` (`PAINEL`, `DOZZLE`, `GOACCESS`, `UPTIME_KUMA`, `SEQ`, `BACKUP_LOG` = `true`/`false`, portas, imagens, `SEQ_MEMORY`, `SEQ_NETWORKS`); senha em `/opt/homelab/monitor/.env` (600). Trocou a senha no `.env`? Rode `monitor.sh apply`.
 - O tráfego vem do **log de acesso do proxy** (`/opt/homelab/proxy/logs/access.log`, `ACCESS_LOG="true"` no `proxy.conf`), com rotação diária (14 dias). Nenhum projeto precisa mudar.
 - No Uptime Kuma, crie o usuário logo após a instalação. Monitores úteis: cada domínio público (HTTP + validade do certificado) e as portas da LAN (`https://<IP>:<porta>`, ignorando o certificado ou instalando a CA).
 
@@ -397,7 +397,7 @@ sudo /opt/homelab/scripts/painel.sh json     # os mesmos dados em JSON (também 
    ```
    Use `https://127.0.0.1:9445/...` (o backup roda no próprio servidor; o certificado da LAN é aceito). Cada backup completo envia `up` ou `down` com a mensagem do resultado; sem aviso por 25 h, o Kuma alerta sozinho. Configure a notificação (Telegram, e-mail…) no próprio monitor.
 
-**Enviando logs de uma API .NET para o Seq** (serviço na rede `proxy`):
+**Enviando logs de uma API .NET para o Seq** (serviço na rede `proxy` ou na `devnet`; o Seq está nas duas — redes extras em `SEQ_NETWORKS` no `monitor.conf`):
 
 ```csharp
 // dotnet add package Serilog.AspNetCore Serilog.Sinks.Seq
@@ -527,7 +527,7 @@ Internet ─► api.seudominio.com.br (DNS A) ─► 203.0.113.10 (roteador/ONT)
 
 Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o IP fixo do L14 na LAN e `api`/`app.seudominio.com.br` domínios do seu projeto.
 
-1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, os painéis (9443–9446), 3306, 6379, 5672 nem 15672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
+1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, os painéis (9440–9449), 3306, 6379 nem 5672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
 2. **DNS** (zona do seu domínio, ex.: Registro.br) — um registro por subdomínio:
    ```text
    api   A   203.0.113.10   TTL 300
@@ -589,9 +589,11 @@ sudo cat /opt/homelab/infra/.env      # credenciais
 
 | Serviço | Endereço | Login |
 |---|---|---|
-| Adminer | `http://<host>:8088` | servidor `mysql`; `root`/`MYSQL_ROOT_PASSWORD` ou `dev`/`MYSQL_PASSWORD` |
-| RedisInsight | `http://<host>:5540` | banco `homelab-redis` pré-cadastrado (`REDIS_PASSWORD`) |
-| RabbitMQ | `http://<host>:15672` | `admin` / `RABBITMQ_DEFAULT_PASS` |
+| Adminer | `https://<host>:9447` | servidor `mysql`; `root`/`MYSQL_ROOT_PASSWORD` ou `dev`/`MYSQL_PASSWORD` |
+| RedisInsight | `https://<host>:9448` | banco `homelab-redis` pré-cadastrado (`REDIS_PASSWORD`) |
+| RabbitMQ | `https://<host>:9449` | `admin` / `RABBITMQ_DEFAULT_PASS` |
+
+Os três abrem pelo proxy, em HTTPS com o certificado da CA do homelab e só pela LAN/Tailscale, como os painéis (portas em `/opt/homelab/monitor/monitor.conf`: `ADMINER_UI_PORT`, `REDIS_UI_PORT`, `RABBITMQ_UI_HTTPS_PORT`). Versões anteriores publicavam em HTTP nas portas 8088, 5540 e 15672 — o Safari bloqueava essas portas depois de ver HTTPS no mesmo nome (HSTS).
 
 Connection strings:
 
