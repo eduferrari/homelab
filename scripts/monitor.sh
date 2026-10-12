@@ -49,6 +49,7 @@ UPTIME_KUMA_PORT="9445"
 SEQ="true"              # logs estruturados das apps (.NET/Serilog → http://seq:5341)
 SEQ_PORT="9446"
 SEQ_MEMORY="1g"         # limite de memória do Seq
+SEQ_NETWORKS="devnet"   # redes extras do Seq (além da do proxy): apps só na devnet também alcançam http://seq:5341
 BACKUP_LOG="true"       # mostra o log do backup no Dozzle (container backup-log)
 INFRA_UIS="true"        # Adminer, RedisInsight e RabbitMQ (stack de dados) em HTTPS pelo proxy
 ADMINER_UI_PORT="9447"
@@ -70,7 +71,7 @@ load_conf() {
   [[ -f "$CONF" ]] || { printf '%s\n' "$DEFAULT_CONF" > "$CONF"; chmod 644 "$CONF"; }
   # monitor.conf de versões anteriores: acrescenta as opções novas (com o valor padrão)
   local key added=""
-  for key in PAINEL PAINEL_PORT BACKUP_LOG INFRA_UIS ADMINER_UI_PORT REDIS_UI_PORT RABBITMQ_UI_HTTPS_PORT; do
+  for key in PAINEL PAINEL_PORT BACKUP_LOG SEQ_NETWORKS INFRA_UIS ADMINER_UI_PORT REDIS_UI_PORT RABBITMQ_UI_HTTPS_PORT; do
     grep -q "^${key}=" "$CONF" || added+="$(grep "^${key}=" <<<"$DEFAULT_CONF")"$'\n'
   done
   [[ -z "$added" ]] || printf '# Opções novas (monitor.sh)\n%s' "$added" >> "$CONF"
@@ -81,6 +82,7 @@ load_conf() {
   GOACCESS="${GOACCESS:-true}"; GOACCESS_PORT="${GOACCESS_PORT:-9444}"; GOACCESS_INTERVAL="${GOACCESS_INTERVAL:-60}"
   UPTIME_KUMA="${UPTIME_KUMA:-true}"; UPTIME_KUMA_PORT="${UPTIME_KUMA_PORT:-9445}"
   SEQ="${SEQ:-true}"; SEQ_PORT="${SEQ_PORT:-9446}"; SEQ_MEMORY="${SEQ_MEMORY:-1g}"
+  SEQ_NETWORKS="${SEQ_NETWORKS-devnet}"
   BACKUP_LOG="${BACKUP_LOG:-true}"
   INFRA_UIS="${INFRA_UIS:-true}"; ADMINER_UI_PORT="${ADMINER_UI_PORT:-9447}"
   REDIS_UI_PORT="${REDIS_UI_PORT:-9448}"; RABBITMQ_UI_HTTPS_PORT="${RABBITMQ_UI_HTTPS_PORT:-9449}"
@@ -276,8 +278,18 @@ remove_painel_timer() {
   systemctl daemon-reload 2>/dev/null || true
 }
 
+# Redes extras do Seq que existem de fato (uma rede ausente impediria o compose de subir).
+seq_networks() {
+  local n
+  for n in $SEQ_NETWORKS; do
+    [[ "$n" == "$PROXY_NETWORK" ]] && continue
+    if docker network inspect "$n" >/dev/null 2>&1; then echo "$n"; else warn "Rede '$n' (SEQ_NETWORKS) não existe — Seq fica só na rede $PROXY_NETWORK"; fi
+  done
+}
+
 generate_compose() {
-  local out="$1"
+  local out="$1" extra=""
+  [[ "$SEQ" == true ]] && extra="$(seq_networks | xargs)"
   {
     echo "# Gerado por monitor.sh — NÃO edite. Configure $CONF e rode: sudo monitor.sh apply"
     echo "name: homelab-monitor"
@@ -359,7 +371,7 @@ EOF
       SEQ_CACHE_SYSTEMRAMTARGET: "0.1"
     volumes:
       - ./seq:/data
-    networks: [${PROXY_NETWORK}]
+    networks: [${PROXY_NETWORK}${extra:+, ${extra// /, }}]
 EOF
       labels painel-seq 80
     fi
@@ -378,9 +390,12 @@ EOF
 EOF
     fi
     echo "networks:"
-    echo "  ${PROXY_NETWORK}:"
-    echo "    name: ${PROXY_NETWORK}"
-    echo "    external: true"
+    local n
+    for n in "$PROXY_NETWORK" $extra; do
+      echo "  ${n}:"
+      echo "    name: ${n}"
+      echo "    external: true"
+    done
   } > "$out"
 }
 
@@ -442,7 +457,7 @@ cmd_status() {
     s="$(docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' "$c" 2>/dev/null)" || s="não instalado"
     printf '  %s%*s https://%s:%s  |  https://%s:%s   [%s]\n' "$label" $((22 - ${#label})) '' "$host" "$port" "$ip" "$port" "$s"
   done < <(panels)
-  [[ "$SEQ" == true ]] && echo "  Apps .NET → Seq: WriteTo.Seq(\"http://seq:5341\")  (serviço na rede ${PROXY_NETWORK})"
+  [[ "$SEQ" == true ]] && echo "  Apps .NET → Seq: WriteTo.Seq(\"http://seq:5341\")  (serviço na rede ${PROXY_NETWORK}${SEQ_NETWORKS:+ ou ${SEQ_NETWORKS// / ou }})"
   return 0
 }
 

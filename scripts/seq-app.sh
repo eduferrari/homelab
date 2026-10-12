@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Liga um serviço de um projeto Docker Compose ao Seq do homelab (logs estruturados, monitor.sh):
-#   1. coloca o serviço na rede do proxy (onde o Seq está) — e migra a rede "coolify" legada;
+#   1. garante uma rede em comum com o Seq (a do proxy, se o serviço ainda não compartilha nenhuma,
+#      como a devnet) — e migra a rede "coolify" legada;
 #   2. define Seq__ServerUrl e Seq__ApiKey no environment do serviço (a chave fica no .env
 #      do projeto, fora do Git: Seq__ApiKey: ${SEQ_APIKEY_<SERVIÇO>});
 #   3. recria o serviço (as rotas públicas ficam no proxy, via public-route.sh, e não são afetadas);
@@ -61,6 +62,22 @@ compose() { docker compose --project-directory "$DIR" "$@"; }   # inclui overrid
 PROXY_NETWORK="proxy"
 # shellcheck source=/dev/null
 [[ -r "$PROXY_DIR/proxy.conf" ]] && PROXY_NETWORK="$(. "$PROXY_DIR/proxy.conf"; echo "${PROXY_NETWORK:-proxy}")"
+
+# Redes do container do Seq (vazio se não estiver rodando).
+seq_nets() { docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$SEQ_CONTAINER" 2>/dev/null || true; }
+# Redes (nome real) de um serviço segundo o compose.
+svc_nets() {
+  compose config --format json | python3 -c '
+import json, sys
+c = json.load(sys.stdin); s = c["services"].get(sys.argv[1], {}); top = c.get("networks") or {}
+nets = s.get("networks") or {"default": None}
+print(" ".join((top.get(n) or {}).get("name", n) for n in nets))' "$1"
+}
+shared_net() {   # shared_net "redes A" "redes B" → primeira em comum
+  local a
+  for a in $1; do [[ " $2 " == *" $a "* ]] && { echo "$a"; return 0; }; done
+  return 1
+}
 
 key_var() { echo "SEQ_APIKEY_$(tr '[:lower:]-.' '[:upper:]__' <<<"$1")"; }
 container_of() { compose ps -q "$1" 2>/dev/null | head -1; }
@@ -123,28 +140,29 @@ def find_key(key):
     return None
 
 changes = []
-# ---- redes do serviço
-n = find_key("networks")
-if n is None:
-    lines.insert(b, f"{pad}networks: [default, {net}]"); b += 1
-    changes.append(f"{svc}: networks: [default, {net}]")
-else:
-    m = re.match(r"^(\s*networks:\s*)\[(.*)\]\s*(#.*)?$", lines[n])
-    if m:
-        items = [x.strip() for x in m.group(2).split(",") if x.strip()]
-        if net not in items:
-            items.append(net)
-            lines[n] = f"{m.group(1)}[{', '.join(items)}]" + (f"  {m.group(3)}" if m.group(3) else "")
-            changes.append(f"{svc}: rede {net} adicionada")
+# ---- redes do serviço (net vazio: o serviço já compartilha uma rede com o Seq)
+if net:
+    n = find_key("networks")
+    if n is None:
+        lines.insert(b, f"{pad}networks: [default, {net}]"); b += 1
+        changes.append(f"{svc}: networks: [default, {net}]")
     else:
-        e = block(n + 1, ci)
-        sub = [lines[j] for j in range(n + 1, e) if not blank(lines[j])]
-        names = [re.sub(r"^\s*-\s*", "", l).split(":")[0].strip() for l in sub]
-        if net not in names:
-            ii = indent(sub[0]) if sub else ci + 2
-            new = f"{' ' * ii}- {net}" if sub and sub[0].lstrip().startswith("-") else f"{' ' * ii}{net}: {{}}"
-            lines.insert(e, new); b += 1
-            changes.append(f"{svc}: rede {net} adicionada")
+        m = re.match(r"^(\s*networks:\s*)\[(.*)\]\s*(#.*)?$", lines[n])
+        if m:
+            items = [x.strip() for x in m.group(2).split(",") if x.strip()]
+            if net not in items:
+                items.append(net)
+                lines[n] = f"{m.group(1)}[{', '.join(items)}]" + (f"  {m.group(3)}" if m.group(3) else "")
+                changes.append(f"{svc}: rede {net} adicionada")
+        else:
+            e = block(n + 1, ci)
+            sub = [lines[j] for j in range(n + 1, e) if not blank(lines[j])]
+            names = [re.sub(r"^\s*-\s*", "", l).split(":")[0].strip() for l in sub]
+            if net not in names:
+                ii = indent(sub[0]) if sub else ci + 2
+                new = f"{' ' * ii}- {net}" if sub and sub[0].lstrip().startswith("-") else f"{' ' * ii}{net}: {{}}"
+                lines.insert(e, new); b += 1
+                changes.append(f"{svc}: rede {net} adicionada")
 
 # ---- environment do serviço
 want = {"Seq__ServerUrl": url}
@@ -172,18 +190,19 @@ else:
     sys.exit(f"'environment' do serviço {svc} em formato não suportado (use bloco: CHAVE: valor)")
 
 # ---- rede declarada no fim do arquivo
-t = next((i for i, l in enumerate(lines) if re.match(r"^networks:\s*(#.*)?$", l)), None)
-if t is None:
-    while lines and not lines[-1].strip():
-        lines.pop()
-    lines += ["", "networks:", f"  {net}:", "    external: true", ""]
-    changes.append(f"networks: {net} (external)")
-else:
-    e = block(t + 1, 0)
-    ti = child_indent(t + 1, e, 2)
-    if not any(indent(lines[j]) == ti and re.match(rf"^\s*{re.escape(net)}:", lines[j]) for j in range(t + 1, e)):
-        lines[e:e] = [f"{' ' * ti}{net}:", f"{' ' * (ti * 2)}external: true"]
+if net:
+    t = next((i for i, l in enumerate(lines) if re.match(r"^networks:\s*(#.*)?$", l)), None)
+    if t is None:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines += ["", "networks:", f"  {net}:", "    external: true", ""]
         changes.append(f"networks: {net} (external)")
+    else:
+        e = block(t + 1, 0)
+        ti = child_indent(t + 1, e, 2)
+        if not any(indent(lines[j]) == ti and re.match(rf"^\s*{re.escape(net)}:", lines[j]) for j in range(t + 1, e)):
+            lines[e:e] = [f"{' ' * ti}{net}:", f"{' ' * (ti * 2)}external: true"]
+            changes.append(f"networks: {net} (external)")
 
 open(path, "w", encoding="utf-8").write("\n".join(lines))
 print("\n".join(changes))
@@ -209,7 +228,9 @@ check_service() {
   url="$(grep -oP '^Seq__ServerUrl=\K.*' <<<"$envs" || true)"
   key="$(grep -oP '^Seq__ApiKey=\K.*' <<<"$envs" || true)"
   echo "$svc"
-  if [[ " $nets " == *" $PROXY_NETWORK "* ]]; then ok "rede $PROXY_NETWORK"; else warn "fora da rede $PROXY_NETWORK (redes: ${nets% }) — rode: $0 add $svc"; res=1; fi
+  local snets common; snets="$(seq_nets)"
+  if common="$(shared_net "$nets" "${snets:-$PROXY_NETWORK}")"; then ok "rede em comum com o Seq: $common"
+  else warn "nenhuma rede em comum com o Seq (serviço: ${nets% }; Seq: ${snets:-?}) — rode: $0 add $svc"; res=1; fi
   if [[ -n "$url" ]]; then ok "Seq__ServerUrl=$url"; else warn "sem Seq__ServerUrl"; res=1; fi
   if [[ -n "$key" ]]; then ok "Seq__ApiKey definida"; else echo "  · sem Seq__ApiKey (o Seq aceita, mas sem identificar a origem)"; fi
   if (( res == 0 )); then
@@ -255,9 +276,15 @@ cmd_add() {
     [[ -n "$KEY" ]] && { [[ "$KEY" =~ ^[A-Za-z0-9]+$ ]] || die "Chave inválida (só letras e números)"; keyvar="$(key_var "$svc")"; }
   fi
 
+  # rede: se o serviço já compartilha uma rede com o Seq (ex.: devnet), não mexe nas redes
+  local net="$PROXY_NETWORK" common
+  if (( ! migrate )) && common="$(shared_net "$(svc_nets "$svc")" "$(seq_nets)")"; then
+    net=""; ok "$svc já alcança o Seq pela rede $common"
+  fi
+
   bak="$COMPOSE_FILE.bak-$(date +%F_%H%M%S)"
   cp -p "$COMPOSE_FILE" "$bak"
-  changes="$(edit_compose "$COMPOSE_FILE" "$svc" "$PROXY_NETWORK" "$migrate" "$keyvar" "$SEQ_URL")" \
+  changes="$(edit_compose "$COMPOSE_FILE" "$svc" "$net" "$migrate" "$keyvar" "$SEQ_URL")" \
     || { cp -p "$bak" "$COMPOSE_FILE"; die "Não foi possível editar o compose (original restaurado)"; }
   [[ -n "$keyvar" ]] && set_env "$keyvar" "$KEY"
   if ! compose config --quiet; then
