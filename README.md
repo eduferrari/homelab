@@ -365,7 +365,7 @@ sudo /opt/homelab/scripts/monitor.sh apply         # aplica monitor.conf editado
 sudo /opt/homelab/scripts/monitor.sh remove        # para os painéis e fecha as portas (dados preservados)
 ```
 
-- Configuração em `/opt/homelab/monitor/monitor.conf` (`PAINEL`, `DOZZLE`, `GOACCESS`, `UPTIME_KUMA`, `SEQ`, `BACKUP_LOG` = `true`/`false`, portas, imagens, `SEQ_MEMORY`); senha em `/opt/homelab/monitor/.env` (600). Trocou a senha no `.env`? Rode `monitor.sh apply`.
+- Configuração em `/opt/homelab/monitor/monitor.conf` (`PAINEL`, `DOZZLE`, `GOACCESS`, `UPTIME_KUMA`, `SEQ`, `BACKUP_LOG` = `true`/`false`, portas, imagens, `SEQ_MEMORY`, `SEQ_NETWORKS`); senha em `/opt/homelab/monitor/.env` (600). Trocou a senha no `.env`? Rode `monitor.sh apply`.
 - O tráfego vem do **log de acesso do proxy** (`/opt/homelab/proxy/logs/access.log`, `ACCESS_LOG="true"` no `proxy.conf`), com rotação diária (14 dias). Nenhum projeto precisa mudar.
 - No Uptime Kuma, crie o usuário logo após a instalação. Monitores úteis: cada domínio público (HTTP + validade do certificado) e as portas da LAN (`https://<IP>:<porta>`, ignorando o certificado ou instalando a CA).
 
@@ -397,7 +397,7 @@ sudo /opt/homelab/scripts/painel.sh json     # os mesmos dados em JSON (também 
    ```
    Use `https://127.0.0.1:9445/...` (o backup roda no próprio servidor; o certificado da LAN é aceito). Cada backup completo envia `up` ou `down` com a mensagem do resultado; sem aviso por 25 h, o Kuma alerta sozinho. Configure a notificação (Telegram, e-mail…) no próprio monitor.
 
-**Enviando logs de uma API .NET para o Seq** (serviço na rede `proxy`):
+**Enviando logs de uma API .NET para o Seq** (serviço na rede `proxy` ou na `devnet`; o Seq está nas duas — redes extras em `SEQ_NETWORKS` no `monitor.conf`):
 
 ```csharp
 // dotnet add package Serilog.AspNetCore Serilog.Sinks.Seq
