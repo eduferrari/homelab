@@ -386,6 +386,23 @@ sudo /opt/homelab/scripts/painel.sh          # gera agora (o timer já faz a cad
 sudo /opt/homelab/scripts/painel.sh json     # os mesmos dados em JSON (também em https://<host>:9440/status.json)
 ```
 
+**Página de status pública** (para clientes, como `status.seudominio.com.br`):
+
+O Uptime Kuma tem páginas de status: componentes, barras de disponibilidade dos últimos 90 dias, incidentes e manutenções programadas. O `monitor.sh` publica **só essa página** na internet. O painel, o login, a API de administração e o socket do Kuma continuam só na LAN.
+
+1. **DNS:** registro A `status` → IP público do homelab. As portas 80/443 já estão abertas (`public-access.sh`).
+2. **No Kuma (LAN, `:9445`):** em *Status Pages → New Status Page*, crie a página (ex.: slug `clientes`) e adicione os monitores, com nomes que o cliente entende ("API", "PDV", "CRM"). Em *Domain Names*, cadastre `status.seudominio.com.br`. Se quiser, configure logo, descrição, rodapé e CSS próprio.
+3. **No servidor:**
+   ```bash
+   sudo sed -i 's/^STATUS_PUBLIC_DOMAIN=.*/STATUS_PUBLIC_DOMAIN="status.seudominio.com.br"/' /opt/homelab/monitor/monitor.conf
+   sudo /opt/homelab/scripts/monitor.sh apply
+   ```
+   O Let's Encrypt emite o certificado em seguida. `https://status.seudominio.com.br` abre a página, e o painel geral passa a testar esse domínio.
+
+Rotas liberadas ao público: `/`, `/status/*`, `/api/status-page/*`, `/api/entry-page`, `/api/badge/*`, `/assets/*`, `/upload/*` e os ícones. Todo o resto responde `404` pela internet. Para retirar a página do ar, deixe `STATUS_PUBLIC_DOMAIN=""` e rode `monitor.sh apply`.
+
+**Incidentes:** quando algo cair, publique um aviso em *Status Pages → (página) → Create Incident*. Ele aparece no topo para os clientes até você resolver.
+
 **Alerta do backup no Uptime Kuma** (avisa quando o backup falha **ou não roda**):
 
 1. No Uptime Kuma: *Add New Monitor* → tipo **Push** → *Heartbeat Interval* `90000` s (25 h) → salve e copie a **Push URL**.
