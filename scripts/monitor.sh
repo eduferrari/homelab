@@ -46,6 +46,7 @@ GOACCESS_PORT="9444"
 GOACCESS_INTERVAL="60"  # segundos entre atualizações do relatório
 UPTIME_KUMA="true"      # disponibilidade e alertas
 UPTIME_KUMA_PORT="9445"
+STATUS_PUBLIC_DOMAIN="" # página de status pública do Uptime Kuma (ex.: status.seudominio.com.br); vazio = só LAN
 SEQ="true"              # logs estruturados das apps (.NET/Serilog → http://seq:5341)
 SEQ_PORT="9446"
 SEQ_MEMORY="1g"         # limite de memória do Seq
@@ -71,7 +72,7 @@ load_conf() {
   [[ -f "$CONF" ]] || { printf '%s\n' "$DEFAULT_CONF" > "$CONF"; chmod 644 "$CONF"; }
   # monitor.conf de versões anteriores: acrescenta as opções novas (com o valor padrão)
   local key added=""
-  for key in PAINEL PAINEL_PORT BACKUP_LOG SEQ_NETWORKS INFRA_UIS ADMINER_UI_PORT REDIS_UI_PORT RABBITMQ_UI_HTTPS_PORT; do
+  for key in PAINEL PAINEL_PORT STATUS_PUBLIC_DOMAIN BACKUP_LOG SEQ_NETWORKS INFRA_UIS ADMINER_UI_PORT REDIS_UI_PORT RABBITMQ_UI_HTTPS_PORT; do
     grep -q "^${key}=" "$CONF" || added+="$(grep "^${key}=" <<<"$DEFAULT_CONF")"$'\n'
   done
   [[ -z "$added" ]] || printf '# Opções novas (monitor.sh)\n%s' "$added" >> "$CONF"
@@ -81,6 +82,7 @@ load_conf() {
   DOZZLE="${DOZZLE:-true}"; DOZZLE_PORT="${DOZZLE_PORT:-9443}"
   GOACCESS="${GOACCESS:-true}"; GOACCESS_PORT="${GOACCESS_PORT:-9444}"; GOACCESS_INTERVAL="${GOACCESS_INTERVAL:-60}"
   UPTIME_KUMA="${UPTIME_KUMA:-true}"; UPTIME_KUMA_PORT="${UPTIME_KUMA_PORT:-9445}"
+  STATUS_PUBLIC_DOMAIN="${STATUS_PUBLIC_DOMAIN:-}"
   SEQ="${SEQ:-true}"; SEQ_PORT="${SEQ_PORT:-9446}"; SEQ_MEMORY="${SEQ_MEMORY:-1g}"
   SEQ_NETWORKS="${SEQ_NETWORKS-devnet}"
   BACKUP_LOG="${BACKUP_LOG:-true}"
@@ -287,6 +289,28 @@ seq_networks() {
   done
 }
 
+# Página de status pública (internet): só as rotas da página de status do Uptime Kuma, nunca o
+# painel, o login ou a API de administração. A página e o domínio são definidos no próprio Kuma
+# (Status Pages → Domain Names). "$$" = "$" literal no compose.
+# shellcheck disable=SC2016  # crases e $ fazem parte da regra do Traefik
+STATUS_PUBLIC_PATHS='Path(`/`) || Path(`/status`) || PathPrefix(`/status/`) || PathPrefix(`/api/status-page/`) || Path(`/api/entry-page`) || PathPrefix(`/api/badge/`) || PathPrefix(`/assets/`) || PathPrefix(`/upload/`) || PathRegexp(`^/(favicon\.ico|icon[^/]*\.(svg|png)|apple-touch-icon\.png|manifest\.json|robots\.txt|serviceWorker\.js)$$`)'
+status_public_labels() {
+  local d="$STATUS_PUBLIC_DOMAIN"
+  [[ -n "$d" ]] || return 0
+  [[ "$d" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]] || die "STATUS_PUBLIC_DOMAIN inválido: $d"
+  cat <<EOF
+      - traefik.http.routers.status-pub.entrypoints=https
+      - 'traefik.http.routers.status-pub.rule=Host(\`$d\`) && (${STATUS_PUBLIC_PATHS})'
+      - traefik.http.routers.status-pub.tls=true
+      - traefik.http.routers.status-pub.tls.certresolver=letsencrypt
+      - traefik.http.routers.status-pub.service=painel-status
+      - traefik.http.routers.status-pub-http.entrypoints=http
+      - 'traefik.http.routers.status-pub-http.rule=Host(\`$d\`)'
+      - traefik.http.routers.status-pub-http.middlewares=homelab-redirect-https@file
+      - traefik.http.routers.status-pub-http.service=painel-status
+EOF
+}
+
 generate_compose() {
   local out="$1" extra=""
   [[ "$SEQ" == true ]] && extra="$(seq_networks | xargs)"
@@ -357,6 +381,7 @@ EOF
     networks: [${PROXY_NETWORK}]
 EOF
       labels painel-status 3001
+      status_public_labels
     fi
     if [[ "$SEQ" == true ]]; then
       cat <<EOF
