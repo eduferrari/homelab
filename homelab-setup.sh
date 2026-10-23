@@ -49,6 +49,7 @@ GH_RUNNER_DIR="${GH_RUNNER_DIR:-/opt/actions-runner}"
 INSTALL_PROXY="${INSTALL_PROXY:-true}"
 # Painéis (só LAN): logs (Dozzle), tráfego (GoAccess), status (Uptime Kuma) e Seq. Ajustes em /opt/homelab/monitor/monitor.conf
 INSTALL_MONITOR="${INSTALL_MONITOR:-true}"
+INSTALL_SONARQUBE="${INSTALL_SONARQUBE:-auto}"   # auto = instala se o servidor tiver 12 GB de RAM ou mais
 
 # IP público fixo do provedor (informativo: status e README)
 PUBLIC_IP="${PUBLIC_IP:-}"
@@ -747,6 +748,25 @@ else
   warn "Painéis não subiram — o resto do homelab segue normal. Tente: sudo $HOMELAB_DIR/scripts/monitor.sh apply"
 fi
 
+# SonarQube (análise de código; pesado: 2–4 GB de RAM)
+SONAR_STATE="não instalado"
+if [[ "$INSTALL_SONARQUBE" == "auto" ]]; then
+  MEM_GB=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 / 1024 ))
+  if (( MEM_GB >= 11 )); then INSTALL_SONARQUBE=true; else INSTALL_SONARQUBE=false
+    warn "SonarQube não instalado: ${MEM_GB} GB de RAM (auto exige 12 GB). Forçar: sudo $HOMELAB_DIR/scripts/sonarqube.sh apply"
+  fi
+fi
+if [[ "$INSTALL_SONARQUBE" == "true" ]]; then
+  if [[ "$PROXY_STATE" != "no ar" ]]; then
+    SONAR_STATE="pendente (proxy fora do ar)"
+  elif "$HOMELAB_DIR/scripts/sonarqube.sh" apply; then
+    SONAR_STATE="no ar"
+  else
+    SONAR_STATE="falhou (veja acima)"
+    warn "SonarQube não subiu — o resto do homelab segue normal. Tente: sudo $HOMELAB_DIR/scripts/sonarqube.sh apply"
+  fi
+fi
+
 # =================== 13. Preparação GitHub Actions ===========================
 step "13/13 Preparando GitHub Actions self-hosted runner"
 if [[ "$PREPARE_GH_RUNNER" == "true" ]]; then
@@ -793,6 +813,7 @@ ${C_GREEN}=====================================================================
   Adminer ........ https://${HOST}:9447   (servidor: mysql)
   RedisInsight ... https://${HOST}:9448
   RabbitMQ UI .... https://${HOST}:9449
+  SonarQube ...... https://${HOST}:9450   [${SONAR_STATE}]   (análise no CI: http://127.0.0.1:9000)
   MySQL / Redis .. ${IP}:3306 / ${IP}:6379   |   RabbitMQ AMQP ${IP}:5672
 
   Credenciais .... sudo cat ${ENV_FILE}

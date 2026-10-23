@@ -3,7 +3,7 @@
 [[ -r "${HOMELAB_CONF:-/etc/homelab.conf}" ]] && . "${HOMELAB_CONF:-/etc/homelab.conf}"
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 # Restaura um componente a partir de um backup do homelab.
-# Uso: sudo restore.sh <pasta-do-backup|latest> <mysql|redis|rabbitmq|config> [--yes]
+# Uso: sudo restore.sh <pasta-do-backup|latest> <mysql|redis|rabbitmq|sonarqube|config> [--yes]
 set -Eeuo pipefail
 
 INFRA="$HOMELAB_DIR/infra"
@@ -13,7 +13,7 @@ ROOT="$HOMELAB_DIR/backups"
 [[ $EUID -eq 0 ]] || { echo "Execute com sudo: sudo $0 $*" >&2; exit 1; }
 
 usage() {
-  echo "Uso: sudo $0 <pasta-do-backup|latest> <mysql|redis|rabbitmq|config> [--yes]"
+  echo "Uso: sudo $0 <pasta-do-backup|latest> <mysql|redis|rabbitmq|sonarqube|config> [--yes]"
   echo "Backups disponíveis:"
   local d
   for d in "$ROOT"/20* "$ROOT"/latest; do [[ -e "$d" ]] && echo "  $(basename "$d")"; done
@@ -108,6 +108,18 @@ case "$COMP" in
     docker exec rabbitmq rabbitmqctl import_definitions /tmp/definitions.json
     docker exec rabbitmq rm -f /tmp/definitions.json
     log "Definições do RabbitMQ importadas."
+    ;;
+
+  sonarqube)
+    need sonarqube.sql.gz
+    docker inspect sonarqube-db >/dev/null 2>&1 || { echo "SonarQube não instalado: sudo /opt/homelab/scripts/sonarqube.sh apply" >&2; exit 1; }
+    confirm "Isto SOBRESCREVE o banco do SonarQube (projetos, histórico, regras, usuários e tokens) com o backup $(basename "$SRC")."
+    docker stop sonarqube >/dev/null 2>&1 || true
+    docker exec sonarqube-db psql -q -U sonar -d postgres -c "DROP DATABASE IF EXISTS sonar WITH (FORCE);" -c "CREATE DATABASE sonar OWNER sonar;"
+    zcat "$SRC/sonarqube.sql.gz" | docker exec -i sonarqube-db psql -q -U sonar -d sonar -v ON_ERROR_STOP=1 >/dev/null
+    rm -rf /opt/homelab/sonarqube/data/es*      # índices são reconstruídos a partir do banco
+    docker start sonarqube >/dev/null
+    log "SonarQube restaurado (reindexação na subida pode levar alguns minutos)."
     ;;
 
   config)

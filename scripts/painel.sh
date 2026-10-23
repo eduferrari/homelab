@@ -373,6 +373,10 @@ def links():
         if p and not n.startswith("painel"):
             L.append({"group": "Projetos (LAN)", "name": n, "desc": f"entrypoint {n}", "scheme": "https", "port": p})
     L.append({"group": "Projetos (LAN)", "name": "443", "desc": "rotas na porta padrão", "scheme": "https", "port": "443"})
+    sq = shconf(f"{HOMELAB}/sonarqube/sonarqube.conf")
+    if sq and os.path.exists(f"{HOMELAB}/sonarqube/docker-compose.yml"):
+        L.append({"group": "Infraestrutura", "name": "SonarQube", "desc": "Qualidade do código", "scheme": "https",
+                  "port": sq.get("SONAR_PORT", "9450")})
     if on("INFRA_UIS"):
         for key, name, desc, dflt in (("ADMINER_UI_PORT", "Adminer", "MySQL (servidor: mysql)", "9447"),
                                       ("REDIS_UI_PORT", "RedisInsight", "Redis", "9448"),

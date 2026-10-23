@@ -4,7 +4,7 @@
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 BACKUP_GROUP="${BACKUP_GROUP:-root}"
 # Backup do homelab: MySQL, Redis, RabbitMQ (definições) e configurações (CA, proxy, projetos).
-# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|config ...]
+# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|sonarqube|config ...]
 #      sudo backup.sh --sync-external      # só copia para o SSD externo
 # Agendado diariamente pelo homelab-backup.timer (systemd).
 # Resultado: $HOMELAB_DIR/backups/last-status.json (painel geral) e, se BACKUP_PUSH_URL estiver no
@@ -36,6 +36,8 @@ if [[ "${1:-}" == "--sync-external" ]]; then SYNC_ONLY=1; shift; fi
 COMPONENTS=("$@")
 if [[ ${#COMPONENTS[@]} -eq 0 || "${COMPONENTS[0]}" == "all" ]]; then
   COMPONENTS=(mysql redis rabbitmq config)
+  # SonarQube é opcional: entra no backup completo só se estiver instalado
+  docker inspect sonarqube-db >/dev/null 2>&1 && COMPONENTS+=(sonarqube)
   FULL_RUN=1
 else
   FULL_RUN=0
@@ -202,6 +204,17 @@ backup_rabbitmq() {
   jq -e '.vhosts and .users' "$out" >/dev/null || { log "  JSON de definições inválido"; return 1; }
 }
 
+# --------------------------------------------------------------- SonarQube
+# Banco do SonarQube (projetos, histórico, regras, quality gates, usuários e tokens).
+# Os índices (data/es) são reconstruídos pelo SonarQube a partir do banco.
+backup_sonarqube() {
+  container_up sonarqube-db || { log "  container sonarqube-db não está rodando"; return 1; }
+  local out="$DEST/sonarqube.sql.gz"
+  docker exec sonarqube-db pg_dump -U sonar -d sonar --no-owner | gzip > "$out" || return 1
+  gzip -t "$out" || return 1
+  zcat "$out" | tail -n 5 | grep -q 'PostgreSQL database dump complete' || { log "  dump incompleto"; return 1; }
+}
+
 # ----------------------------------------------------------- Configurações
 backup_config() {
   local candidates=(
@@ -211,6 +224,7 @@ backup_config() {
     "$HOMELAB_DIR/proxy/dynamic" "$HOMELAB_DIR/proxy/acme"
     "$HOMELAB_DIR/monitor/monitor.conf" "$HOMELAB_DIR/monitor/.env"
     "$HOMELAB_DIR/monitor/dozzle" "$HOMELAB_DIR/monitor/uptime-kuma"
+    "$HOMELAB_DIR/sonarqube/sonarqube.conf" "$HOMELAB_DIR/sonarqube/.env" /etc/sysctl.d/99-sonarqube.conf
     /etc/homelab.conf
     /etc/ssh/sshd_config.d/00-homelab.conf
     /etc/fail2ban/jail.d/homelab.local

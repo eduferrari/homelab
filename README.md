@@ -89,6 +89,7 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 | `SSH_PORT` / `DISABLE_SSH_PASSWORD` | `22` / `auto` | SSH; `auto` desliga senha se já houver chave |
 | `INSTALL_PROXY` | `true` | Sobe o proxy Traefik do homelab (se 80 e 443 estiverem livres) |
 | `INSTALL_MONITOR` | `true` | Painel geral e painéis de logs, tráfego, status e Seq (seção 7.6) |
+| `INSTALL_SONARQUBE` | `auto` | SonarQube; `auto` instala com 12 GB de RAM ou mais (seção 7.8) |
 | `PUBLIC_IP` | — | IP público fixo do provedor (registrado no `.env`, informativo) |
 | `CA_IMPORT_DIR` | — | Pasta com `root.crt` e `root.key` de uma CA existente; sem ela, uma CA nova é criada |
 | `HEADLESS` | `true` | Desativa o boot gráfico |
@@ -135,6 +136,7 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
     ├── status.sh               # visão geral
     ├── proxy.sh                # proxy Traefik (portas, Let's Encrypt, versão, migração do Coolify)
     ├── monitor.sh              # painéis de logs, tráfego, status e Seq
+    ├── sonarqube.sh            # SonarQube (qualidade do código), opcional
     ├── painel.sh               # gera o painel geral (timer a cada minuto)
     ├── homelab-ca.sh           # CA e HTTPS na LAN
     ├── backup.sh / restore.sh  # backup e restauração
@@ -464,6 +466,71 @@ sudo ./homelab-setup.sh                               # fecha o SSH de root e as
 - O backup do Coolify (banco + `/data/coolify`) fica em `/opt/homelab/backups/coolify-final-<data>/`.
 - Projetos que usam a rede `coolify` continuam funcionando, porque o proxy também entra nela (`PROXY_EXTRA_NETWORKS="coolify"`). Para padronizar, troque `coolify` por `proxy` no compose do projeto (em `networks` e em `traefik.docker.network`) e rode `docker compose up -d`. Depois de migrar todos, remova `coolify` de `PROXY_EXTRA_NETWORKS` e rode `proxy.sh apply`.
 
+### 7.8 Qualidade do código — SonarQube (`sonarqube.sh`)
+
+O SonarQube Community Build analisa cada push e PR: bugs, vulnerabilidades, *code smells*, duplicação e cobertura de testes. O *quality gate* (aprovado/reprovado) pode travar o merge.
+
+```text
+PR / push ──► GitHub Actions no runner do L14 ──► dotnet sonarscanner ──► http://127.0.0.1:9000
+                                                                            │
+                                         painel: https://<host>:9450 (proxy, só LAN/Tailscale)
+```
+
+```bash
+sudo /opt/homelab/scripts/sonarqube.sh              # status e endereços
+sudo /opt/homelab/scripts/sonarqube.sh apply        # instala/atualiza
+sudo /opt/homelab/scripts/sonarqube.sh credenciais  # login inicial e token
+sudo /opt/homelab/scripts/sonarqube.sh remove       # para e fecha a porta (dados preservados)
+```
+
+- **Instalação:**
+  - `INSTALL_SONARQUBE=auto` (padrão) instala se o servidor tiver 12 GB de RAM ou mais; `true` ou `false` forçam.
+  - Compose próprio em `/opt/homelab/sonarqube`, com PostgreSQL próprio (o SonarQube não aceita MySQL).
+  - Limites de memória e portas em `sonarqube.conf`.
+  - Ajuste de kernel em `/etc/sysctl.d/99-sonarqube.conf` (`vm.max_map_count`, que o Elasticsearch interno exige).
+- **Primeiro acesso:** `admin`/`admin` (o SonarQube pede a troca). Depois:
+  - gere um token em *My Account → Security → Generate Token* (tipo *Global Analysis*) e guarde-o como secret `SONAR_TOKEN` em cada repositório;
+  - crie o projeto (*Create Project → Local project*) com a mesma chave usada no workflow (`/k:`).
+- **Backup:** o banco entra no backup diário (`sonarqube.sql.gz`): projetos, histórico, regras, quality gates, usuários e tokens. Restaurar: `sudo restore.sh latest sonarqube`. Os índices são reconstruídos sozinhos.
+- **Limite da edição gratuita:** o painel guarda o histórico só da branch principal. A análise de cada PR roda e o quality gate trava o merge, mas a análise por branch/PR e os comentários no PR exigem a edição Developer.
+
+**Workflow do projeto** (`.github/workflows/qualidade.yml`, roda no runner do L14):
+
+```yaml
+name: qualidade
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  sonar:
+    runs-on: [self-hosted, homelab]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }          # histórico completo: "código novo" e blame
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: 8.0.x }
+      - uses: actions/setup-java@v4       # o scanner precisa de Java 17+
+        with: { distribution: temurin, java-version: 17 }
+      - name: Análise
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          dotnet tool update --global dotnet-sonarscanner
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          dotnet sonarscanner begin /k:"minhaapi" /n:"Minha API" \
+            /d:sonar.host.url=http://127.0.0.1:9000 /d:sonar.token="$SONAR_TOKEN" \
+            /d:sonar.qualitygate.wait=true \
+            /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" \
+            /d:sonar.exclusions="**/Migrations/**"
+          dotnet build --no-incremental
+          dotnet test --no-build --collect:"XPlat Code Coverage;Format=opencover" --results-directory TestResults
+          dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN"
+```
+
+Com `sonar.qualitygate.wait=true`, o job falha quando o código não passa no quality gate. Para travar o merge, marque o check `sonar` como obrigatório em *Settings → Branches* do repositório.
+
 ---
 
 ## 8. HTTPS na LAN — CA do homelab (`homelab-ca.sh`)
@@ -544,7 +611,7 @@ Internet ─► api.seudominio.com.br (DNS A) ─► 203.0.113.10 (roteador/ONT)
 
 Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o IP fixo do L14 na LAN e `api`/`app.seudominio.com.br` domínios do seu projeto.
 
-1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, os painéis (9440–9449), 3306, 6379 nem 5672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
+1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, os painéis (9440–9450), 3306, 6379 nem 5672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
 2. **DNS** (zona do seu domínio, ex.: Registro.br) — um registro por subdomínio:
    ```text
    api   A   203.0.113.10   TTL 300
@@ -653,6 +720,7 @@ Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd,
 | `mysql-all.sql.gz` | Todos os bancos, usuários, rotinas, triggers e eventos | `mysqldump --single-transaction` (sem travar as tabelas) — validado pela linha `Dump completed` |
 | `redis-dump.rdb.gz` | Snapshot do Redis | `BGSAVE` consistente, sem parar o serviço |
 | `rabbitmq-definitions.json` | vhosts, usuários, permissões, filas, exchanges, bindings, policies | `rabbitmqctl export_definitions` |
+| `sonarqube.sql.gz` | Banco do SonarQube (só se instalado) | `pg_dump` — validado pela linha final do dump |
 | `config.tar.gz` | `.env`, compose, `my.cnf`, **CA do homelab** (`/opt/homelab/ca`), **proxy** (`proxy.conf`, `dynamic/`, certificados Let's Encrypt), **painéis** (`monitor.conf`, senha, usuários do Dozzle, banco do Uptime Kuma), SSH, UFW, fail2ban, Docker, avahi, TLP, tampa, sysctl, netplan (Wi-Fi), units do systemd, e de cada projeto em `/opt/homelab/apps/<projeto>`: compose, overrides, `.env` e `public-routes.conf` (sem código-fonte nem volumes) | `tar` |
 | `SHA256SUMS` | Checksums de todos os arquivos | conferidos antes de qualquer restauração |
 
