@@ -155,12 +155,6 @@ def host_info():
 def containers():
     rows = []
     out = run(["docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}"])
-    stats = {}
-    for line in run(["docker", "stats", "--no-stream", "--format", "{{json .}}"], timeout=30).splitlines():
-        try:
-            s = json.loads(line); stats[s["Name"]] = s
-        except Exception:
-            pass
     ids = []
     for line in out.splitlines():
         try:
@@ -168,6 +162,17 @@ def containers():
         except Exception:
             pass
     inspect = json.loads(run(["docker", "inspect", *ids]) or "[]") if ids else []
+    # CPU/memória só dos containers rodando e com rede: em network_mode none o Docker registra
+    # "collecting stats ... Link not found" no journal a cada consulta
+    alvo = [c["Name"].lstrip("/") for c in inspect
+            if c["State"].get("Running") and (c.get("HostConfig") or {}).get("NetworkMode") != "none"]
+    stats = {}
+    if alvo:
+        for line in run(["docker", "stats", "--no-stream", "--format", "{{json .}}", *alvo], timeout=30).splitlines():
+            try:
+                s = json.loads(line); stats[s["Name"]] = s
+            except Exception:
+                pass
     for c in inspect:
         name = c["Name"].lstrip("/"); st = c["State"]; lab = c["Config"].get("Labels") or {}
         project = lab.get("com.docker.compose.project") or "(sem projeto)"

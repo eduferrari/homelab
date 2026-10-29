@@ -34,6 +34,11 @@ HEADLESS="${HEADLESS:-true}"
 
 # Saúde da bateria (ThinkPad): carrega só entre 75% e 80%, já que fica sempre na tomada
 INSTALL_TLP="${INSTALL_TLP:-true}"
+# Reinício automático se o sistema congelar (watchdog de hardware, ~1 min)
+HW_WATCHDOG="${HW_WATCHDOG:-true}"
+# Wi-Fi Realtek rtw89 (ex.: RTL8852AE): desliga a economia de energia que congela o sistema (auto = se a placa existir)
+FIX_RTW89="${FIX_RTW89:-auto}"
+REBOOT_HINT=false
 BATTERY_START_THRESHOLD="${BATTERY_START_THRESHOLD:-75}"
 BATTERY_STOP_THRESHOLD="${BATTERY_STOP_THRESHOLD:-80}"
 
@@ -184,12 +189,53 @@ START_CHARGE_THRESH_BAT0=${BATTERY_START_THRESHOLD}
 STOP_CHARGE_THRESH_BAT0=${BATTERY_STOP_THRESHOLD}
 # Evita economia de energia que derruba rede/USB em servidor
 WIFI_PWR_ON_AC=off
+PCIE_ASPM_ON_AC=performance
 RUNTIME_PM_ON_AC=on
 USB_AUTOSUSPEND=0
 EOF
   systemctl enable --now tlp >/dev/null 2>&1
   tlp start >/dev/null 2>&1 || true
   ok "TLP ativo: bateria carrega entre ${BATTERY_START_THRESHOLD}% e ${BATTERY_STOP_THRESHOLD}%"
+fi
+
+# Watchdog de hardware: se o sistema congelar (kernel/driver), a máquina reinicia sozinha
+if [[ "$HW_WATCHDOG" == "true" ]]; then
+  modprobe iTCO_wdt 2>/dev/null || true
+  if compgen -G "/dev/watchdog*" >/dev/null; then
+    mkdir -p /etc/systemd/system.conf.d
+    cat > /etc/systemd/system.conf.d/homelab-watchdog.conf <<'EOF'
+# Homelab: reinicia sozinho se o sistema congelar por ~1 min (watchdog de hardware)
+[Manager]
+RuntimeWatchdogSec=60
+RebootWatchdogSec=5min
+EOF
+    systemctl daemon-reexec
+    ok "Watchdog de hardware ativo: congelou por ~1 min → reinicia sozinho ($(cat /sys/class/watchdog/watchdog0/identity 2>/dev/null || echo watchdog))"
+  else
+    warn "Sem watchdog de hardware (/dev/watchdog) — reinício automático em travamento indisponível"
+  fi
+else
+  rm -f /etc/systemd/system.conf.d/homelab-watchdog.conf
+fi
+
+# Wi-Fi Realtek rtw89: firmware instável com economia de energia do PCIe (ASPM) — congela o sistema
+RTW89_CONF=/etc/modprobe.d/homelab-rtw89.conf
+if [[ "$FIX_RTW89" == "auto" ]]; then
+  if lsmod | grep -q '^rtw89_' || lspci -k 2>/dev/null | grep -q 'rtw89'; then FIX_RTW89=true; else FIX_RTW89=false; fi
+fi
+if [[ "$FIX_RTW89" == "true" ]]; then
+  RTW89_NEW='# Homelab: Wi-Fi Realtek rtw89 sem economia de energia (evita congelamentos)
+options rtw89_pci disable_aspm_l1=y disable_aspm_l1ss=y
+options rtw89_core disable_ps_mode=y'
+  if [[ "$(cat "$RTW89_CONF" 2>/dev/null)" != "$RTW89_NEW" ]]; then
+    mkdir -p /etc/modprobe.d
+    printf '%s\n' "$RTW89_NEW" > "$RTW89_CONF"
+    update-initramfs -u >/dev/null 2>&1 || true
+    REBOOT_HINT=true
+    ok "Wi-Fi rtw89: economia de energia desligada (vale após reiniciar). Para servidor, prefira o cabo de rede."
+  else
+    ok "Wi-Fi rtw89: economia de energia já desligada"
+  fi
 fi
 
 # ================================ 4. SSH =====================================
@@ -808,3 +854,4 @@ ${C_GREEN}=====================================================================
 
 ${C_YELLOW}  ► Na primeira instalação, reinicie:  sudo reboot${C_RESET}
 EOF
+$REBOOT_HINT && echo "${C_YELLOW}  ► Ajuste do Wi-Fi (rtw89) aplicado: reinicie para valer:  sudo reboot${C_RESET}"

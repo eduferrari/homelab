@@ -487,7 +487,9 @@ cmd_remove_coolify() {
   read -r -p "Digite REMOVER para confirmar: " ans
   [[ "$ans" == "REMOVER" ]] || die "Cancelado"
   local c
-  for c in $(docker ps -aq --filter label=coolify.managed=true) $(coolify_containers); do
+  # inclui o builder do Coolify (buildx_buildkit_coolify-*), que sobra rodando depois da remoção
+  for c in $(docker ps -aq --filter label=coolify.managed=true) $(coolify_containers) \
+           $(docker ps -a --format '{{.Names}}' | grep '^buildx_buildkit_coolify' || true); do
     docker rm -f "$c" >/dev/null 2>&1 || true
   done
   docker volume ls -q | grep -E '^coolify[-_]' | xargs -r docker volume rm >/dev/null 2>&1 || true
