@@ -93,6 +93,8 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 | `CA_IMPORT_DIR` | — | Pasta com `root.crt` e `root.key` de uma CA existente; sem ela, uma CA nova é criada |
 | `HEADLESS` | `true` | Desativa o boot gráfico |
 | `INSTALL_TLP` / `BATTERY_*_THRESHOLD` | `true` / `75`–`80` | Limite de carga da bateria |
+| `HW_WATCHDOG` | `true` | Watchdog de hardware: se o sistema congelar, reinicia sozinho em ~1 min (seção 14) |
+| `FIX_RTW89` | `auto` | Wi-Fi Realtek `rtw89` (ex.: RTL8852AE): desliga a economia de energia que congela o sistema (seção 14) |
 | `CONSOLE_BLANK_SECONDS` | `60` | Desliga a tela do console |
 | `PREPARE_GH_RUNNER` | `true` | Prepara o runner self-hosted do GitHub Actions |
 
@@ -839,6 +841,19 @@ Para liberar carga total temporariamente (ex.: antes de levar o notebook):
 ```bash
 sudo tlp fullcharge BAT0
 ```
+
+### Estabilidade: travamentos e reinício automático
+
+- **Watchdog de hardware** (`HW_WATCHDOG=true`): o systemd alimenta o watchdog do chipset (`iTCO_wdt` nos ThinkPad). Se o sistema congelar por cerca de 1 minuto, a máquina reinicia sozinha. O boot seguinte sobe tudo (containers com `restart: unless-stopped`). Para conferir: `systemctl show -p RuntimeWatchdogUSec` e `cat /sys/class/watchdog/watchdog0/identity`.
+- **Wi-Fi Realtek `rtw89`** (ex.: RTL8852AE, `FIX_RTW89=auto`): o firmware dessas placas cai com a economia de energia do PCIe ligada e pode congelar o sistema inteiro, sem deixar nada no log. O setup grava `/etc/modprobe.d/homelab-rtw89.conf` (ASPM e economia de energia desligados), e o ajuste vale depois de reiniciar. O TLP também desliga o ASPM na tomada (`PCIE_ASPM_ON_AC=performance`). **Para servidor, prefira o cabo de rede.** Ao trocar, mova a reserva de IP do roteador para o MAC da placa de cabo, ou rode `network-static.sh`, porque o encaminhamento de portas aponta para o IP.
+- **Kernel mais novo:** no Ubuntu 24.04, o kernel HWE traz drivers mais recentes (Wi-Fi, vídeo, NVMe): `sudo apt install linux-generic-hwe-24.04 && sudo reboot`.
+- **Investigar um travamento**, depois de religar:
+  ```bash
+  journalctl --list-boots | tail -3                       # o boot anterior terminou de repente?
+  journalctl -b -1 -k | grep -iE 'oom|hung_task|lockup|panic|i/o error|rtw89|fw PC' | tail -40
+  journalctl -b -1 | tail -40                             # o que rodava no último minuto
+  ```
+  Log que termina de repente, sem desligamento registrado, indica congelamento de hardware ou driver. `R_AX_LBC_WATCHDOG` ou `[ERR]fw PC` são quedas do firmware do Wi-Fi `rtw89`.
 
 ---
 

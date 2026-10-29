@@ -218,6 +218,8 @@ backup_config() {
     /etc/docker/daemon.json
     /etc/avahi/avahi-daemon.conf
     /etc/tlp.d/01-homelab.conf
+    /etc/systemd/system.conf.d/homelab-watchdog.conf
+    /etc/modprobe.d/homelab-rtw89.conf
     /etc/systemd/logind.conf.d/99-homelab-lid.conf
     /etc/sysctl.d/99-homelab.conf
     /etc/systemd/system/homelab-backup.service
