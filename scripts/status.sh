@@ -11,7 +11,7 @@ HOST="$(hostname).local"
 echo "== Rede =="
 echo "IP: $IP | mDNS: $HOST | público: $(envget HOMELAB_PUBLIC_IP)"
 echo
-echo "== Stack (MySQL, Redis, RabbitMQ) =="
+echo "== Stack (MySQL, PostgreSQL, Redis, RabbitMQ) =="
 docker compose -f "$HOMELAB_DIR/infra/docker-compose.yml" ps --format 'table {{.Name}}\t{{.Status}}'
 echo
 echo "== Proxy (Traefik) =="
