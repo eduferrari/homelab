@@ -420,7 +420,7 @@ ok "UFW ativo: entrada negada por padrão, SSH com rate-limit, mDNS na LAN; cont
 # ======================= 7. Estrutura, configuração e limpeza ================
 step "7/13 Estrutura de diretórios e configuração"
 INFRA_DIR="$HOMELAB_DIR/infra"
-mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} "$HOMELAB_DIR"/{apps,backups,scripts} \
+mkdir -p "$INFRA_DIR"/mysql/{conf.d,init} "$INFRA_DIR"/postgres/init "$HOMELAB_DIR"/{apps,backups,scripts} \
          "$USER_HOME"/projects/{apps,libs,sandbox}
 install -d -m 700 -o root -g root "$HOMELAB_DIR/ca"
 
@@ -456,7 +456,7 @@ else
 fi
 
 # ======================= 9. Stack de dados (Compose) =========================
-step "9/13 Gerando stack de dados (MySQL, Redis, RabbitMQ)"
+step "9/13 Gerando stack de dados (MySQL, PostgreSQL, Redis, RabbitMQ)"
 ENV_FILE="$INFRA_DIR/.env"
 if [[ ! -f "$ENV_FILE" ]]; then
   cat > "$ENV_FILE" <<EOF
@@ -469,6 +469,13 @@ MYSQL_ROOT_PASSWORD=$(gen_secret)
 MYSQL_DATABASE=appdb
 MYSQL_USER=dev
 MYSQL_PASSWORD=$(gen_secret)
+
+# PostgreSQL 17
+POSTGRES_PORT=5432
+POSTGRES_PASSWORD=$(gen_secret)
+POSTGRES_APP_DB=appdb
+POSTGRES_APP_USER=dev
+POSTGRES_APP_PASSWORD=$(gen_secret)
 
 # Adminer
 ADMINER_PORT=8088            # (não usado: o Adminer abre em https://<host>:9447, monitor.conf)
@@ -503,6 +510,19 @@ fi
 set_env() {
   if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
 }
+# Instalações anteriores à adição do PostgreSQL: o .env já existe, então acrescenta as chaves (uma vez)
+if ! grep -q '^POSTGRES_PASSWORD=' "$ENV_FILE"; then
+  cat >> "$ENV_FILE" <<EOF
+
+# PostgreSQL 17
+POSTGRES_PORT=5432
+POSTGRES_PASSWORD=$(gen_secret)
+POSTGRES_APP_DB=appdb
+POSTGRES_APP_USER=dev
+POSTGRES_APP_PASSWORD=$(gen_secret)
+EOF
+  ok "Credenciais do PostgreSQL acrescentadas em $ENV_FILE"
+fi
 # Host e IP atualizados a cada execução (usados pelo certificado da LAN e pelo status)
 set_env HOMELAB_HOST "$(hostname).local"
 set_env HOMELAB_IP "$(hostname -I | awk '{print $1}')"
@@ -519,6 +539,17 @@ max_connections      = 200
 innodb_buffer_pool_size = 512M
 EOF
 chmod 644 "$INFRA_DIR/mysql/conf.d/homelab.cnf"
+
+# PostgreSQL: roda só na primeira criação do volume (cria o usuário e o banco da aplicação, como no MySQL)
+cat > "$INFRA_DIR/postgres/init/01-app.sh" <<'EOF'
+#!/bin/bash
+set -e
+psql -v ON_ERROR_STOP=1 --username postgres --dbname postgres <<SQL
+CREATE ROLE "${POSTGRES_APP_USER}" LOGIN PASSWORD '${POSTGRES_APP_PASSWORD}';
+CREATE DATABASE "${POSTGRES_APP_DB}" OWNER "${POSTGRES_APP_USER}";
+SQL
+EOF
+chmod 755 "$INFRA_DIR/postgres/init/01-app.sh"
 
 cat > "$INFRA_DIR/docker-compose.yml" <<'EOF'
 name: homelab
@@ -547,6 +578,32 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    networks: [devnet]
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres
+    hostname: postgres
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_APP_DB: ${POSTGRES_APP_DB}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB"]
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     networks: [devnet]
 
   adminer:
@@ -647,6 +704,7 @@ services:
 
 volumes:
   mysql_data:
+  postgres_data:
   redis_data:
   redisinsight_data:
   rabbitmq_data:
@@ -836,10 +894,10 @@ ${C_GREEN}=====================================================================
   Painéis ........ logs :9443 | tráfego :9444 | status :9445 | Seq :9446   [${MONITOR_STATE}]
                    senha: sudo ${HOMELAB_DIR}/scripts/monitor.sh credenciais
   Projetos ....... ${HOMELAB_DIR}/apps/<projeto>  (compose na rede "proxy"; deploy: GitHub Actions + runner)
-  Adminer ........ https://${HOST}:9447   (servidor: mysql)
+  Adminer ........ https://${HOST}:9447   (servidor: mysql ou postgres)
   RedisInsight ... https://${HOST}:9448
   RabbitMQ UI .... https://${HOST}:9449
-  MySQL / Redis .. ${IP}:3306 / ${IP}:6379   |   RabbitMQ AMQP ${IP}:5672
+  MySQL / Postgres ${IP}:3306 / ${IP}:5432   |   Redis ${IP}:6379   |   RabbitMQ AMQP ${IP}:5672
 
   Credenciais .... sudo cat ${ENV_FILE}
   Status ......... ${HOMELAB_DIR}/scripts/status.sh
