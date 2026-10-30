@@ -3,7 +3,7 @@
 [[ -r "${HOMELAB_CONF:-/etc/homelab.conf}" ]] && . "${HOMELAB_CONF:-/etc/homelab.conf}"
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 # Restaura um componente a partir de um backup do homelab.
-# Uso: sudo restore.sh <pasta-do-backup|latest> <mysql|redis|rabbitmq|config> [--yes]
+# Uso: sudo restore.sh <pasta-do-backup|latest> <mysql|postgres|redis|rabbitmq|config> [--yes]
 set -Eeuo pipefail
 
 INFRA="$HOMELAB_DIR/infra"
@@ -13,7 +13,7 @@ ROOT="$HOMELAB_DIR/backups"
 [[ $EUID -eq 0 ]] || { echo "Execute com sudo: sudo $0 $*" >&2; exit 1; }
 
 usage() {
-  echo "Uso: sudo $0 <pasta-do-backup|latest> <mysql|redis|rabbitmq|config> [--yes]"
+  echo "Uso: sudo $0 <pasta-do-backup|latest> <mysql|postgres|redis|rabbitmq|config> [--yes]"
   echo "Backups disponíveis:"
   local d
   for d in "$ROOT"/20* "$ROOT"/latest; do [[ -e "$d" ]] && echo "  $(basename "$d")"; done
@@ -54,6 +54,29 @@ case "$COMP" in
       | docker exec -i -e MYSQL_PWD="$(envget MYSQL_ROOT_PASSWORD)" mysql mysql -uroot
     docker exec -e MYSQL_PWD="$(envget MYSQL_ROOT_PASSWORD)" mysql mysql -uroot -e 'FLUSH PRIVILEGES;'
     log "MySQL restaurado."
+    ;;
+
+  postgres)
+    need postgres-all.sql.gz
+    confirm "Isto SOBRESCREVE todos os bancos do PostgreSQL (inclusive roles/usuários) com o backup $(basename "$SRC"). Pare as apps que usam o banco antes: conexões abertas impedem o DROP DATABASE."
+    docker exec postgres pg_isready -U postgres >/dev/null || { echo "Container postgres não está pronto" >&2; exit 1; }
+    log "Restaurando PostgreSQL..."
+    # Sem ON_ERROR_STOP de propósito: o --clean tenta dar DROP ROLE postgres (o usuário em uso),
+    # o que gera um erro inofensivo. Os demais erros são exibidos e contados abaixo.
+    ERR_LOG="$(mktemp)"
+    gunzip -c "$SRC/postgres-all.sql.gz" \
+      | docker exec -i -e PGPASSWORD="$(envget POSTGRES_PASSWORD)" postgres psql -U postgres -d postgres -q \
+      2> "$ERR_LOG" >/dev/null || true
+    # ignora o erro esperado do próprio usuário "postgres"
+    REAL_ERRS="$(grep -i 'ERROR' "$ERR_LOG" | grep -viE 'current user cannot be dropped|role "postgres" already exists' || true)"
+    rm -f "$ERR_LOG"
+    if [[ -n "$REAL_ERRS" ]]; then
+      echo "Erros durante a restauração do PostgreSQL:" >&2
+      echo "$REAL_ERRS" | head -n 20 | sed 's/^/  /' >&2
+      echo "Confira se há apps conectadas ao banco e rode de novo." >&2
+      exit 1
+    fi
+    log "PostgreSQL restaurado."
     ;;
 
   redis)

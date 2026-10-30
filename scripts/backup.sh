@@ -3,8 +3,8 @@
 [[ -r "${HOMELAB_CONF:-/etc/homelab.conf}" ]] && . "${HOMELAB_CONF:-/etc/homelab.conf}"
 HOMELAB_DIR="${HOMELAB_DIR:-/opt/homelab}"
 BACKUP_GROUP="${BACKUP_GROUP:-root}"
-# Backup do homelab: MySQL, Redis, RabbitMQ (definições) e configurações (CA, proxy, projetos).
-# Uso: sudo backup.sh [all|mysql|redis|rabbitmq|config ...]
+# Backup do homelab: MySQL, PostgreSQL, Redis, RabbitMQ (definições) e configurações (CA, proxy, projetos).
+# Uso: sudo backup.sh [all|mysql|postgres|redis|rabbitmq|config ...]
 #      sudo backup.sh --sync-external      # só copia para o SSD externo
 # Agendado diariamente pelo homelab-backup.timer (systemd).
 # Resultado: $HOMELAB_DIR/backups/last-status.json (painel geral) e, se BACKUP_PUSH_URL estiver no
@@ -35,7 +35,7 @@ if [[ "${1:-}" == "--sync-external" ]]; then SYNC_ONLY=1; shift; fi
 
 COMPONENTS=("$@")
 if [[ ${#COMPONENTS[@]} -eq 0 || "${COMPONENTS[0]}" == "all" ]]; then
-  COMPONENTS=(mysql redis rabbitmq config)
+  COMPONENTS=(mysql postgres redis rabbitmq config)
   FULL_RUN=1
 else
   FULL_RUN=0
@@ -164,6 +164,19 @@ backup_mysql() {
   zcat "$out" | tail -n 1 | grep -q 'Dump completed' || { log "  dump incompleto"; return 1; }
 }
 
+# -------------------------------------------------------------- PostgreSQL
+backup_postgres() {
+  container_up postgres || { log "  container postgres não está rodando"; return 1; }
+  local out="$DEST/postgres-all.sql.gz"
+  # pg_dumpall: todos os bancos + roles (usuários). --clean/--if-exists deixa o dump restaurável por cima.
+  docker exec -e PGPASSWORD="$(envget POSTGRES_PASSWORD)" postgres \
+    pg_dumpall -U postgres --clean --if-exists \
+    | gzip > "$out" || return 1
+  gzip -t "$out" || return 1
+  # pg_dumpall grava esta linha só quando termina com sucesso
+  zcat "$out" | tail -n 3 | grep -q 'PostgreSQL database cluster dump complete' || { log "  dump incompleto"; return 1; }
+}
+
 # ------------------------------------------------------------------- Redis
 backup_redis() {
   container_up redis || { log "  container redis não está rodando"; return 1; }
@@ -205,7 +218,7 @@ backup_rabbitmq() {
 # ----------------------------------------------------------- Configurações
 backup_config() {
   local candidates=(
-    "$INFRA/docker-compose.yml" "$INFRA/.env" "$INFRA/mysql"
+    "$INFRA/docker-compose.yml" "$INFRA/.env" "$INFRA/mysql" "$INFRA/postgres"
     "$HOMELAB_DIR/ca"
     "$HOMELAB_DIR/proxy/proxy.conf" "$HOMELAB_DIR/proxy/docker-compose.yml"
     "$HOMELAB_DIR/proxy/dynamic" "$HOMELAB_DIR/proxy/acme"
