@@ -1,6 +1,6 @@
 # Homelab — ThinkPad L14
 
-Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação limpa do Ubuntu Server**: Ubuntu endurecido, **stack de dados** (MySQL, Redis, RabbitMQ) em Docker, **proxy Traefik** com HTTPS na LAN (CA própria) e domínios públicos (Let's Encrypt), e projetos em Docker Compose com **deploy pelo GitHub Actions**.
+Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação limpa do Ubuntu Server**: Ubuntu endurecido, **stack de dados** (MySQL, PostgreSQL, Redis, RabbitMQ) em Docker, **proxy Traefik** com HTTPS na LAN (CA própria) e domínios públicos (Let's Encrypt), e projetos em Docker Compose com **deploy pelo GitHub Actions**.
 
 ---
 
@@ -12,6 +12,7 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 | Projetos | Projetos em Docker Compose | — | `/opt/homelab/apps/<projeto>` |
 | Painéis | **Painel geral**, logs (Dozzle), tráfego (GoAccess), status (Uptime Kuma), Seq | 9440, 9443, 9444, 9445, 9446 | `https://<host>:<porta>` (seção 7.6) |
 | Dados | MySQL 8.4 | 3306 | clientes MySQL / apps |
+| Dados | PostgreSQL 17 | 5432 | clientes PostgreSQL / apps |
 | Dados | Adminer | 9447 | `https://<host>:9447` (pelo proxy, só LAN) |
 | Dados | Redis 7 | 6379 | clientes Redis / apps |
 | Dados | RedisInsight | 9448 | `https://<host>:9448` (pelo proxy, só LAN) |
@@ -127,7 +128,8 @@ sudo PUBLIC_IP=203.0.113.10 ./homelab-setup.sh
 ├── infra/                      # stack de dados
 │   ├── docker-compose.yml
 │   ├── .env                    # credenciais (640 — NÃO versionar)
-│   └── mysql/{conf.d,init}/
+│   ├── mysql/{conf.d,init}/
+│   └── postgres/init/
 ├── ca/                         # CA do homelab + certificado da LAN (700, root)
 ├── apps/<projeto>/             # compose, .env e rotas públicas de cada projeto
 ├── proxy/                      # Traefik: proxy.conf, compose gerado, dynamic/, certs/, acme/, logs/
@@ -168,7 +170,7 @@ Cada projeto roda em **Docker Compose próprio** em `/opt/homelab/apps/<projeto>
 ```text
 LAN  (nome .local / IP, portas 443 e extras) ─┐
                                               ├─► Traefik (proxy.sh) ─► containers dos projetos (rede "proxy")
-Internet (domínio, 80/443, Let's Encrypt) ────┘                          └─► MySQL/Redis/RabbitMQ (rede "devnet")
+Internet (domínio, 80/443, Let's Encrypt) ────┘                          └─► MySQL/PostgreSQL/Redis/RabbitMQ (rede "devnet")
 ```
 
 ### 7.1 Proxy (Traefik) — `proxy.sh`
@@ -224,7 +226,7 @@ networks:
   proxy:
     external: true
   devnet:
-    external: true      # MySQL, Redis e RabbitMQ pelo nome: mysql, redis, rabbitmq
+    external: true      # MySQL, PostgreSQL, Redis e RabbitMQ pelo nome: mysql, postgres, redis, rabbitmq
 ```
 
 `.env` do projeto (no servidor, nunca no Git):
@@ -508,7 +510,7 @@ O L14 responde como `<hostname>.local` (só IPv4). macOS, Windows 10+ e Linux co
 ### 9.2 Firewall
 
 - UFW: entrada negada por padrão; SSH com rate-limit; mDNS só da LAN.
-- O Docker publica portas ignorando o UFW. O bloco *ufw-docker* em `/etc/ufw/after.rules` (cadeia `DOCKER-USER`) faz **toda porta de container aceitar só redes privadas** (`10/8`, `172.16/12`, `192.168/16`, `100.64/10` — Tailscale). Vale para MySQL, Redis, RabbitMQ, o proxy (80/443 e portas extras) e os painéis (9443–9446).
+- O Docker publica portas ignorando o UFW. O bloco *ufw-docker* em `/etc/ufw/after.rules` (cadeia `DOCKER-USER`) faz **toda porta de container aceitar só redes privadas** (`10/8`, `172.16/12`, `192.168/16`, `100.64/10` — Tailscale). Vale para MySQL, PostgreSQL, Redis, RabbitMQ, o proxy (80/443 e portas extras) e os painéis (9443–9446).
 - Acesso pela internet: só via `public-access.sh` (seção 9.4).
 
 ```bash
@@ -608,7 +610,7 @@ sudo cat /opt/homelab/infra/.env      # credenciais
 
 | Serviço | Endereço | Login |
 |---|---|---|
-| Adminer | `https://<host>:9447` | servidor `mysql`; `root`/`MYSQL_ROOT_PASSWORD` ou `dev`/`MYSQL_PASSWORD` |
+| Adminer | `https://<host>:9447` | servidor `mysql`; `root`/`MYSQL_ROOT_PASSWORD` ou `dev`/`MYSQL_PASSWORD`. Para o PostgreSQL: sistema *PostgreSQL*, servidor `postgres`, `postgres`/`POSTGRES_PASSWORD` ou `dev`/`POSTGRES_APP_PASSWORD` |
 | RedisInsight | `https://<host>:9448` | banco `homelab-redis` pré-cadastrado (`REDIS_PASSWORD`) |
 | RabbitMQ | `https://<host>:9449` | `admin` / `RABBITMQ_DEFAULT_PASS` |
 
@@ -619,15 +621,19 @@ Connection strings:
 ```text
 # Do seu Mac / Rider (pelo nome ou IP)
 MySQL     Server=homelab.local;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
+Postgres  Host=homelab.local;Port=5432;Database=appdb;Username=dev;Password=<POSTGRES_APP_PASSWORD>;
 Redis     homelab.local:6379,password=<REDIS_PASSWORD>
 RabbitMQ  amqp://admin:<RABBITMQ_DEFAULT_PASS>@homelab.local:5672/
 
 # De outros projetos sem a rede devnet (pelo IP fixo da LAN)
 MySQL     Server=192.168.1.10;Port=3306;Database=appdb;User=dev;Password=<MYSQL_PASSWORD>;
+Postgres  Host=192.168.1.10;Port=5432;Database=appdb;Username=dev;Password=<POSTGRES_APP_PASSWORD>;
 
 # De containers na rede devnet (compose próprio)
-MySQL     Server=mysql;Port=3306;...      Redis  redis:6379,...      RabbitMQ  amqp://...@rabbitmq:5672/
+MySQL     Server=mysql;Port=3306;...      Postgres  Host=postgres;Port=5432;...      Redis  redis:6379,...      RabbitMQ  amqp://...@rabbitmq:5672/
 ```
+
+> **PostgreSQL 17**: para EF Core use o pacote `Npgsql.EntityFrameworkCore.PostgreSQL`. O `init` (usuário `dev` e banco `appdb`) só roda na primeira criação do volume; imagens 18+ mudam o `PGDATA` e exigem montar o volume em `/var/lib/postgresql`.
 
 > **MySQL 8.4** usa `caching_sha2_password`. MySqlConnector/Pomelo funcionam normalmente; clientes antigos podem precisar de `AllowPublicKeyRetrieval=True;` (só em dev).
 
@@ -642,7 +648,7 @@ docker compose pull && docker compose up -d      # atualizar imagens
 /opt/homelab/scripts/status.sh                   # visão geral
 ```
 
-> ⚠️ `docker compose down -v` **apaga os volumes**. As senhas do `.env` só valem na criação dos volumes do MySQL e RabbitMQ; depois, troque pelo próprio serviço e atualize o `.env` (o Redis relê a senha a cada início).
+> ⚠️ `docker compose down -v` **apaga os volumes**. As senhas do `.env` só valem na criação dos volumes do MySQL, PostgreSQL e RabbitMQ; depois, troque pelo próprio serviço e atualize o `.env` (o Redis relê a senha a cada início).
 
 ---
 
@@ -652,6 +658,7 @@ Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd,
 
 | Arquivo | Conteúdo | Como é gerado |
 |---|---|---|
+| `postgres-all.sql.gz` | Todos os bancos e roles (usuários) do PostgreSQL | `pg_dumpall --clean --if-exists` — validado pela linha final `PostgreSQL database cluster dump complete` |
 | `mysql-all.sql.gz` | Todos os bancos, usuários, rotinas, triggers e eventos | `mysqldump --single-transaction` (sem travar as tabelas) — validado pela linha `Dump completed` |
 | `redis-dump.rdb.gz` | Snapshot do Redis | `BGSAVE` consistente, sem parar o serviço |
 | `rabbitmq-definitions.json` | vhosts, usuários, permissões, filas, exchanges, bindings, policies | `rabbitmqctl export_definitions` |
@@ -683,6 +690,7 @@ ls -l /opt/homelab/backups/                          # backups disponíveis
 
 ```bash
 sudo /opt/homelab/scripts/restore.sh latest mysql
+sudo /opt/homelab/scripts/restore.sh latest postgres
 sudo /opt/homelab/scripts/restore.sh 2026-10-01_030512 redis
 sudo /opt/homelab/scripts/restore.sh latest rabbitmq
 sudo /opt/homelab/scripts/restore.sh latest config   # só extrai em /tmp para comparar — não sobrescreve nada
@@ -691,6 +699,7 @@ sudo /opt/homelab/scripts/restore.sh latest config   # só extrai em /tmp para c
 | Componente | O que a restauração faz |
 |---|---|
 | `mysql` | Sobrescreve todos os bancos **e usuários** com o dump |
+| `postgres` | Sobrescreve todos os bancos **e roles** com o dump (pare as apps antes: conexões abertas impedem o `DROP DATABASE`) |
 | `redis` | Para o Redis, troca os dados do volume, carrega o snapshot sem AOF, regenera o AOF a partir da memória e sobe de novo (*trocar só o `dump.rdb` não funciona com AOF ativo — o Redis ignoraria o snapshot*) |
 | `rabbitmq` | Importa as definições (mescla com as existentes) |
 | `config` | Só extrai — a CA fica em `opt/homelab/ca` dentro do pacote |
@@ -759,7 +768,7 @@ sudo /opt/homelab/scripts/backup-disk-setup.sh /dev/sdX1
 
 # 4. Restaure os dados
 B=/mnt/backup-ssd/homelab/latest
-for c in mysql redis rabbitmq; do sudo /opt/homelab/scripts/restore.sh $B $c --yes; done
+for c in mysql postgres redis rabbitmq; do sudo /opt/homelab/scripts/restore.sh $B $c --yes; done
 sudo /opt/homelab/scripts/restore.sh $B config   # compare SSH/UFW/netplan e copie o que precisar
 sudo /opt/homelab/scripts/homelab-ca.sh issue    # reinstala o certificado da LAN no proxy
 ```
@@ -862,7 +871,7 @@ sudo tlp fullcharge BAT0
 | Sintoma | Causa provável / solução |
 |---|---|
 | Setup: *Proxy NÃO instalado: portas em uso* | Algo ocupa 80/443: `sudo ss -tlnp \| grep -E ':(80\|443) '`. Se for o Coolify: `sudo proxy.sh migrate-coolify` (seção 7.7) |
-| Projeto não conecta no MySQL/Redis | Serviço na rede `devnet` e host `mysql`/`redis`/`rabbitmq`; sem a rede, use o **IP fixo da LAN** (não `.local`); confira usuário/senha do `.env` |
+| Projeto não conecta no MySQL/PostgreSQL/Redis | Serviço na rede `devnet` e host `mysql`/`postgres`/`redis`/`rabbitmq`; sem a rede, use o **IP fixo da LAN** (não `.local`); confira usuário/senha do `.env` |
 | Navegador/tablet: certificado inválido | CA não instalada no dispositivo, ou o IP mudou: `sudo /opt/homelab/scripts/homelab-ca.sh` (status) e `issue` |
 | Acesso pelo IP falha com erro de TLS | `/opt/homelab/proxy/dynamic/homelab-lan.yaml` ausente: `sudo /opt/homelab/scripts/homelab-ca.sh issue` |
 | `404 page not found` (Traefik) | Nenhuma rota casou: confira entrypoint/rule das labels ou do arquivo em `dynamic/`; `sudo proxy.sh logs` |
