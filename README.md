@@ -193,9 +193,38 @@ sudo /opt/homelab/scripts/proxy.sh apply                   # aplica proxy.conf e
 | `certs/` | Certificado da LAN (CA do homelab) |
 | `acme/acme.json` | Certificados Let's Encrypt (600) |
 
-- Container `traefik`, rede Docker `proxy`. Painel/API do Traefik desligados: nada além de 80, 443 e as portas extras.
+- Container `traefik`, rede Docker `proxy` (mais as redes de `PROXY_EXTRA_NETWORKS`, se houver — veja *Redes Docker do proxy* abaixo). Painel/API do Traefik desligados: nada além de 80, 443 e as portas extras.
 - Toda alteração passa por validação; se o proxy não ficar saudável, a configuração anterior volta sozinha.
 - O `homelab-setup.sh` roda o `apply` na etapa 12.
+
+#### Redes Docker do proxy
+
+O Traefik só encaminha para containers que estejam numa rede que ele também alcança. Em cada projeto, **três coisas precisam apontar para a mesma rede**:
+
+1. o `networks:` do serviço (com a rede declarada `external: true` no fim do compose);
+2. a label `traefik.docker.network=<rede>`;
+3. qualquer configuração que cite a sub-rede — por exemplo `KnownNetworks`/`KnownProxies` do `ForwardedHeaders` em APIs .NET. O app enxerga o IP do Traefik **na rede escolhida na label**, então a sub-rede confiada é a dela.
+
+| Rede | Quem usa | Observação |
+|---|---|---|
+| `proxy` | Traefik e projetos com rotas | **Padrão** (`PROXY_NETWORK` no `proxy.conf`). Criada pelo `proxy.sh apply` |
+| `devnet` | Stack de dados (`mysql`, `postgres`, `redis`, `rabbitmq`) e o Seq | Projetos que usam banco entram nela também |
+| Extras | Projetos que ficaram numa rede própria (ex.: `coolify`, herdada da migração da seção 7.7) | O Traefik só entra nelas se estiverem em `PROXY_EXTRA_NETWORKS` no `proxy.conf` (e só se a rede existir; senão o `apply` avisa e ignora) |
+
+Regras práticas:
+
+- **Projeto novo:** rede `proxy`, com `traefik.docker.network=proxy`.
+- **Rede extra** continua válida enquanto estiver em `PROXY_EXTRA_NETWORKS`. Se ela sair da lista, ou a rede for removida, os serviços que dependem dela ficam sem rota (502/504). Só retire depois de `sudo proxy.sh check` limpo.
+- **Sem a label**, o Traefik usa a rede `proxy`; se o container não estiver nela, usa a *primeira* rede do container, que pode ser uma que o proxy não alcança. Em serviço com mais de uma rede, declare sempre a label.
+- **Logs no Seq:** o serviço precisa de uma rede em comum com ele (`proxy`, `devnet` ou as de `SEQ_NETWORKS` no `monitor.conf`).
+- **O servidor é a fonte da verdade** para saber quais redes o Traefik alcança — o repositório mostra o padrão, mas o `proxy.conf` do servidor pode ter extras:
+
+```bash
+docker inspect traefik --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'   # redes do Traefik
+grep -E 'PROXY_NETWORK|PROXY_EXTRA_NETWORKS' /opt/homelab/proxy/proxy.conf                     # configuração
+docker network inspect <rede> --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}'              # sub-rede de uma rede
+sudo /opt/homelab/scripts/proxy.sh check                                                       # rotas em rede que o proxy não alcança
+```
 
 ### 7.2 Estrutura de um projeto
 
@@ -210,7 +239,7 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Production
       ASPNETCORE_FORWARDEDHEADERS_ENABLED: "true"     # atrás do Traefik: esquema/IP reais do cliente
-    networks: [default, proxy, devnet]
+    networks: [default, proxy, devnet]              # rede, label e sub-rede citada no app: a mesma (7.1, Redes Docker do proxy)
     labels:
       - traefik.enable=true
       - traefik.docker.network=proxy
@@ -441,7 +470,7 @@ cd /opt/homelab/apps/<projeto>
 ```
 
 O `add`:
-1. Põe o serviço na rede `proxy`, onde o Seq está. Se o compose ainda usa a rede legada `coolify`, troca por `proxy` no arquivo todo (pede confirmação).
+1. Põe o serviço na rede `proxy`, onde o Seq está. Se o compose ainda usa a rede legada `coolify`, troca por `proxy` no arquivo todo (pede confirmação; responder não **cancela o comando** sem alterar nada). Para manter a rede legada, configure o Seq à mão: coloque o serviço também na `devnet` e defina `Seq__ServerUrl` e `Seq__ApiKey` no `environment:`; o `seq-app.sh check` valida o resultado.
 2. Acrescenta `Seq__ServerUrl: http://seq:5341` e `Seq__ApiKey: ${SEQ_APIKEY_<SERVIÇO>}` no `environment:` do serviço. A chave fica no `.env` do projeto, fora do Git.
 3. Valida o compose. Se der erro, volta o original (há sempre um backup `docker-compose.yml.bak-<data>`).
 4. Recria o serviço (as rotas públicas ficam no proxy e não são afetadas).
@@ -466,7 +495,7 @@ sudo ./homelab-setup.sh                               # fecha o SSH de root e as
 ```
 
 - O backup do Coolify (banco + `/data/coolify`) fica em `/opt/homelab/backups/coolify-final-<data>/`.
-- Projetos que usam a rede `coolify` continuam funcionando, porque o proxy também entra nela (`PROXY_EXTRA_NETWORKS="coolify"`). Para padronizar, troque `coolify` por `proxy` no compose do projeto (em `networks` e em `traefik.docker.network`) e rode `docker compose up -d`. Depois de migrar todos, remova `coolify` de `PROXY_EXTRA_NETWORKS` e rode `proxy.sh apply`.
+- Projetos que usam a rede `coolify` continuam funcionando, porque o proxy também entra nela (`PROXY_EXTRA_NETWORKS="coolify"`). Para padronizar, troque `coolify` por `proxy` no compose do projeto (em `networks` e em `traefik.docker.network`) e rode `docker compose up -d`. Depois de migrar todos, remova `coolify` de `PROXY_EXTRA_NETWORKS` e rode `proxy.sh apply`. Manter a rede `coolify` é uma escolha válida (nada quebra enquanto ela estiver em `PROXY_EXTRA_NETWORKS`); as regras e a verificação estão em *Redes Docker do proxy* (7.1).
 
 ---
 
