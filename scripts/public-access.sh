@@ -56,10 +56,10 @@ check_domain() {
   elif [[ "$dns" == "$pub" ]]; then
     pass "$domain → $dns"
   else
-    fail "$domain → $dns, mas o IP público do L14 é $pub"
+    fail "$domain → $dns, mas o IP público do servidor é $pub"
   fi
 
-  echo "2. Firewall do L14"
+  echo "2. Firewall do servidor"
   if ufw status | grep -q 'Proxy publico'; then pass "80/443 liberados (public-access.sh enable)"
   else fail "80/443 fechados para a internet — rode: sudo $0 enable"; fi
 
@@ -107,7 +107,7 @@ check_domain() {
   echo "     e abra https://$domain pelo 4G do celular."
   echo "     Sem nenhuma linha → o roteador/provedor ainda não encaminha 80/443 para $(lan_ip)."
   echo
-  if (( ok == 0 )); then echo "Tudo certo do lado do L14."; else echo "Há itens pendentes (✘) acima."; fi
+  if (( ok == 0 )); then echo "Tudo certo do lado do servidor."; else echo "Há itens pendentes (✘) acima."; fi
   return "$ok"
 }
 
@@ -133,7 +133,7 @@ case "${1:-status}" in
     echo
     echo "Próximos passos:"
     echo "  1. No roteador/ONT: encaminhe as portas 80/tcp, 443/tcp e 443/udp para $(lan_ip)"
-    echo "     (o L14 precisa de IP fixo na LAN — network-static.sh)."
+    echo "     (o servidor precisa de IP fixo na LAN — network-static.sh)."
     echo "  2. No DNS do seu domínio: registro A  ex.: api.seudominio.com.br → $(public_ip)"
     echo "  3. Na pasta do projeto: $HOMELAB_DIR/scripts/public-route.sh add <serviço> api.seudominio.com.br"
     echo "     (o Traefik emite o certificado Let's Encrypt automaticamente)."

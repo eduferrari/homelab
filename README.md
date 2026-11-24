@@ -1,6 +1,6 @@
-# Homelab — ThinkPad L14
+# Homelab
 
-Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação limpa do Ubuntu Server**: Ubuntu endurecido, **stack de dados** (MySQL, PostgreSQL, Redis, RabbitMQ) em Docker, **proxy Traefik** com HTTPS na LAN (CA própria) e domínios públicos (Let's Encrypt), e projetos em Docker Compose com **deploy pelo GitHub Actions**.
+Provisionamento do notebook como servidor, **a partir de uma instalação limpa do Ubuntu Server**: Ubuntu endurecido, **stack de dados** (MySQL, PostgreSQL, Redis, RabbitMQ) em Docker, **proxy Traefik** com HTTPS na LAN (CA própria) e domínios públicos (Let's Encrypt), e projetos em Docker Compose com **deploy pelo GitHub Actions**.
 
 ---
 
@@ -19,7 +19,7 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 | Dados | RabbitMQ 4 (AMQP / Management) | 5672 / 9449 | AMQP direto; painel em `https://<host>:9449` (pelo proxy, só LAN) |
 | Host | SSH | 22 | `ssh <usuario>@<host>` |
 
-`<host>` é o nome mDNS do L14 — `homelab.local` — ou o IP fixo da LAN.
+`<host>` é o nome mDNS do servidor — `homelab.local` — ou o IP fixo da LAN.
 
 - A stack de dados fica em `/opt/homelab/infra` (compose `homelab`, rede `devnet`, volumes persistentes).
 - Tudo que roda em container é acessível **somente pela LAN** (seção 9.2). Para a internet, apenas 80/443 do proxy, quando você ativar (seção 9.4).
@@ -29,7 +29,7 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 
 ## 2. Pré-requisitos
 
-1. **Ubuntu Server 24.04 LTS** instalado no L14 (22.04 também funciona; Ubuntu Desktop funciona, mas o script muda o boot para modo texto).
+1. **Ubuntu Server 24.04 LTS** instalado no servidor (22.04 também funciona; Ubuntu Desktop funciona, mas o script muda o boot para modo texto).
    - Na instalação, marque **"Install OpenSSH server"**.
 2. Um usuário comum com `sudo` (o que você criou na instalação).
 3. Hardware: **2 núcleos e 4 GB de RAM** (stack de dados + projetos), **30 GB de disco** livres.
@@ -54,7 +54,7 @@ No seu computador principal (macOS/Linux):
 
 ```bash
 ssh-keygen -t ed25519 -C "usuario@homelab"   # se ainda não tiver chave
-ssh-copy-id <usuario>@<IP-do-L14>
+ssh-copy-id <usuario>@<IP-do-servidor>
 ```
 
 Com a chave copiada **antes** do script, ele desativa automaticamente o login por senha no SSH (`DISABLE_SSH_PASSWORD=auto`).
@@ -63,7 +63,7 @@ Com a chave copiada **antes** do script, ele desativa automaticamente o login po
 
 ## 4. Instalação
 
-No L14:
+No servidor:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
@@ -315,9 +315,9 @@ cd /opt/homelab/apps/minhaapi
 /opt/homelab/scripts/public-route.sh add api api.seudominio.com.br
 ```
 
-### 7.5 Deploy automático (GitHub Actions + runner no L14)
+### 7.5 Deploy automático (GitHub Actions + runner no servidor)
 
-O runner self-hosted (seção 12) busca os jobs no GitHub, então nenhuma porta precisa ser aberta. O build roda na nuvem do GitHub e publica a imagem no GHCR; o job de deploy, no L14, só baixa a imagem e recria os containers.
+O runner self-hosted (seção 12) busca os jobs no GitHub, então nenhuma porta precisa ser aberta. O build roda na nuvem do GitHub e publica a imagem no GHCR; o job de deploy, no servidor, só baixa a imagem e recria os containers.
 
 Preparação (uma vez por projeto):
 1. Registre o runner no repositório (seção 12). Use **só em repositório privado**.
@@ -534,7 +534,7 @@ Confira a impressão digital (SHA-256) antes de confiar.
 
 ### 9.1 Nome na LAN (mDNS)
 
-O L14 responde como `<hostname>.local` (só IPv4). macOS, Windows 10+ e Linux com `libnss-mdns` resolvem. Containers **não** resolvem `.local` — use o IP.
+O servidor responde como `<hostname>.local` (só IPv4). macOS, Windows 10+ e Linux com `libnss-mdns` resolvem. Containers **não** resolvem `.local` — use o IP.
 
 ### 9.2 Firewall
 
@@ -549,7 +549,7 @@ sudo journalctl -k | grep "UFW DOCKER BLOCK"   # bloqueios vindos de fora
 
 ### 9.3 IP fixo na LAN — `network-static.sh`
 
-O roteador encaminha o IP público para **um IP da LAN**; por isso o L14 precisa de IP fixo:
+O roteador encaminha o IP público para **um IP da LAN**; por isso o servidor precisa de IP fixo:
 
 ```bash
 sudo /opt/homelab/scripts/network-static.sh                       # rede atual e sugestão
@@ -572,18 +572,18 @@ Voltar para DHCP: `sudo /opt/homelab/scripts/network-static.sh --dhcp`.
 
 ```text
 Internet ─► api.seudominio.com.br (DNS A) ─► 203.0.113.10 (roteador/ONT)
-         ─► 80/443 encaminhadas ─► 192.168.1.10 (L14) ─► Traefik (proxy.sh) ─► app
+         ─► 80/443 encaminhadas ─► 192.168.1.10 (servidor) ─► Traefik (proxy.sh) ─► app
 ```
 
-Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o IP fixo do L14 na LAN e `api`/`app.seudominio.com.br` domínios do seu projeto.
+Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o IP fixo do servidor na LAN e `api`/`app.seudominio.com.br` domínios do seu projeto.
 
-1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, os painéis (9440–9449), 3306, 6379 nem 5672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
+1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do servidor, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, os painéis (9440–9449), 3306, 6379 nem 5672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
 2. **DNS** (zona do seu domínio, ex.: Registro.br) — um registro por subdomínio:
    ```text
    api   A   203.0.113.10   TTL 300
    app   A   203.0.113.10   TTL 300
    ```
-3. **Firewall do L14:**
+3. **Firewall do servidor:**
    ```bash
    sudo /opt/homelab/scripts/public-access.sh enable    # status | enable | disable | check <dominio>
    ```
@@ -683,7 +683,7 @@ docker compose pull && docker compose up -d      # atualizar imagens
 
 ## 11. Backup e restauração
 
-Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd, com até 15 min de atraso aleatório; se o L14 estiver desligado, roda ao ligar). Ele grava em `/opt/homelab/backups/AAAA-MM-DD_HHMMSS/` (disco interno) e, em seguida, **copia para o SSD externo** (veja *SSD externo*):
+Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd, com até 15 min de atraso aleatório; se o servidor estiver desligado, roda ao ligar). Ele grava em `/opt/homelab/backups/AAAA-MM-DD_HHMMSS/` (disco interno) e, em seguida, **copia para o SSD externo** (veja *SSD externo*):
 
 | Arquivo | Conteúdo | Como é gerado |
 |---|---|---|
@@ -780,7 +780,7 @@ sudo /opt/homelab/scripts/restore.sh /mnt/backup-ssd/homelab/latest redis
 
 > ⚠️ O SSD guarda segredos sem criptografia (`.env`, chave privada da CA, senha do Wi-Fi, certificados Let's Encrypt). Guarde-o como guardaria as senhas.
 
-### Recuperação total (L14 novo ou SSD interno trocado)
+### Recuperação total (servidor novo ou SSD interno trocado)
 
 ```bash
 # 1. Instale o Ubuntu Server, clone o repositório e conecte o SSD de backup
@@ -811,7 +811,7 @@ Depois, suba cada projeto (`cd /opt/homelab/apps/<projeto> && docker compose up 
 O setup cria o usuário `gh-runner` (grupo `docker`) e baixa o runner em `/opt/actions-runner`. Para registrar:
 
 1. GitHub: **repositório → Settings → Actions → Runners → New self-hosted runner** (ou na organização). Copie o token (vale 1 hora).
-2. No L14:
+2. No servidor:
    ```bash
    sudo /opt/homelab/scripts/register-runner.sh https://github.com/eduferrari/<repo> <TOKEN>
    ```
@@ -830,7 +830,7 @@ Uso típico: o job de deploy roda `docker compose pull && up -d` na pasta do pro
    ```bash
    ssh-copy-id usuario@homelab.local
    ```
-4. *(Opcional)* **Manter uma CA existente** (dispositivos que já confiam nela): copie `root.crt` e `root.key` para o L14, por exemplo em `~/ca-antiga/`, e rode o setup com `CA_IMPORT_DIR=~/ca-antiga`. Sem isso, uma CA nova é criada.
+4. *(Opcional)* **Manter uma CA existente** (dispositivos que já confiam nela): copie `root.crt` e `root.key` para o servidor, por exemplo em `~/ca-antiga/`, e rode o setup com `CA_IMPORT_DIR=~/ca-antiga`. Sem isso, uma CA nova é criada.
 5. **Setup**:
    ```bash
    sudo apt-get update && sudo apt-get install -y git
@@ -872,7 +872,7 @@ sudo tlp-stat -b | grep -i thresh              # faixa 75–80%
 cat /sys/class/power_supply/BAT0/capacity      # carga atual
 ```
 
-Teste: feche a tampa, aguarde 1 minuto e acesse o L14 via SSH de outra máquina.
+Teste: feche a tampa, aguarde 1 minuto e acesse o servidor via SSH de outra máquina.
 
 Para liberar carga total temporariamente (ex.: antes de levar o notebook):
 
