@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  homelab-setup.sh — Provisionamento do homelab (ThinkPad L14 + Ubuntu Server)
+#  homelab-setup.sh — Provisionamento do homelab (notebook + Ubuntu Server)
 #
 #  Base:     Ubuntu servidor | SSH + fail2ban | UFW (+Docker) | mDNS | tampa fechada/TLP
 #  Dados:    Docker Engine + Compose | rede "devnet" | MySQL 8.4 + Adminer

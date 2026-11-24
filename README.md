@@ -1,6 +1,6 @@
-# Homelab — ThinkPad L14
+# Homelab
 
-Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação limpa do Ubuntu Server**: Ubuntu endurecido, **stack de dados** (MySQL, PostgreSQL, Redis, RabbitMQ) em Docker, **proxy Traefik** com HTTPS na LAN (CA própria) e domínios públicos (Let's Encrypt), e projetos em Docker Compose com **deploy pelo GitHub Actions**.
+Provisionamento do notebook como servidor, **a partir de uma instalação limpa do Ubuntu Server**: Ubuntu endurecido, **stack de dados** (MySQL, PostgreSQL, Redis, RabbitMQ) em Docker, **proxy Traefik** com HTTPS na LAN (CA própria) e domínios públicos (Let's Encrypt), e projetos em Docker Compose com **deploy pelo GitHub Actions**.
 
 ---
 
@@ -19,7 +19,7 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 | Dados | RabbitMQ 4 (AMQP / Management) | 5672 / 9449 | AMQP direto; painel em `https://<host>:9449` (pelo proxy, só LAN) |
 | Host | SSH | 22 | `ssh <usuario>@<host>` |
 
-`<host>` é o nome mDNS do L14 — `homelab.local` — ou o IP fixo da LAN.
+`<host>` é o nome mDNS do servidor — `homelab.local` — ou o IP fixo da LAN.
 
 - A stack de dados fica em `/opt/homelab/infra` (compose `homelab`, rede `devnet`, volumes persistentes).
 - Tudo que roda em container é acessível **somente pela LAN** (seção 9.2). Para a internet, apenas 80/443 do proxy, quando você ativar (seção 9.4).
@@ -29,7 +29,7 @@ Provisionamento do ThinkPad L14 como servidor, **a partir de uma instalação li
 
 ## 2. Pré-requisitos
 
-1. **Ubuntu Server 24.04 LTS** instalado no L14 (22.04 também funciona; Ubuntu Desktop funciona, mas o script muda o boot para modo texto).
+1. **Ubuntu Server 24.04 LTS** instalado no servidor (22.04 também funciona; Ubuntu Desktop funciona, mas o script muda o boot para modo texto).
    - Na instalação, marque **"Install OpenSSH server"**.
 2. Um usuário comum com `sudo` (o que você criou na instalação).
 3. Hardware: **2 núcleos e 4 GB de RAM** (stack de dados + projetos), **30 GB de disco** livres.
@@ -54,7 +54,7 @@ No seu computador principal (macOS/Linux):
 
 ```bash
 ssh-keygen -t ed25519 -C "usuario@homelab"   # se ainda não tiver chave
-ssh-copy-id <usuario>@<IP-do-L14>
+ssh-copy-id <usuario>@<IP-do-servidor>
 ```
 
 Com a chave copiada **antes** do script, ele desativa automaticamente o login por senha no SSH (`DISABLE_SSH_PASSWORD=auto`).
@@ -63,7 +63,7 @@ Com a chave copiada **antes** do script, ele desativa automaticamente o login po
 
 ## 4. Instalação
 
-No L14:
+No servidor:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
@@ -193,9 +193,38 @@ sudo /opt/homelab/scripts/proxy.sh apply                   # aplica proxy.conf e
 | `certs/` | Certificado da LAN (CA do homelab) |
 | `acme/acme.json` | Certificados Let's Encrypt (600) |
 
-- Container `traefik`, rede Docker `proxy`. Painel/API do Traefik desligados: nada além de 80, 443 e as portas extras.
+- Container `traefik`, rede Docker `proxy` (mais as redes de `PROXY_EXTRA_NETWORKS`, se houver — veja *Redes Docker do proxy* abaixo). Painel/API do Traefik desligados: nada além de 80, 443 e as portas extras.
 - Toda alteração passa por validação; se o proxy não ficar saudável, a configuração anterior volta sozinha.
 - O `homelab-setup.sh` roda o `apply` na etapa 12.
+
+#### Redes Docker do proxy
+
+O Traefik só encaminha para containers que estejam numa rede que ele também alcança. Em cada projeto, **três coisas precisam apontar para a mesma rede**:
+
+1. o `networks:` do serviço (com a rede declarada `external: true` no fim do compose);
+2. a label `traefik.docker.network=<rede>`;
+3. qualquer configuração que cite a sub-rede — por exemplo `KnownNetworks`/`KnownProxies` do `ForwardedHeaders` em APIs .NET. O app enxerga o IP do Traefik **na rede escolhida na label**, então a sub-rede confiada é a dela.
+
+| Rede | Quem usa | Observação |
+|---|---|---|
+| `proxy` | Traefik e projetos com rotas | **Padrão** (`PROXY_NETWORK` no `proxy.conf`). Criada pelo `proxy.sh apply` |
+| `devnet` | Stack de dados (`mysql`, `postgres`, `redis`, `rabbitmq`) e o Seq | Projetos que usam banco entram nela também |
+| Extras | Projetos que ficaram numa rede própria (ex.: `coolify`, herdada da migração da seção 7.7) | O Traefik só entra nelas se estiverem em `PROXY_EXTRA_NETWORKS` no `proxy.conf` (e só se a rede existir; senão o `apply` avisa e ignora) |
+
+Regras práticas:
+
+- **Projeto novo:** rede `proxy`, com `traefik.docker.network=proxy`.
+- **Rede extra** continua válida enquanto estiver em `PROXY_EXTRA_NETWORKS`. Se ela sair da lista, ou a rede for removida, os serviços que dependem dela ficam sem rota (502/504). Só retire depois de `sudo proxy.sh check` limpo.
+- **Sem a label**, o Traefik usa a rede `proxy`; se o container não estiver nela, usa a *primeira* rede do container, que pode ser uma que o proxy não alcança. Em serviço com mais de uma rede, declare sempre a label.
+- **Logs no Seq:** o serviço precisa de uma rede em comum com ele (`proxy`, `devnet` ou as de `SEQ_NETWORKS` no `monitor.conf`).
+- **O servidor é a fonte da verdade** para saber quais redes o Traefik alcança — o repositório mostra o padrão, mas o `proxy.conf` do servidor pode ter extras:
+
+```bash
+docker inspect traefik --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'   # redes do Traefik
+grep -E 'PROXY_NETWORK|PROXY_EXTRA_NETWORKS' /opt/homelab/proxy/proxy.conf                     # configuração
+docker network inspect <rede> --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}'              # sub-rede de uma rede
+sudo /opt/homelab/scripts/proxy.sh check                                                       # rotas em rede que o proxy não alcança
+```
 
 ### 7.2 Estrutura de um projeto
 
@@ -204,13 +233,14 @@ sudo /opt/homelab/scripts/proxy.sh apply                   # aplica proxy.conf e
 ```yaml
 services:
   api:
-    image: ghcr.io/eduferrari/minhaapi-api:latest    # imagem publicada pelo GitHub Actions (7.5)
+    image: minhaapi-api:latest                       # imagem construída no servidor pelo GitHub Actions (7.5)
+    pull_policy: never                               # sem registry: nunca tenta baixar a imagem
     restart: unless-stopped
     env_file: .env
     environment:
       ASPNETCORE_ENVIRONMENT: Production
       ASPNETCORE_FORWARDEDHEADERS_ENABLED: "true"     # atrás do Traefik: esquema/IP reais do cliente
-    networks: [default, proxy, devnet]
+    networks: [default, proxy, devnet]              # rede, label e sub-rede citada no app: a mesma (7.1, Redes Docker do proxy)
     labels:
       - traefik.enable=true
       - traefik.docker.network=proxy
@@ -286,9 +316,9 @@ cd /opt/homelab/apps/minhaapi
 /opt/homelab/scripts/public-route.sh add api api.seudominio.com.br
 ```
 
-### 7.5 Deploy automático (GitHub Actions + runner no L14)
+### 7.5 Deploy automático (GitHub Actions + runner no servidor)
 
-O runner self-hosted (seção 12) busca os jobs no GitHub, então nenhuma porta precisa ser aberta. O build roda na nuvem do GitHub e publica a imagem no GHCR; o job de deploy, no L14, só baixa a imagem e recria os containers.
+O runner self-hosted (seção 12) busca os jobs no GitHub, então nenhuma porta precisa ser aberta. **A imagem é construída no próprio servidor**, sem registry (nada de GHCR): o job faz o `docker build`, e o compose usa a imagem local com `pull_policy: never`.
 
 Preparação (uma vez por projeto):
 1. Registre o runner no repositório (seção 12). Use **só em repositório privado**.
@@ -298,6 +328,7 @@ Preparação (uma vez por projeto):
    sudo chgrp docker docker-compose*.yml .env && sudo chmod 640 .env
    ```
 3. Proteja a `main` (*Settings → Branches → Require a pull request*): o deploy acontece no merge do PR.
+4. No compose do projeto, deixe `pull_policy: never` no serviço (seção 7.2). Se a imagem local não existir, o `up` falha em vez de tentar baixá-la de um registry.
 
 `.github/workflows/deploy.yml` no repositório do projeto:
 
@@ -309,46 +340,34 @@ on:
   workflow_dispatch:
 
 concurrency: { group: deploy-homelab, cancel-in-progress: false }
-permissions: { contents: read, packages: write }
+permissions: { contents: read }
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: src/Api/Dockerfile
-          push: true
-          tags: |
-            ghcr.io/eduferrari/minhaapi-api:latest
-            ghcr.io/eduferrari/minhaapi-api:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
   deploy:
-    needs: build
     runs-on: [self-hosted, homelab]
     environment: production          # opcional: aprovação manual em Settings → Environments
-    defaults:
-      run:
-        working-directory: /opt/homelab/apps/minhaapi
     steps:
-      - uses: docker/login-action@v3
-        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
-      - run: docker compose pull && docker compose up -d --no-build && docker image prune -f
-      - run: sleep 15 && docker compose ps && test -z "$(docker compose ps --status exited -q)"
-      - if: always()
-        run: docker logout ghcr.io
+      - uses: actions/checkout@v4
+      - name: Build da imagem no servidor
+        run: |
+          docker build -f src/Api/Dockerfile \
+            -t minhaapi-api:latest \
+            -t minhaapi-api:${{ github.sha }} .
+      - name: Recria os containers
+        working-directory: /opt/homelab/apps/minhaapi
+        run: |
+          docker compose config --quiet
+          docker compose up -d --no-build --pull never
+          docker image prune -f
+      - name: Verifica
+        working-directory: /opt/homelab/apps/minhaapi
+        run: sleep 15 && docker compose ps && test -z "$(docker compose ps --status exited -q)"
 ```
 
 - Só os serviços com imagem nova são recriados; o `.env` e as rotas públicas do servidor continuam valendo.
-- As rotas públicas ficam no proxy (`public-route.sh`), não no compose: o deploy pode usar `docker compose -f ...` ou `--project-directory` sem perder os domínios. Antes do `up`, um `docker compose ... config --quiet` faz o job falhar com uma mensagem clara se o compose do servidor estiver inválido.
-- Para voltar uma versão, troque `latest` pela tag do commit (`:<sha>`) no compose e rode `docker compose up -d`.
+- As rotas públicas ficam no proxy (`public-route.sh`), não no compose: o deploy pode usar `docker compose -f ...` ou `--project-directory` sem perder os domínios. O `docker compose config --quiet` antes do `up` faz o job falhar com uma mensagem clara se o compose do servidor estiver inválido.
+- O build usa o cache de camadas do Docker do próprio servidor, então os builds seguintes são rápidos. Sem registry, a imagem existe só nesta máquina: ela não vai para o backup (o código está no Git; para reconstruir, rode o workflow com *Run workflow*).
+- Para voltar uma versão, aponte o compose para a tag do commit (`minhaapi-api:<sha>`, que continua local) no lugar de `latest` e rode `docker compose up -d`.
 
 ### 7.6 Painéis: geral, logs, tráfego, status e Seq — `monitor.sh`
 
@@ -441,7 +460,7 @@ cd /opt/homelab/apps/<projeto>
 ```
 
 O `add`:
-1. Põe o serviço na rede `proxy`, onde o Seq está. Se o compose ainda usa a rede legada `coolify`, troca por `proxy` no arquivo todo (pede confirmação).
+1. Põe o serviço na rede `proxy`, onde o Seq está. Se o compose ainda usa a rede legada `coolify`, troca por `proxy` no arquivo todo (pede confirmação; responder não **cancela o comando** sem alterar nada). Para manter a rede legada, configure o Seq à mão: coloque o serviço também na `devnet` e defina `Seq__ServerUrl` e `Seq__ApiKey` no `environment:`; o `seq-app.sh check` valida o resultado.
 2. Acrescenta `Seq__ServerUrl: http://seq:5341` e `Seq__ApiKey: ${SEQ_APIKEY_<SERVIÇO>}` no `environment:` do serviço. A chave fica no `.env` do projeto, fora do Git.
 3. Valida o compose. Se der erro, volta o original (há sempre um backup `docker-compose.yml.bak-<data>`).
 4. Recria o serviço (as rotas públicas ficam no proxy e não são afetadas).
@@ -466,7 +485,7 @@ sudo ./homelab-setup.sh                               # fecha o SSH de root e as
 ```
 
 - O backup do Coolify (banco + `/data/coolify`) fica em `/opt/homelab/backups/coolify-final-<data>/`.
-- Projetos que usam a rede `coolify` continuam funcionando, porque o proxy também entra nela (`PROXY_EXTRA_NETWORKS="coolify"`). Para padronizar, troque `coolify` por `proxy` no compose do projeto (em `networks` e em `traefik.docker.network`) e rode `docker compose up -d`. Depois de migrar todos, remova `coolify` de `PROXY_EXTRA_NETWORKS` e rode `proxy.sh apply`.
+- Projetos que usam a rede `coolify` continuam funcionando, porque o proxy também entra nela (`PROXY_EXTRA_NETWORKS="coolify"`). Para padronizar, troque `coolify` por `proxy` no compose do projeto (em `networks` e em `traefik.docker.network`) e rode `docker compose up -d`. Depois de migrar todos, remova `coolify` de `PROXY_EXTRA_NETWORKS` e rode `proxy.sh apply`. Manter a rede `coolify` é uma escolha válida (nada quebra enquanto ela estiver em `PROXY_EXTRA_NETWORKS`); as regras e a verificação estão em *Redes Docker do proxy* (7.1).
 
 ---
 
@@ -505,7 +524,7 @@ Confira a impressão digital (SHA-256) antes de confiar.
 
 ### 9.1 Nome na LAN (mDNS)
 
-O L14 responde como `<hostname>.local` (só IPv4). macOS, Windows 10+ e Linux com `libnss-mdns` resolvem. Containers **não** resolvem `.local` — use o IP.
+O servidor responde como `<hostname>.local` (só IPv4). macOS, Windows 10+ e Linux com `libnss-mdns` resolvem. Containers **não** resolvem `.local` — use o IP.
 
 ### 9.2 Firewall
 
@@ -520,7 +539,7 @@ sudo journalctl -k | grep "UFW DOCKER BLOCK"   # bloqueios vindos de fora
 
 ### 9.3 IP fixo na LAN — `network-static.sh`
 
-O roteador encaminha o IP público para **um IP da LAN**; por isso o L14 precisa de IP fixo:
+O roteador encaminha o IP público para **um IP da LAN**; por isso o servidor precisa de IP fixo:
 
 ```bash
 sudo /opt/homelab/scripts/network-static.sh                       # rede atual e sugestão
@@ -543,18 +562,18 @@ Voltar para DHCP: `sudo /opt/homelab/scripts/network-static.sh --dhcp`.
 
 ```text
 Internet ─► api.seudominio.com.br (DNS A) ─► 203.0.113.10 (roteador/ONT)
-         ─► 80/443 encaminhadas ─► 192.168.1.10 (L14) ─► Traefik (proxy.sh) ─► app
+         ─► 80/443 encaminhadas ─► 192.168.1.10 (servidor) ─► Traefik (proxy.sh) ─► app
 ```
 
-Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o IP fixo do L14 na LAN e `api`/`app.seudominio.com.br` domínios do seu projeto.
+Nos exemplos: `203.0.113.10` é o IP público fixo do provedor, `192.168.1.10` o IP fixo do servidor na LAN e `api`/`app.seudominio.com.br` domínios do seu projeto.
 
-1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do L14, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, os painéis (9440–9449), 3306, 6379 nem 5672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
+1. **Provedor / roteador:** encaminhar `80/tcp`, `443/tcp` e `443/udp` de `203.0.113.10` para `192.168.1.10` (IP fixo do servidor, seção 9.3). **Não** encaminhe 22, as portas extras da LAN, os painéis (9440–9449), 3306, 6379 nem 5672. Se o IP da WAN no roteador for `100.64.x.x` (CGNAT), o encaminhamento não funciona.
 2. **DNS** (zona do seu domínio, ex.: Registro.br) — um registro por subdomínio:
    ```text
    api   A   203.0.113.10   TTL 300
    app   A   203.0.113.10   TTL 300
    ```
-3. **Firewall do L14:**
+3. **Firewall do servidor:**
    ```bash
    sudo /opt/homelab/scripts/public-access.sh enable    # status | enable | disable | check <dominio>
    ```
@@ -654,7 +673,7 @@ docker compose pull && docker compose up -d      # atualizar imagens
 
 ## 11. Backup e restauração
 
-Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd, com até 15 min de atraso aleatório; se o L14 estiver desligado, roda ao ligar). Ele grava em `/opt/homelab/backups/AAAA-MM-DD_HHMMSS/` (disco interno) e, em seguida, **copia para o SSD externo** (veja *SSD externo*):
+Um backup completo roda **todo dia às 03:00** (`homelab-backup.timer`, systemd, com até 15 min de atraso aleatório; se o servidor estiver desligado, roda ao ligar). Ele grava em `/opt/homelab/backups/AAAA-MM-DD_HHMMSS/` (disco interno) e, em seguida, **copia para o SSD externo** (veja *SSD externo*):
 
 | Arquivo | Conteúdo | Como é gerado |
 |---|---|---|
@@ -751,7 +770,7 @@ sudo /opt/homelab/scripts/restore.sh /mnt/backup-ssd/homelab/latest redis
 
 > ⚠️ O SSD guarda segredos sem criptografia (`.env`, chave privada da CA, senha do Wi-Fi, certificados Let's Encrypt). Guarde-o como guardaria as senhas.
 
-### Recuperação total (L14 novo ou SSD interno trocado)
+### Recuperação total (servidor novo ou SSD interno trocado)
 
 ```bash
 # 1. Instale o Ubuntu Server, clone o repositório e conecte o SSD de backup
@@ -782,12 +801,12 @@ Depois, suba cada projeto (`cd /opt/homelab/apps/<projeto> && docker compose up 
 O setup cria o usuário `gh-runner` (grupo `docker`) e baixa o runner em `/opt/actions-runner`. Para registrar:
 
 1. GitHub: **repositório → Settings → Actions → Runners → New self-hosted runner** (ou na organização). Copie o token (vale 1 hora).
-2. No L14:
+2. No servidor:
    ```bash
    sudo /opt/homelab/scripts/register-runner.sh https://github.com/eduferrari/<repo> <TOKEN>
    ```
 
-Uso típico: o job de deploy roda `docker compose pull && up -d` na pasta do projeto (seção 7.5).
+Uso típico: o job de deploy faz o `docker build` e roda `docker compose up -d` na pasta do projeto (seção 7.5).
 
 > ⚠️ Nunca use runner self-hosted em **repositório público** (um PR de terceiro executaria código no servidor). O `gh-runner` está no grupo `docker` — equivale a root.
 
@@ -801,7 +820,7 @@ Uso típico: o job de deploy roda `docker compose pull && up -d` na pasta do pro
    ```bash
    ssh-copy-id usuario@homelab.local
    ```
-4. *(Opcional)* **Manter uma CA existente** (dispositivos que já confiam nela): copie `root.crt` e `root.key` para o L14, por exemplo em `~/ca-antiga/`, e rode o setup com `CA_IMPORT_DIR=~/ca-antiga`. Sem isso, uma CA nova é criada.
+4. *(Opcional)* **Manter uma CA existente** (dispositivos que já confiam nela): copie `root.crt` e `root.key` para o servidor, por exemplo em `~/ca-antiga/`, e rode o setup com `CA_IMPORT_DIR=~/ca-antiga`. Sem isso, uma CA nova é criada.
 5. **Setup**:
    ```bash
    sudo apt-get update && sudo apt-get install -y git
@@ -843,7 +862,7 @@ sudo tlp-stat -b | grep -i thresh              # faixa 75–80%
 cat /sys/class/power_supply/BAT0/capacity      # carga atual
 ```
 
-Teste: feche a tampa, aguarde 1 minuto e acesse o L14 via SSH de outra máquina.
+Teste: feche a tampa, aguarde 1 minuto e acesse o servidor via SSH de outra máquina.
 
 Para liberar carga total temporariamente (ex.: antes de levar o notebook):
 
