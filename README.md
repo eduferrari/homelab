@@ -233,7 +233,8 @@ sudo /opt/homelab/scripts/proxy.sh check                                        
 ```yaml
 services:
   api:
-    image: ghcr.io/eduferrari/minhaapi-api:latest    # imagem publicada pelo GitHub Actions (7.5)
+    image: minhaapi-api:latest                       # imagem construída no servidor pelo GitHub Actions (7.5)
+    pull_policy: never                               # sem registry: nunca tenta baixar a imagem
     restart: unless-stopped
     env_file: .env
     environment:
@@ -317,7 +318,7 @@ cd /opt/homelab/apps/minhaapi
 
 ### 7.5 Deploy automático (GitHub Actions + runner no servidor)
 
-O runner self-hosted (seção 12) busca os jobs no GitHub, então nenhuma porta precisa ser aberta. O build roda na nuvem do GitHub e publica a imagem no GHCR; o job de deploy, no servidor, só baixa a imagem e recria os containers.
+O runner self-hosted (seção 12) busca os jobs no GitHub, então nenhuma porta precisa ser aberta. **A imagem é construída no próprio servidor**, sem registry (nada de GHCR): o job faz o `docker build`, e o compose usa a imagem local com `pull_policy: never`.
 
 Preparação (uma vez por projeto):
 1. Registre o runner no repositório (seção 12). Use **só em repositório privado**.
@@ -327,6 +328,7 @@ Preparação (uma vez por projeto):
    sudo chgrp docker docker-compose*.yml .env && sudo chmod 640 .env
    ```
 3. Proteja a `main` (*Settings → Branches → Require a pull request*): o deploy acontece no merge do PR.
+4. No compose do projeto, deixe `pull_policy: never` no serviço (seção 7.2). Se a imagem local não existir, o `up` falha em vez de tentar baixá-la de um registry.
 
 `.github/workflows/deploy.yml` no repositório do projeto:
 
@@ -338,46 +340,34 @@ on:
   workflow_dispatch:
 
 concurrency: { group: deploy-homelab, cancel-in-progress: false }
-permissions: { contents: read, packages: write }
+permissions: { contents: read }
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: src/Api/Dockerfile
-          push: true
-          tags: |
-            ghcr.io/eduferrari/minhaapi-api:latest
-            ghcr.io/eduferrari/minhaapi-api:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
   deploy:
-    needs: build
     runs-on: [self-hosted, homelab]
     environment: production          # opcional: aprovação manual em Settings → Environments
-    defaults:
-      run:
-        working-directory: /opt/homelab/apps/minhaapi
     steps:
-      - uses: docker/login-action@v3
-        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
-      - run: docker compose pull && docker compose up -d --no-build && docker image prune -f
-      - run: sleep 15 && docker compose ps && test -z "$(docker compose ps --status exited -q)"
-      - if: always()
-        run: docker logout ghcr.io
+      - uses: actions/checkout@v4
+      - name: Build da imagem no servidor
+        run: |
+          docker build -f src/Api/Dockerfile \
+            -t minhaapi-api:latest \
+            -t minhaapi-api:${{ github.sha }} .
+      - name: Recria os containers
+        working-directory: /opt/homelab/apps/minhaapi
+        run: |
+          docker compose config --quiet
+          docker compose up -d --no-build --pull never
+          docker image prune -f
+      - name: Verifica
+        working-directory: /opt/homelab/apps/minhaapi
+        run: sleep 15 && docker compose ps && test -z "$(docker compose ps --status exited -q)"
 ```
 
 - Só os serviços com imagem nova são recriados; o `.env` e as rotas públicas do servidor continuam valendo.
-- As rotas públicas ficam no proxy (`public-route.sh`), não no compose: o deploy pode usar `docker compose -f ...` ou `--project-directory` sem perder os domínios. Antes do `up`, um `docker compose ... config --quiet` faz o job falhar com uma mensagem clara se o compose do servidor estiver inválido.
-- Para voltar uma versão, troque `latest` pela tag do commit (`:<sha>`) no compose e rode `docker compose up -d`.
+- As rotas públicas ficam no proxy (`public-route.sh`), não no compose: o deploy pode usar `docker compose -f ...` ou `--project-directory` sem perder os domínios. O `docker compose config --quiet` antes do `up` faz o job falhar com uma mensagem clara se o compose do servidor estiver inválido.
+- O build usa o cache de camadas do Docker do próprio servidor, então os builds seguintes são rápidos. Sem registry, a imagem existe só nesta máquina: ela não vai para o backup (o código está no Git; para reconstruir, rode o workflow com *Run workflow*).
+- Para voltar uma versão, aponte o compose para a tag do commit (`minhaapi-api:<sha>`, que continua local) no lugar de `latest` e rode `docker compose up -d`.
 
 ### 7.6 Painéis: geral, logs, tráfego, status e Seq — `monitor.sh`
 
@@ -816,7 +806,7 @@ O setup cria o usuário `gh-runner` (grupo `docker`) e baixa o runner em `/opt/a
    sudo /opt/homelab/scripts/register-runner.sh https://github.com/eduferrari/<repo> <TOKEN>
    ```
 
-Uso típico: o job de deploy roda `docker compose pull && up -d` na pasta do projeto (seção 7.5).
+Uso típico: o job de deploy faz o `docker build` e roda `docker compose up -d` na pasta do projeto (seção 7.5).
 
 > ⚠️ Nunca use runner self-hosted em **repositório público** (um PR de terceiro executaria código no servidor). O `gh-runner` está no grupo `docker` — equivale a root.
 
